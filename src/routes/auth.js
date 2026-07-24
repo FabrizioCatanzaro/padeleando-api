@@ -377,7 +377,8 @@ router.get('/search', async (req, res, next) => {
     const sql = getDb();
     const users = await sql`
       SELECT id, name, username, avatar_url, created_at FROM users
-      WHERE username ILIKE ${'%' + q + '%'} OR name ILIKE ${'%' + q + '%'}
+      WHERE id != ${ANON_ID}
+        AND (username ILIKE ${'%' + q + '%'} OR name ILIKE ${'%' + q + '%'})
       LIMIT 10
     `;
     res.json(users);
