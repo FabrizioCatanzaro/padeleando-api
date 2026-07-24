@@ -4,6 +4,7 @@ import { uid }    from '../uid.js';
 const router = Router();
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
+import { ANON_ID } from '../lib/deleteUser.js';
 
 // GET /api/groups — solo los del usuario autenticado
 router.get('/', requireAuth, async (req, res, next) => {
@@ -81,6 +82,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const sql = getDb();
     const [owner] = await sql`SELECT id, name, username, avatar_url, created_at, social_links, bio FROM users WHERE username = ${req.params.username}`;
     if (!owner) return res.status(404).json({ error: 'Usuario no encontrado' });
+    // La cuenta anónima que hereda torneos huérfanos no tiene perfil público.
+    if (owner.id === ANON_ID) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     const isOwner = req.user?.id === owner.id;
 

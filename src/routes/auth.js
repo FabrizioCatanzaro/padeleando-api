@@ -14,7 +14,7 @@ import { uid }           from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { uploadAvatar } from '../middleware/upload.js';
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
-import { deleteUserAccount } from '../lib/deleteUser.js';
+import { deleteUserAccount, ANON_ID } from '../lib/deleteUser.js';
 import { getActiveSubscription } from './subscriptions.js';
 
 const router       = Router();

@@ -224,7 +224,7 @@ CREATE TABLE IF NOT EXISTS ownership_transfers (
 ALTER TABLE IF EXISTS notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
 ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
   CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
-                  'collab_invite','ownership_transfer'));
+                  'collab_invite','ownership_transfer','ownership_received'));
 
 -- Índices
 CREATE INDEX IF NOT EXISTS idx_group_collab_user     ON group_collaborators(user_id);
