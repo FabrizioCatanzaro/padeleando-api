@@ -114,10 +114,11 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     if (name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
     if (!['liga', 'americano'].includes(format)) return res.status(400).json({ error: 'format debe ser "liga" o "americano"' });
 
-    if (format === 'americano') {
-      if (pairsInput.length < 8 || pairsInput.length > 16) {
-        return res.status(400).json({ error: 'El modo Americano requiere entre 8 y 16 parejas' });
-      }
+    // El americano se puede crear como "borrador" con menos de 8 parejas: recién al
+    // llegar al mínimo se habilitan el calendario, los partidos y el cuadro
+    // (validado en /schedule y /bracket). Acá sólo se controla el tope.
+    if (format === 'americano' && pairsInput.length > 16) {
+      return res.status(400).json({ error: 'El modo Americano admite hasta 16 parejas' });
     }
 
     const sql  = getDb();
