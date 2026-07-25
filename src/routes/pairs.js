@@ -14,6 +14,17 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
       return res.status(400).json({ error: 'tournamentId, p1Id y p2Id son requeridos' });
     }
     const sql = getDb();
+
+    // Tope del formato americano: 16 parejas.
+    const [tournament] = await sql`SELECT format FROM tournaments WHERE id = ${tournamentId}`;
+    if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (tournament.format === 'americano') {
+      const [{ count }] = await sql`SELECT COUNT(*)::int AS count FROM pairs WHERE tournament_id = ${tournamentId}`;
+      if (count >= 16) {
+        return res.status(400).json({ error: 'El modo Americano admite hasta 16 parejas' });
+      }
+    }
+
     const [pair] = await sql`
       INSERT INTO pairs (id, tournament_id, p1_id, p2_id)
       VALUES (${uid()}, ${tournamentId}, ${p1Id}, ${p2Id}) RETURNING *

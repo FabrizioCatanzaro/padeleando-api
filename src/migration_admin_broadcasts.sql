@@ -20,3 +20,7 @@ CREATE TABLE IF NOT EXISTS admin_broadcasts (
   recipients     INT         NOT NULL DEFAULT 0,
   created_at     TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Lista de destinatarios cuando target = 'user' (permite elegir varios usuarios).
+ALTER TABLE admin_broadcasts
+  ADD COLUMN IF NOT EXISTS target_user_ids JSONB;

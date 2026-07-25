@@ -19,6 +19,17 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     }
 
     const sql = getDb();
+
+    // Un americano en borrador (menos de 8 parejas) todavía no se puede jugar.
+    const [tournament] = await sql`SELECT format FROM tournaments WHERE id = ${tournamentId}`;
+    if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (tournament.format === 'americano') {
+      const [{ count }] = await sql`SELECT COUNT(*)::int AS count FROM pairs WHERE tournament_id = ${tournamentId}`;
+      if (count < 8) {
+        return res.status(400).json({ error: 'El americano necesita al menos 8 parejas para cargar partidos' });
+      }
+    }
+
     const today = new Date().toISOString().slice(0, 10);
     const setsJson = sets?.length ? JSON.stringify(sets) : null;
 

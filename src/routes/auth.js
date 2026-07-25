@@ -9,12 +9,13 @@ import { createElement } from 'react';
 import VerifyEmailTemplate  from '../emails/VerifyEmail.jsx';
 import ResetPasswordTemplate from '../emails/ResetPassword.jsx';
 import WelcomeTemplate       from '../emails/Welcome.jsx';
+import GoodbyeTemplate       from '../emails/Goodbye.jsx';
 import { getDb }         from '../db.js';
 import { uid }           from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { uploadAvatar } from '../middleware/upload.js';
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
-import { deleteUserAccount } from '../lib/deleteUser.js';
+import { deleteUserAccount, ANON_ID } from '../lib/deleteUser.js';
 import { getActiveSubscription } from './subscriptions.js';
 
 const router       = Router();
@@ -173,6 +174,25 @@ async function sendWelcomeEmail(user) {
     });
   } catch (err) {
     console.error('No se pudo enviar el mail de bienvenida:', err);
+  }
+}
+
+// Mail de despedida al borrar la cuenta. No-bloqueante: el borrado ya ocurrió,
+// un fallo del mail nunca debe hacer fallar la respuesta al usuario.
+async function sendGoodbyeEmail(user) {
+  try {
+    await resend.emails.send({
+      from:    MAIL_FROM,
+      to:      user.email,
+      subject: 'Te vamos a extrañar 💚',
+      react:   createElement(GoodbyeTemplate, {
+        name:      user.name,
+        appUrl:    process.env.FRONTEND_URL,
+        surveyUrl: process.env.SURVEY_URL || process.env.FRONTEND_URL,
+      }),
+    });
+  } catch (err) {
+    console.error('No se pudo enviar el mail de despedida:', err);
   }
 }
 
@@ -377,7 +397,8 @@ router.get('/search', async (req, res, next) => {
     const sql = getDb();
     const users = await sql`
       SELECT id, name, username, avatar_url, created_at FROM users
-      WHERE username ILIKE ${'%' + q + '%'} OR name ILIKE ${'%' + q + '%'}
+      WHERE id != ${ANON_ID}
+        AND (username ILIKE ${'%' + q + '%'} OR name ILIKE ${'%' + q + '%'})
       LIMIT 10
     `;
     res.json(users);
@@ -658,7 +679,7 @@ router.delete('/me/avatar', requireAuth, async (req, res, next) => {
 router.delete('/me', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
-    const [user] = await sql`SELECT id, password_hash FROM users WHERE id = ${req.user.id}`;
+    const [user] = await sql`SELECT id, email, name, password_hash FROM users WHERE id = ${req.user.id}`;
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     if (user.password_hash) {
@@ -669,6 +690,9 @@ router.delete('/me', requireAuth, async (req, res, next) => {
     }
 
     await deleteUserAccount(user.id);
+
+    // Despedida (no-bloqueante). Capturamos email/name antes del borrado.
+    await sendGoodbyeEmail(user);
 
     res.clearCookie('access_token',  cookieOpts(0));
     res.clearCookie('refresh_token', cookieOpts(0));

@@ -8,7 +8,7 @@ const router = Router();
 // POST /api/join-requests — usuario solicita unirse a un torneo
 router.post('/', requireAuth, async (req, res, next) => {
   try {
-    const { tournamentId } = req.body;
+    const { tournamentId, playerId } = req.body;
     if (!tournamentId) return res.status(400).json({ error: 'tournamentId requerido' });
 
     const sql = getDb();
@@ -31,6 +31,18 @@ router.post('/', requireAuth, async (req, res, next) => {
     `;
     if (alreadyPlayer) return res.status(409).json({ error: 'Ya estás en este torneo' });
 
+    // Jugador específico que el solicitante quiere reclamar (opcional). Debe estar
+    // en el torneo y no tener cuenta vinculada todavía.
+    if (playerId) {
+      const [target] = await sql`
+        SELECT p.id, p.user_id FROM players p
+        INNER JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${tournamentId}
+        WHERE p.id = ${playerId}
+      `;
+      if (!target) return res.status(404).json({ error: 'Jugador no encontrado en el torneo' });
+      if (target.user_id) return res.status(409).json({ error: 'Ese jugador ya está vinculado a una cuenta' });
+    }
+
     const [existing] = await sql`
       SELECT id, status FROM tournament_join_requests
       WHERE tournament_id = ${tournamentId} AND user_id = ${req.user.id}
@@ -47,8 +59,8 @@ router.post('/', requireAuth, async (req, res, next) => {
     }
 
     const [joinRequest] = await sql`
-      INSERT INTO tournament_join_requests (id, tournament_id, user_id)
-      VALUES (${uid()}, ${tournamentId}, ${req.user.id})
+      INSERT INTO tournament_join_requests (id, tournament_id, user_id, requested_player_id)
+      VALUES (${uid()}, ${tournamentId}, ${req.user.id}, ${playerId ?? null})
       RETURNING *
     `;
 
@@ -81,8 +93,11 @@ router.get('/my-status/:tournamentId', requireAuth, async (req, res, next) => {
     `;
 
     const [request] = await sql`
-      SELECT id, status, created_at FROM tournament_join_requests
-      WHERE tournament_id = ${tournamentId} AND user_id = ${req.user.id}
+      SELECT tjr.id, tjr.status, tjr.created_at, tjr.requested_player_id,
+             rp.name AS requested_player_name
+      FROM tournament_join_requests tjr
+      LEFT JOIN players rp ON rp.id = tjr.requested_player_id
+      WHERE tjr.tournament_id = ${tournamentId} AND tjr.user_id = ${req.user.id}
     `;
 
     res.json({
@@ -101,9 +116,11 @@ router.get('/:id', requireAuth, async (req, res, next) => {
     const [request] = await sql`
       SELECT tjr.*,
         u.name AS requester_name, u.username AS requester_username,
+        rp.name AS requested_player_name,
         t.name AS tournament_name, t.id AS tournament_id, g.user_id AS owner_id
       FROM tournament_join_requests tjr
       JOIN users u ON u.id = tjr.user_id
+      LEFT JOIN players rp ON rp.id = tjr.requested_player_id
       JOIN tournaments t ON t.id = tjr.tournament_id
       JOIN groups g ON g.id = t.group_id
       WHERE tjr.id = ${req.params.id}
@@ -127,12 +144,9 @@ router.get('/:id', requireAuth, async (req, res, next) => {
 // Body: { action: 'accept' | 'reject', playerId? }
 router.patch('/:id', requireAuth, async (req, res, next) => {
   try {
-    const { action, playerId } = req.body;
+    const { action } = req.body;
     if (!['accept', 'reject'].includes(action)) {
       return res.status(400).json({ error: 'action debe ser accept o reject' });
-    }
-    if (action === 'accept' && !playerId) {
-      return res.status(400).json({ error: 'playerId requerido para aceptar' });
     }
 
     const sql = getDb();
@@ -147,6 +161,12 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
     if (!request) return res.status(404).json({ error: 'Solicitud no encontrada' });
     if (request.status !== 'pending') return res.status(409).json({ error: 'La solicitud ya fue procesada' });
     if (request.owner_id !== req.user.id) return res.status(403).json({ error: 'No autorizado' });
+
+    // El jugador a vincular: el que el organizador elija, o el que pidió el solicitante.
+    const playerId = req.body.playerId ?? request.requested_player_id;
+    if (action === 'accept' && !playerId) {
+      return res.status(400).json({ error: 'playerId requerido para aceptar' });
+    }
 
     if (action === 'accept') {
       const [player] = await sql`

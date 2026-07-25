@@ -114,10 +114,11 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     if (name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
     if (!['liga', 'americano'].includes(format)) return res.status(400).json({ error: 'format debe ser "liga" o "americano"' });
 
-    if (format === 'americano') {
-      if (pairsInput.length < 8 || pairsInput.length > 16) {
-        return res.status(400).json({ error: 'El modo Americano requiere entre 8 y 16 parejas' });
-      }
+    // El americano se puede crear como "borrador" con menos de 8 parejas: recién al
+    // llegar al mínimo se habilitan el calendario, los partidos y el cuadro
+    // (validado en /schedule y /bracket). Acá sólo se controla el tope.
+    if (format === 'americano' && pairsInput.length > 16) {
+      return res.status(400).json({ error: 'El modo Americano admite hasta 16 parejas' });
     }
 
     const sql  = getDb();
@@ -386,6 +387,21 @@ router.patch('/:id/bracket', requireAuth, requireTournamentManage, async (req, r
     `;
     if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });
     res.json({ ...updated, bracket });
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/tournaments/:id/bracket  — borra el cuadro eliminatorio completo
+// (por si se generó por error). También limpia el indicador de partido en vivo del
+// cuadro. No toca la fase previa ni sus resultados.
+router.delete('/:id/bracket', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [updated] = await sql`
+      UPDATE tournaments SET bracket = NULL, live_match = NULL
+      WHERE id = ${req.params.id} RETURNING *
+    `;
+    if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });
+    res.json({ ok: true });
   } catch (err) { next(err); }
 });
 
