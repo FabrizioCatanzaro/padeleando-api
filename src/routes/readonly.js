@@ -61,7 +61,10 @@ router.get('/:tournamentId', async (req, res, next) => {
         `
       : [];
 
-    const players = [...tpPlayers, ...extraPlayers];
+    const players = [
+      ...tpPlayers.map((p) => ({ ...p, removed: false })),
+      ...extraPlayers.map((p) => ({ ...p, removed: true })),
+    ];
  
     res.json({
       id:             tournament.id,

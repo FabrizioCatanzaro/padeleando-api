@@ -1,9 +1,13 @@
 import { Router }  from 'express';
 import { Resend }   from 'resend';
+import { createElement } from 'react';
 import { getDb }    from '../db.js';
 import { uid }      from '../uid.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
 import { deleteUserAccount } from '../lib/deleteUser.js';
+import { linkPreapprovalToUser } from './subscriptions.js';
+import { mdToHtml, personalize } from '../lib/richText.js';
+import AdminBroadcastTemplate from '../emails/AdminBroadcast.jsx';
 
 const resend    = new Resend(process.env.RESEND_API_KEY);
 const MAIL_FROM = process.env.MAIL_FROM || 'Padeleando <onboarding@resend.dev>';
@@ -182,12 +186,27 @@ router.post('/users/:id/grant-premium', async (req, res, next) => {
   try {
     const sql = getDb();
     const { id } = req.params;
-    const days = Math.max(1, Math.min(365, parseInt(req.body?.duration_days ?? '30', 10) || 30));
+    const preapprovalId = req.body?.preapproval_id?.trim();
 
     const [user] = await sql`SELECT id FROM users WHERE id = ${id}`;
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-    // Expirar suscripciones activas previas
+    // Si se pasa un preapproval_id, VINCULAR la suscripción real de MP: queda
+    // activa y se auto-renueva cada mes (no hay que volver a otorgar a mano).
+    if (preapprovalId) {
+      const r = await linkPreapprovalToUser(sql, id, preapprovalId);
+      if (!r.ok) return res.status(400).json({ error: r.error });
+      const [linked] = await sql`
+        SELECT id, plan, billing_period, status, starts_at, ends_at
+        FROM subscriptions WHERE user_id = ${id} AND status = 'active'
+        ORDER BY created_at DESC LIMIT 1
+      `;
+      return res.status(201).json(linked);
+    }
+
+    // Sin preapproval_id: cortesía por N días (comp, no se renueva).
+    const days = Math.max(1, Math.min(365, parseInt(req.body?.duration_days ?? '30', 10) || 30));
+
     await sql`
       UPDATE subscriptions SET status = 'expired'
       WHERE user_id = ${id} AND status = 'active'
@@ -239,11 +258,14 @@ router.delete('/users/:id', async (req, res, next) => {
 
 // ── POST /api/admin/broadcast ────────────────────────────────────────────────
 // Envía una notificación de admin a un grupo de usuarios.
-// Body: { title, body, target: 'all'|'free'|'premium'|'user', target_user_id?, channel: 'app'|'app_email' }
+// Body: { title, body, target: 'all'|'free'|'premium'|'user',
+//         target_user_ids?: string[] (o target_user_id legacy),
+//         channel: 'app'|'app_email' }
+// El body admite un subconjunto de Markdown (**negrita**, *itálica*, [texto](url)).
 router.post('/broadcast', async (req, res, next) => {
   try {
     const sql = getDb();
-    const { title, body, target, target_user_id, channel } = req.body;
+    const { title, body, target, target_user_id, target_user_ids, channel } = req.body;
 
     if (!title?.trim() || !body?.trim())
       return res.status(400).json({ error: 'Título y cuerpo son requeridos' });
@@ -251,8 +273,15 @@ router.post('/broadcast', async (req, res, next) => {
       return res.status(400).json({ error: 'Target inválido' });
     if (!['app', 'app_email'].includes(channel))
       return res.status(400).json({ error: 'Canal inválido' });
-    if (target === 'user' && !target_user_id)
-      return res.status(400).json({ error: 'target_user_id requerido para target=user' });
+
+    // Aceptar el array nuevo (target_user_ids) o el id único legacy (target_user_id).
+    const targetIds = [...new Set(
+      (Array.isArray(target_user_ids) ? target_user_ids : [])
+        .concat(target_user_id ? [target_user_id] : [])
+        .filter(Boolean),
+    )];
+    if (target === 'user' && targetIds.length === 0)
+      return res.status(400).json({ error: 'Seleccioná al menos un usuario' });
 
     let users;
     if (target === 'all') {
@@ -278,7 +307,7 @@ router.post('/broadcast', async (req, res, next) => {
           )
       `;
     } else {
-      users = await sql`SELECT id, email, name FROM users WHERE id = ${target_user_id}`;
+      users = await sql`SELECT id, email, name FROM users WHERE id = ANY(${targetIds})`;
       if (!users.length) return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
@@ -288,15 +317,17 @@ router.post('/broadcast', async (req, res, next) => {
     const t = title.trim();
     const b = body.trim();
 
-    // Insertar notificaciones en app
+    // Insertar notificaciones en app. El cuerpo se personaliza por usuario
+    // (reemplaza {nombre} por el nombre del destinatario).
     for (const u of users) {
       await sql`
         INSERT INTO notifications (id, user_id, type, title, body)
-        VALUES (${uid()}, ${u.id}, 'admin_message', ${t}, ${b})
+        VALUES (${uid()}, ${u.id}, 'admin_message', ${t}, ${personalize(b, u)})
       `;
     }
 
-    // Enviar emails si corresponde
+    // Enviar emails si corresponde. El cuerpo se renderiza por usuario (para
+    // resolver {nombre}) desde el subconjunto de Markdown a HTML con estilos inline.
     if (channel === 'app_email') {
       const batchSize = 50;
       for (let i = 0; i < users.length; i += batchSize) {
@@ -305,24 +336,28 @@ router.post('/broadcast', async (req, res, next) => {
           resend.emails.send({
             from:    MAIL_FROM,
             to:      u.email,
-            subject: `[Padeleando] ${t}`,
-            html: `
-              <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px">
-                <h2 style="color:#e8f04a;margin-bottom:8px">${t}</h2>
-                <p style="color:#ccc;font-size:15px;line-height:1.6;white-space:pre-wrap">${b}</p>
-                <hr style="border-color:#333;margin:24px 0"/>
-                <p style="color:#555;font-size:12px">Este mensaje fue enviado desde el equipo de Padeleando.</p>
-              </div>
-            `,
+            subject: t,
+            react:   createElement(AdminBroadcastTemplate, {
+              title:    t,
+              bodyHtml: mdToHtml(personalize(b, u)),
+            }),
           })
         ));
       }
     }
 
-    // Guardar en historial
+    // Guardar en historial. target_user_id se conserva para el caso de 1 solo
+    // destinatario (compatibilidad con el join del historial); la lista completa
+    // va en target_user_ids.
+    const singleTargetId = target === 'user' && targetIds.length === 1 ? targetIds[0] : null;
     const [broadcast] = await sql`
-      INSERT INTO admin_broadcasts (id, admin_id, title, body, target, target_user_id, channel, recipients)
-      VALUES (${uid()}, ${req.user.id}, ${t}, ${b}, ${target}, ${target_user_id ?? null}, ${channel}, ${users.length})
+      INSERT INTO admin_broadcasts
+        (id, admin_id, title, body, target, target_user_id, target_user_ids, channel, recipients)
+      VALUES (
+        ${uid()}, ${req.user.id}, ${t}, ${b}, ${target}, ${singleTargetId},
+        ${target === 'user' ? JSON.stringify(targetIds) : null}::jsonb,
+        ${channel}, ${users.length}
+      )
       RETURNING *
     `;
 

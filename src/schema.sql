@@ -102,6 +102,23 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   created_at     TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Cancelación al fin del período: la suscripción sigue 'active' (el usuario
+-- conserva premium) hasta ends_at, pero no se renueva. Se setea al cancelar
+-- (desde la app o desde MP) y evita cortar el premium al instante.
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN NOT NULL DEFAULT false;
+
+-- Códigos de verificación para reclamar un pago por email de MP. El código se
+-- envía al email de MP con el que se pagó: solo quien controla ese inbox puede
+-- activar, evitando que un usuario reclame el pago de otro. Uno por usuario.
+CREATE TABLE IF NOT EXISTS premium_claim_codes (
+  user_id        TEXT        PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  mp_email       TEXT        NOT NULL,
+  preapproval_id TEXT        NOT NULL,
+  code           TEXT        NOT NULL,
+  expires_at     TIMESTAMPTZ NOT NULL,
+  created_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Avatar de usuario (cualquier plan)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url       TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_public_id TEXT;
@@ -224,7 +241,15 @@ CREATE TABLE IF NOT EXISTS ownership_transfers (
 ALTER TABLE IF EXISTS notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
 ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
   CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
-                  'collab_invite','ownership_transfer','ownership_received'));
+                  'collab_invite','ownership_transfer','ownership_received','premium_claim'));
+
+-- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
+-- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
+ALTER TABLE IF EXISTS admin_broadcasts ADD COLUMN IF NOT EXISTS target_user_ids JSONB;
+
+-- Solicitud de unión: jugador específico que el solicitante pide reclamar (opcional).
+-- La tabla vive en migration_join_requests.sql; el IF EXISTS evita fallar si aún no se creó.
+ALTER TABLE IF EXISTS tournament_join_requests ADD COLUMN IF NOT EXISTS requested_player_id TEXT REFERENCES players(id);
 
 -- Índices
 CREATE INDEX IF NOT EXISTS idx_group_collab_user     ON group_collaborators(user_id);

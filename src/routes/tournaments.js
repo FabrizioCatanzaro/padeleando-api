@@ -390,6 +390,21 @@ router.patch('/:id/bracket', requireAuth, requireTournamentManage, async (req, r
   } catch (err) { next(err); }
 });
 
+// DELETE /api/tournaments/:id/bracket  — borra el cuadro eliminatorio completo
+// (por si se generó por error). También limpia el indicador de partido en vivo del
+// cuadro. No toca la fase previa ni sus resultados.
+router.delete('/:id/bracket', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [updated] = await sql`
+      UPDATE tournaments SET bracket = NULL, live_match = NULL
+      WHERE id = ${req.params.id} RETURNING *
+    `;
+    if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
 // PATCH /api/tournaments/:id/bracket/:matchId
 // Registra el resultado de un partido del bracket y propaga el ganador al siguiente round.
 // Body: { score1, score2, duration_seconds, court }

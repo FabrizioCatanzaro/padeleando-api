@@ -32,6 +32,7 @@ router.get('/', requireAuth, async (req, res, next) => {
         COALESCE(g.name, gci.name, got.name, gor.name) AS group_name,
         p.name     AS player_name,
         tjr.status        AS request_status,
+        rp.name           AS requested_player_name,
         tour.id           AS tournament_id,
         tour.name         AS tournament_name,
         ci.status  AS collab_status,
@@ -42,6 +43,7 @@ router.get('/', requireAuth, async (req, res, next) => {
       LEFT JOIN groups g ON g.id = pi.group_id
       LEFT JOIN players p ON p.id = pi.player_id
       LEFT JOIN tournament_join_requests tjr ON n.type = 'join_request' AND tjr.id = n.entity_id
+      LEFT JOIN players rp ON rp.id = tjr.requested_player_id
       LEFT JOIN tournaments tour ON tour.id = tjr.tournament_id
       LEFT JOIN collaborator_invitations ci ON n.type = 'collab_invite' AND ci.id = n.entity_id
       LEFT JOIN groups gci ON gci.id = ci.group_id
