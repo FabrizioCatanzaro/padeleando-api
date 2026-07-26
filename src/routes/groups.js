@@ -392,6 +392,43 @@ router.get('/featured', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /api/groups/:groupId/meta — metadata mínima de la categoría.
+// GET /:groupId devuelve ~10 consultas (torneos, ganadores, estadísticas,
+// co-organizadores), pero la vista de jornada y la de espectador sólo necesitan
+// el nombre, los emojis y un par de flags: las llamaban en cada mutación y en
+// cada ciclo de refresco. Esto es una sola consulta.
+router.get('/:groupId/meta', optionalAuth, async (req, res, next) => {
+  try {
+    const { groupId } = req.params;
+    const sql = getDb();
+    // El cast explícito es necesario: sin sesión el parámetro viaja como NULL y
+    // Postgres no puede inferir su tipo.
+    const viewerId = req.user?.id ?? null;
+    const [group] = await sql`
+      SELECT g.id, g.name, g.emojis, g.is_public, g.user_id,
+             u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
+             (EXISTS (
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
+             )) AS owner_is_premium,
+             (g.user_id = ${viewerId}::text) AS is_owner,
+             EXISTS (SELECT 1 FROM group_collaborators gc
+                     WHERE gc.group_id = g.id AND gc.user_id = ${viewerId}::text) AS is_collab
+      FROM groups g
+      JOIN users u ON u.id = g.user_id
+      WHERE g.id = ${groupId}
+    `;
+    if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
+
+    const { user_id, is_owner, is_collab, ...rest } = group;
+    res.json({
+      ...rest,
+      is_owner:   is_owner === true,
+      can_manage: is_owner === true || is_collab === true,
+    });
+  } catch (err) { next(err); }
+});
+
 // GET /api/groups/:groupId/history — estadísticas históricas de todas las jornadas
 router.get('/:groupId/history', async (req, res, next) => {
   try {
@@ -405,22 +442,44 @@ router.get('/:groupId/history', async (req, res, next) => {
       ORDER  BY created_at ASC
     `;
 
-    const result = [];
-    for (const t of tournaments) {
-      const players = await sql`
-        SELECT p.id, p.name, u.name AS linked_name, u.username AS linked_username, u.avatar_url AS linked_avatar_url
-        FROM   players p
-        JOIN   tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${t.id}
+    if (tournaments.length === 0) return res.json([]);
+
+    // Un lote por tabla en vez de tres consultas por jornada. Sobre el driver
+    // HTTP de Neon cada sentencia es un round-trip, así que el N+1 costaba
+    // 1+3N peticiones de red (91 para 30 jornadas) resueltas en serie.
+    const ids = tournaments.map((t) => t.id);
+
+    const [allPlayers, allMatches, allPairs] = await Promise.all([
+      sql`
+        SELECT tp.tournament_id,
+               p.id, p.name, u.name AS linked_name, u.username AS linked_username,
+               u.avatar_url AS linked_avatar_url
+        FROM   tournament_players tp
+        JOIN   players p ON p.id = tp.player_id
         LEFT   JOIN users u ON u.id = p.user_id
-      `;
-      const matches = await sql`
-        SELECT * FROM matches WHERE tournament_id = ${t.id} ORDER BY created_at DESC
-      `;
-      const pairs = await sql`
-        SELECT * FROM pairs WHERE tournament_id = ${t.id}
-      `;
-      result.push({ ...t, players, matches, pairs });
-    }
+        WHERE  tp.tournament_id = ANY(${ids})
+      `,
+      sql`SELECT * FROM matches WHERE tournament_id = ANY(${ids}) ORDER BY created_at DESC`,
+      sql`SELECT * FROM pairs   WHERE tournament_id = ANY(${ids})`,
+    ]);
+
+    const groupBy = (rows) => {
+      const by = new Map(ids.map((id) => [id, []]));
+      for (const row of rows) by.get(row.tournament_id)?.push(row);
+      return by;
+    };
+    const playersBy = groupBy(allPlayers);
+    const matchesBy = groupBy(allMatches);
+    const pairsBy   = groupBy(allPairs);
+
+    // tournament_id se agregó sólo para agrupar: no formaba parte del payload
+    // que devolvía la versión anterior.
+    const result = tournaments.map((t) => ({
+      ...t,
+      players: (playersBy.get(t.id) ?? []).map(({ tournament_id, ...p }) => p),
+      matches: matchesBy.get(t.id) ?? [],
+      pairs:   pairsBy.get(t.id)   ?? [],
+    }));
 
     res.json(result);
   } catch (err) { next(err); }

@@ -59,8 +59,45 @@ app.use(cookieParser());
 app.use('/api/emails/webhook', express.raw({ type: 'application/json' }));
 
 app.use(express.json());
+
+// ── Política de caché ────────────────────────────────────────────────────────
+// Antes todo respondía `no-store`, que es la directiva más agresiva del
+// estándar: prohíbe la caché privada, la compartida y también la revalidación
+// condicional, anulando el ETag que Express ya calcula. Consecuencia: el
+// polling de la vista de espectador no podía resolverse nunca con un 304.
+//
+// Ahora se distingue por naturaleza del recurso. `private, no-cache` sigue
+// garantizando frescura —el navegador revalida siempre— pero permite el 304.
+
+// Contenido público de lectura: tolera unos segundos de desfase.
+const PUBLIC_CACHEABLE = [
+  '/api/readonly',
+  '/api/groups/featured',
+  '/api/groups/search',
+  '/api/groups/nearby',
+  '/api/clubs',
+];
+
+// Datos sensibles o de sesión: nunca se guardan, ni siquiera en disco.
+const NEVER_STORE = [
+  '/api/auth',
+  '/api/subscriptions',
+  '/api/admin',
+  '/api/notifications',
+  '/api/invitations',
+  '/api/emails',
+];
+
 app.use((req, res, next) => {
-  res.set('Cache-Control', 'no-store');
+  if (req.method !== 'GET') {
+    res.set('Cache-Control', 'no-store');
+  } else if (NEVER_STORE.some((p) => req.path.startsWith(p))) {
+    res.set('Cache-Control', 'no-store');
+  } else if (PUBLIC_CACHEABLE.some((p) => req.path.startsWith(p))) {
+    res.set('Cache-Control', 'public, max-age=10, stale-while-revalidate=60');
+  } else {
+    res.set('Cache-Control', 'private, no-cache');
+  }
   next();
 });
 
