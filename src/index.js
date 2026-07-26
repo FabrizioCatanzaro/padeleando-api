@@ -43,6 +43,10 @@ app.use(cors({
     cb(new Error('Not allowed by CORS'));
   },
   credentials: true,   // ← necesario para enviar/recibir cookies cross-origin
+  // Los GET ya no disparan preflight (el cliente no manda Content-Type sin
+  // cuerpo), pero las mutaciones sí. Sin maxAge el navegador sólo cachea la
+  // respuesta 5 s y vuelve a preguntar en cada tanda de escrituras.
+  maxAge: 86400,
 }));
 
 // Comprime las respuestas JSON antes de los routers. Los payloads de esta API
@@ -59,6 +63,13 @@ app.use(cookieParser());
 app.use('/api/emails/webhook', express.raw({ type: 'application/json' }));
 
 app.use(express.json());
+
+// Las mutaciones sin cuerpo (DELETE /matches/:id, POST /follows/:username y
+// otras 25) ya no mandan Content-Type, para no arrastrar un preflight CORS.
+// Sin ese encabezado express.json() no parsea y en Express 5 req.body queda
+// undefined, así que un `const { x } = req.body` tiraría TypeError. Se
+// normaliza acá en vez de en cada ruta.
+app.use((req, _res, next) => { if (req.body === undefined) req.body = {}; next(); });
 
 // ── Política de caché ────────────────────────────────────────────────────────
 // Antes todo respondía `no-store`, que es la directiva más agresiva del
