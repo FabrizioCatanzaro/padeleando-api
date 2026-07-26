@@ -85,20 +85,39 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     // La cuenta anónima que hereda torneos huérfanos no tiene perfil público.
     if (owner.id === ANON_ID) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-    const isOwner = req.user?.id === owner.id;
-
-    const [{ followers_count }] = await sql`
-      SELECT COUNT(*)::int AS followers_count FROM user_follows WHERE following_id = ${owner.id}
-    `;
-    const [{ following_count }] = await sql`
-      SELECT COUNT(*)::int AS following_count FROM user_follows WHERE follower_id = ${owner.id}
-    `;
+    const isOwner  = req.user?.id === owner.id;
     const viewerId = req.user?.id ?? null;
-    const isFollowing = (!isOwner && viewerId)
-      ? (await sql`SELECT 1 FROM user_follows WHERE follower_id = ${viewerId} AND following_id = ${owner.id}`).length > 0
-      : false;
+    // Sólo tiene sentido preguntar por el seguimiento si mira otra persona.
+    const followerId = isOwner ? null : viewerId;
 
-    const groups = await sql`
+    // A partir de acá todo depende únicamente de owner.id (y del espectador),
+    // nada de una consulta alimenta a la siguiente. Con el driver HTTP de Neon
+    // cada `sql` es un round-trip propio a São Paulo, así que encadenarlas
+    // costaba ~10 viajes en serie: 1,4-2,0 s medidos en producción. Van todas
+    // en una sola tanda, y las tres de seguidores colapsadas en una consulta.
+    const [
+      [follows],
+      groups,
+      [playerStats],
+      dailyActivity,
+      monthlyStats,
+      matchResults,
+      [americanoChamp],
+      recentMatches,
+      frequentPartners,
+      sub,
+    ] = await Promise.all([
+    sql`
+      SELECT
+        (SELECT COUNT(*)::int FROM user_follows WHERE following_id = ${owner.id}) AS followers_count,
+        (SELECT COUNT(*)::int FROM user_follows WHERE follower_id  = ${owner.id}) AS following_count,
+        EXISTS (
+          SELECT 1 FROM user_follows
+          WHERE follower_id = ${followerId}::text AND following_id = ${owner.id}
+        ) AS is_following
+    `,
+
+    sql`
       SELECT g.*,
         (SELECT COUNT(DISTINCT tp.player_id)::int
          FROM tournament_players tp
@@ -109,9 +128,9 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       WHERE g.user_id = ${owner.id}
         AND (${isOwner} OR g.is_public = true)
       ORDER BY g.created_at DESC
-    `;
+    `,
 
-    const [playerStats] = await sql`
+    sql`
       SELECT
         COUNT(DISTINCT tp.tournament_id)::int AS torneos,
         COUNT(m.id)::int                      AS partidos,
@@ -135,10 +154,10 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
-    `;
+    `,
 
     // Actividad diaria para heatmap (últimos 365 días, solo owner)
-    const dailyActivity = isOwner ? await sql`
+    isOwner ? sql`
       SELECT
         m.played_at::date::text AS day,
         COUNT(m.id)::int        AS partidos
@@ -150,10 +169,10 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         AND m.played_at >= CURRENT_DATE - INTERVAL '364 days'
       GROUP BY m.played_at::date
       ORDER BY m.played_at::date ASC
-    ` : [];
+    ` : [],
 
     // Estadísticas mensuales (últimos 12 meses)
-    const monthlyStats = isOwner ? await sql`
+    isOwner ? sql`
       SELECT
         TO_CHAR(DATE_TRUNC('month', m.played_at), 'YYYY-MM') AS month,
         COUNT(m.id)::int AS partidos,
@@ -168,9 +187,9 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         AND m.played_at >= DATE_TRUNC('month', NOW()) - INTERVAL '11 months'
       GROUP BY DATE_TRUNC('month', m.played_at)
       ORDER BY DATE_TRUNC('month', m.played_at) ASC
-    ` : [];
+    ` : [],
 
-    const matchResults = await sql`
+    sql`
       SELECT
         CASE
           WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN true
@@ -182,21 +201,10 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
       ORDER BY m.played_at DESC, m.created_at DESC
-    `;
-    let racha = 0, rachaMax = 0, streak = 0, currentDone = false;
-    for (const row of matchResults) {
-      if (row.won) {
-        streak++;
-        rachaMax = Math.max(rachaMax, streak);
-        if (!currentDone) racha = streak;
-      } else {
-        currentDone = true;
-        streak = 0;
-      }
-    }
+    `,
 
     // Campeón americano = ganó la final del bracket (winner_id es un pair_id)
-    const [americanoChamp] = await sql`
+    sql`
       WITH user_players AS (
         SELECT id FROM players WHERE user_id = ${owner.id}
       )
@@ -212,9 +220,9 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           pr.p1_id IN (SELECT id FROM user_players)
           OR pr.p2_id IN (SELECT id FROM user_players)
         )
-    `;
+    `,
 
-    const recentMatches = await sql`
+    sql`
       SELECT
         m.id,
         m.played_at,
@@ -262,9 +270,9 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       WHERE p.user_id = ${owner.id}
       ORDER BY m.played_at DESC, m.created_at DESC
       LIMIT 20
-    `;
+    `,
 
-    const frequentPartners = await sql`
+    sql`
       SELECT
         COALESCE(u.name, partner.name)     AS name,
         u.username,
@@ -289,13 +297,33 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
                COALESCE(u.name, partner.name), u.username, u.avatar_url, s.id
       ORDER BY partidos_juntos DESC
       LIMIT 5
-    `;
+    `,
 
-    const sub = await getActiveSubscription(sql, owner.id);
+    getActiveSubscription(sql, owner.id),
+    ]);
+
+    // La racha se deriva en memoria del listado ya ordenado por fecha.
+    let racha = 0, rachaMax = 0, streak = 0, currentDone = false;
+    for (const row of matchResults) {
+      if (row.won) {
+        streak++;
+        rachaMax = Math.max(rachaMax, streak);
+        if (!currentDone) racha = streak;
+      } else {
+        currentDone = true;
+        streak = 0;
+      }
+    }
+
     const baseStats = playerStats ?? { torneos: 0, partidos: 0, victorias: 0, torneos_americanos: 0, games_favor: 0, games_contra: 0 };
     res.json({
-      owner: { ...owner, is_premium: sub.plan === 'premium', followers_count, following_count },
-      is_following: isFollowing,
+      owner: {
+        ...owner,
+        is_premium:      sub.plan === 'premium',
+        followers_count: follows.followers_count,
+        following_count: follows.following_count,
+      },
+      is_following: follows.is_following,
       groups,
       stats: {
         ...baseStats,
