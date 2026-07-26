@@ -274,3 +274,16 @@ CREATE INDEX IF NOT EXISTS idx_invitations_player    ON player_invitations(playe
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user    ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_tournament_photos_tournament ON tournament_photos(tournament_id);
 CREATE INDEX IF NOT EXISTS idx_email_verifications_user    ON email_verifications(user_id);
+
+-- Índices de rendimiento (auditoría jul 2026). Detalle y justificación en
+-- migration_perf_indexes.sql.
+CREATE INDEX IF NOT EXISTS idx_players_user          ON players(user_id);
+CREATE INDEX IF NOT EXISTS idx_groups_user           ON groups(user_id);
+CREATE INDEX IF NOT EXISTS idx_tp_player             ON tournament_players(player_id);
+CREATE INDEX IF NOT EXISTS idx_gp_player             ON group_players(player_id);
+-- Permiten resolver con BitmapOr el `OR` de cuatro columnas de las consultas de
+-- estadísticas, en vez de recorrer matches entera.
+CREATE INDEX IF NOT EXISTS idx_matches_t1p1          ON matches(team1_p1);
+CREATE INDEX IF NOT EXISTS idx_matches_t1p2          ON matches(team1_p2);
+CREATE INDEX IF NOT EXISTS idx_matches_t2p1          ON matches(team2_p1);
+CREATE INDEX IF NOT EXISTS idx_matches_t2p2          ON matches(team2_p2);

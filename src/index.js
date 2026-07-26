@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express     from 'express';
 import cors        from 'cors';
 import cookieParser from 'cookie-parser';
+import compression from 'compression';
 import morgan      from 'morgan';
 
 import groupsRouter         from './routes/groups.js';
@@ -25,6 +26,13 @@ import { getDb } from './db.js';
 
 const app  = express();
 const PORT = process.env.PORT ?? 3001;
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+// Render sirve detrás de un proxy: sin esto req.ip devuelve la IP del proxy y
+// los rate limiters de /auth agrupan a todos los usuarios en un mismo cubo.
+// El 1 (en vez de true) confía sólo en el primer salto: la IP no se puede falsear
+// agregando X-Forwarded-For desde el cliente.
+app.set('trust proxy', 1);
 
 const ORIGINS = (process.env.CORS_ORIGIN ?? 'http://localhost:3000').split(',');
 
@@ -37,7 +45,13 @@ app.use(cors({
   credentials: true,   // ← necesario para enviar/recibir cookies cross-origin
 }));
 
-app.use(morgan('dev'));
+// Comprime las respuestas JSON antes de los routers. Los payloads de esta API
+// (filas de matches/players/pairs con claves repetidas) comprimen ~6:1.
+app.use(compression());
+
+// 'dev' emite colores ANSI pensados para terminal: en el log agregado de Render
+// ensucian la salida y no son parseables.
+app.use(morgan(IS_PROD ? 'combined' : 'dev'));
 app.use(cookieParser());
 
 // El webhook de Resend (inbound email) necesita el body crudo para verificar la
