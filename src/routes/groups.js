@@ -392,6 +392,43 @@ router.get('/featured', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /api/groups/:groupId/meta — metadata mínima de la categoría.
+// GET /:groupId devuelve ~10 consultas (torneos, ganadores, estadísticas,
+// co-organizadores), pero la vista de jornada y la de espectador sólo necesitan
+// el nombre, los emojis y un par de flags: las llamaban en cada mutación y en
+// cada ciclo de refresco. Esto es una sola consulta.
+router.get('/:groupId/meta', optionalAuth, async (req, res, next) => {
+  try {
+    const { groupId } = req.params;
+    const sql = getDb();
+    // El cast explícito es necesario: sin sesión el parámetro viaja como NULL y
+    // Postgres no puede inferir su tipo.
+    const viewerId = req.user?.id ?? null;
+    const [group] = await sql`
+      SELECT g.id, g.name, g.emojis, g.is_public, g.user_id,
+             u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
+             (EXISTS (
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
+             )) AS owner_is_premium,
+             (g.user_id = ${viewerId}::text) AS is_owner,
+             EXISTS (SELECT 1 FROM group_collaborators gc
+                     WHERE gc.group_id = g.id AND gc.user_id = ${viewerId}::text) AS is_collab
+      FROM groups g
+      JOIN users u ON u.id = g.user_id
+      WHERE g.id = ${groupId}
+    `;
+    if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
+
+    const { user_id, is_owner, is_collab, ...rest } = group;
+    res.json({
+      ...rest,
+      is_owner:   is_owner === true,
+      can_manage: is_owner === true || is_collab === true,
+    });
+  } catch (err) { next(err); }
+});
+
 // GET /api/groups/:groupId/history — estadísticas históricas de todas las jornadas
 router.get('/:groupId/history', async (req, res, next) => {
   try {
@@ -405,22 +442,44 @@ router.get('/:groupId/history', async (req, res, next) => {
       ORDER  BY created_at ASC
     `;
 
-    const result = [];
-    for (const t of tournaments) {
-      const players = await sql`
-        SELECT p.id, p.name, u.name AS linked_name, u.username AS linked_username, u.avatar_url AS linked_avatar_url
-        FROM   players p
-        JOIN   tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${t.id}
+    if (tournaments.length === 0) return res.json([]);
+
+    // Un lote por tabla en vez de tres consultas por jornada. Sobre el driver
+    // HTTP de Neon cada sentencia es un round-trip, así que el N+1 costaba
+    // 1+3N peticiones de red (91 para 30 jornadas) resueltas en serie.
+    const ids = tournaments.map((t) => t.id);
+
+    const [allPlayers, allMatches, allPairs] = await Promise.all([
+      sql`
+        SELECT tp.tournament_id,
+               p.id, p.name, u.name AS linked_name, u.username AS linked_username,
+               u.avatar_url AS linked_avatar_url
+        FROM   tournament_players tp
+        JOIN   players p ON p.id = tp.player_id
         LEFT   JOIN users u ON u.id = p.user_id
-      `;
-      const matches = await sql`
-        SELECT * FROM matches WHERE tournament_id = ${t.id} ORDER BY created_at DESC
-      `;
-      const pairs = await sql`
-        SELECT * FROM pairs WHERE tournament_id = ${t.id}
-      `;
-      result.push({ ...t, players, matches, pairs });
-    }
+        WHERE  tp.tournament_id = ANY(${ids})
+      `,
+      sql`SELECT * FROM matches WHERE tournament_id = ANY(${ids}) ORDER BY created_at DESC`,
+      sql`SELECT * FROM pairs   WHERE tournament_id = ANY(${ids})`,
+    ]);
+
+    const groupBy = (rows) => {
+      const by = new Map(ids.map((id) => [id, []]));
+      for (const row of rows) by.get(row.tournament_id)?.push(row);
+      return by;
+    };
+    const playersBy = groupBy(allPlayers);
+    const matchesBy = groupBy(allMatches);
+    const pairsBy   = groupBy(allPairs);
+
+    // tournament_id se agregó sólo para agrupar: no formaba parte del payload
+    // que devolvía la versión anterior.
+    const result = tournaments.map((t) => ({
+      ...t,
+      players: (playersBy.get(t.id) ?? []).map(({ tournament_id, ...p }) => p),
+      matches: matchesBy.get(t.id) ?? [],
+      pairs:   pairsBy.get(t.id)   ?? [],
+    }));
 
     res.json(result);
   } catch (err) { next(err); }
@@ -557,78 +616,49 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       }
     }
 
-    const playerStats = await sql`
-      SELECT
-        p.id, COALESCE(u.name, p.name) AS name, u.avatar_url AS linked_avatar_url,
-        COUNT(DISTINCT t.id)::int AS torneos,
-        SUM(CASE
-          WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
-          WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
-          ELSE 0 END)::int AS victorias,
-        COUNT(m.id)::int AS partidos
-      FROM   players p
-      JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = ${groupId}
-      JOIN   tournaments   t  ON t.group_id = ${groupId}
-      LEFT   JOIN users u ON u.id = p.user_id
-      LEFT JOIN matches    m  ON m.tournament_id = t.id
-        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
-          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
-      GROUP BY p.id, COALESCE(u.name, p.name), u.avatar_url
-      ORDER BY victorias DESC
-    `;
-
-    const tournamentWinners = await sql`
-      WITH pw AS (
-        SELECT t.id AS tid, t.name AS tname, t.created_at,
-               p.id AS pid, COALESCE(u.name, p.name) AS pname,
-               SUM(CASE
-                 WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
-                 WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
-                 ELSE 0 END) AS wins
-        FROM   tournaments t
-        JOIN   matches m ON m.tournament_id = t.id
-        JOIN   players p ON p.id IN (m.team1_p1, m.team1_p2, m.team2_p1, m.team2_p2)
-        LEFT   JOIN users u ON u.id = p.user_id
-        WHERE  t.group_id = ${groupId}
-        GROUP  BY t.id, t.name, t.created_at, p.id, COALESCE(u.name, p.name)
-      ),
-      ranked AS (
-        SELECT *, RANK() OVER (PARTITION BY tid ORDER BY wins DESC) AS rnk
-        FROM pw WHERE wins > 0
-      )
-      SELECT * FROM ranked WHERE rnk = 1 ORDER BY created_at DESC
-    `;
+    // Nota: acá se calculaban dos agregados pesados más, `playerStats` (con un
+    // JOIN a tournaments sin correlacionar, o sea un producto cartesiano
+    // jugadores × jornadas) y `tournamentWinners` (RANK() sobre todos los
+    // partidos de la categoría). Se devolvían bajo `stats` y ningún componente
+    // del frontend los consumía. Eliminados: si alguna vista los necesita en el
+    // futuro, van en su propio endpoint y se piden bajo demanda.
+    // El total de jornadas por categoría sigue viniendo en `tournament_count`
+    // de los listados de grupos, y el ganador de cada jornada en `winner_label`.
 
     // ── Permisos + co-organizadores ─────────────────────────────────────────
+    // Ambas consultas son independientes entre sí: sobre un driver donde cada
+    // sentencia es un round-trip, encadenarlas con await sumaba latencia sin
+    // motivo.
     const viewerId = req.user?.id ?? null;
-    const collaborators = await sql`
-      SELECT u.id AS user_id, u.name, u.username, u.avatar_url
-      FROM   group_collaborators gc
-      JOIN   users u ON u.id = gc.user_id
-      WHERE  gc.group_id = ${groupId}
-      ORDER  BY gc.added_at ASC
-    `;
-    const is_owner   = !!viewerId && group.user_id === viewerId;
-    const can_manage = is_owner || (!!viewerId && collaborators.some((c) => c.user_id === viewerId));
+    const is_owner = !!viewerId && group.user_id === viewerId;
 
-    // Transferencia de propiedad pendiente (solo la ve el dueño)
-    let pending_transfer = null;
-    if (is_owner) {
-      const [pt] = await sql`
-        SELECT ot.id, ot.created_at,
-               u.name AS to_name, u.username AS to_username
-        FROM   ownership_transfers ot
-        LEFT   JOIN users u ON u.id = ot.to_user_id
-        WHERE  ot.group_id = ${groupId} AND ot.status = 'pending'
-        ORDER  BY ot.created_at DESC
-        LIMIT  1
-      `;
-      pending_transfer = pt ?? null;
-    }
+    const [collaborators, transferRows] = await Promise.all([
+      sql`
+        SELECT u.id AS user_id, u.name, u.username, u.avatar_url
+        FROM   group_collaborators gc
+        JOIN   users u ON u.id = gc.user_id
+        WHERE  gc.group_id = ${groupId}
+        ORDER  BY gc.added_at ASC
+      `,
+      // Transferencia de propiedad pendiente (sólo la ve el dueño)
+      is_owner
+        ? sql`
+            SELECT ot.id, ot.created_at,
+                   u.name AS to_name, u.username AS to_username
+            FROM   ownership_transfers ot
+            LEFT   JOIN users u ON u.id = ot.to_user_id
+            WHERE  ot.group_id = ${groupId} AND ot.status = 'pending'
+            ORDER  BY ot.created_at DESC
+            LIMIT  1
+          `
+        : Promise.resolve([]),
+    ]);
+
+    const can_manage = is_owner || (!!viewerId && collaborators.some((c) => c.user_id === viewerId));
+    const pending_transfer = transferRows[0] ?? null;
 
     res.json({
       ...group, tournaments,
-      stats: { playerStats, tournamentWinners },
       collaborators, is_owner, can_manage, pending_transfer,
     });
   } catch (err) { next(err); }
