@@ -11,7 +11,18 @@ router.get('/:tournamentId', async (req, res, next) => {
  
     const [tournament] = await sql`
       SELECT t.*, u.username AS owner_username,
+             u.name          AS owner_name,
              g.name          AS group_name,
+             -- La vista de espectador pedía esto en una segunda llamada a
+             -- /groups/:id/meta que sólo podía salir cuando ya había respondido
+             -- ésta. Al llegar tarde, la píldora de la categoría se insertaba
+             -- sobre el título y empujaba la página 39 px (0,25 de CLS).
+             g.emojis        AS group_emojis,
+             g.is_public     AS group_is_public,
+             (EXISTS (
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
+             )) AS group_owner_is_premium,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name
@@ -75,7 +86,13 @@ router.get('/:tournamentId', async (req, res, next) => {
       live_match:     tournament.live_match ?? null,
       group_id:       tournament.group_id,
       group_name:     tournament.group_name ?? null,
+      // Presentación de la categoría: antes venía de una segunda llamada a
+      // /groups/:id/meta encadenada detrás de ésta.
+      group_emojis:           tournament.group_emojis ?? [],
+      group_is_public:        tournament.group_is_public ?? true,
+      group_owner_is_premium: tournament.group_owner_is_premium ?? false,
       owner_username: tournament.owner_username,
+      owner_name:     tournament.owner_name ?? null,
       created_at:     tournament.created_at,
       event_date:          tournament.event_date ?? null,
       club_id:             tournament.club_id ?? null,
