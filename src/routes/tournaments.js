@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getDb }  from '../db.js';
+import { getDb, withTransaction } from '../db.js';
 import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
@@ -124,118 +124,214 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     const sql  = getDb();
     const tId  = uid();
 
-    if (club_id) {
-      const [club] = await sql`SELECT id FROM clubs WHERE id = ${club_id}`;
-      if (!club) return res.status(404).json({ error: 'Club no encontrado' });
+    // ── Fase 1: resolución (sólo lectura, en lote) ──────────────────────────
+    // Antes esto era un bucle por jugador con 3-5 consultas cada uno: crear un
+    // americano de 16 parejas disparaba del orden de 150 peticiones HTTPS en
+    // serie contra Neon.
+    const rawNames = playerNames.filter(Boolean).map((n) => n.trim()).filter(Boolean);
+    const usernames = rawNames.filter((n) => n.startsWith('@')).map((n) => n.slice(1)).filter(Boolean);
+
+    const [clubRows, userRows] = await Promise.all([
+      club_id ? sql`SELECT id FROM clubs WHERE id = ${club_id}` : Promise.resolve([]),
+      usernames.length
+        ? sql`SELECT id, name, username FROM users WHERE username = ANY(${usernames})`
+        : Promise.resolve([]),
+    ]);
+
+    if (club_id && clubRows.length === 0) return res.status(404).json({ error: 'Club no encontrado' });
+
+    const userByUsername = new Map(userRows.map((u) => [u.username, u]));
+    for (const username of usernames) {
+      if (!userByUsername.has(username)) {
+        return res.status(404).json({ error: `No existe el usuario @${username}` });
+      }
     }
 
+    // rawName → { resolvedName, inviteUserId, inviteUsername }, preservando el
+    // orden de entrada y descartando duplicados por nombre resuelto.
+    const requested = [];
+    const seenNames = new Set();
+    for (const raw of rawNames) {
+      const found = raw.startsWith('@') ? userByUsername.get(raw.slice(1)) : null;
+      if (raw.startsWith('@') && !found) continue;
+      const resolvedName = found ? found.name : raw;
+      const key = resolvedName.toLowerCase();
+      if (seenNames.has(key)) continue;
+      seenNames.add(key);
+      requested.push({
+        raw,
+        resolvedName,
+        inviteUserId:   found?.id ?? null,
+        inviteUsername: found?.username ?? null,
+      });
+    }
+
+    // Jugadores que ya existen en la categoría, en una sola consulta.
+    const lowerNames = requested.map((r) => r.resolvedName.toLowerCase());
+    const existing = lowerNames.length
+      ? await sql`
+          SELECT p.* FROM players p
+          JOIN group_players gp ON gp.player_id = p.id
+          WHERE gp.group_id = ${groupId} AND LOWER(p.name) = ANY(${lowerNames})
+        `
+      : [];
+    const existingByName = new Map(existing.map((p) => [p.name.toLowerCase(), p]));
+
+    // Invitaciones ya pendientes y aceptaciones previas del usuario en la categoría:
+    // determinan si se omite la invitación o si se auto-acepta.
+    const inviteUserIds = requested.map((r) => r.inviteUserId).filter(Boolean);
+    const existingPlayerIds = [...existingByName.values()].map((p) => p.id);
+    const [pendingRows, priorRows] = await Promise.all([
+      existingPlayerIds.length
+        ? sql`SELECT player_id FROM player_invitations
+              WHERE player_id = ANY(${existingPlayerIds}) AND status = 'pending'`
+        : Promise.resolve([]),
+      inviteUserIds.length
+        ? sql`SELECT DISTINCT invited_user_id FROM player_invitations
+              WHERE group_id = ${groupId} AND invited_user_id = ANY(${inviteUserIds})
+                AND status = 'accepted'`
+        : Promise.resolve([]),
+    ]);
+    const hasPendingInvite = new Set(pendingRows.map((r) => r.player_id));
+    const hasPriorAccept   = new Set(priorRows.map((r) => r.invited_user_id));
+
+    // ── Fase 2: plan de escritura (en memoria, sin tocar la base) ───────────
     const players = [];
-    const nameMap = {};           // rawName.toLowerCase() → player (para matching de parejas)
-    const pendingInvitations = []; // { player, inviteUserId, inviteUsername }
+    const nameMap = {};             // rawName.toLowerCase() → player (matching de parejas)
+    const newPlayers = [];          // filas a insertar en players
+    const autoLink = [];            // player_id que se vincula al creador
+    const invitations = [];         // { player, inviteUserId, inviteUsername, autoAccept }
 
-    for (const rawName of playerNames.filter(Boolean)) {
-      const trimmed = rawName.trim();
-      let resolvedName = trimmed;
-      let inviteUserId   = null;
-      let inviteUsername = null;
-
-      // Resolver @username → nombre real del usuario
-      if (trimmed.startsWith('@')) {
-        const username = trimmed.slice(1);
-        if (!username) continue;
-        const [foundUser] = await sql`SELECT id, name, username FROM users WHERE username = ${username}`;
-        if (!foundUser) return res.status(404).json({ error: `No existe el usuario @${username}` });
-        resolvedName   = foundUser.name;
-        inviteUserId   = foundUser.id;
-        inviteUsername = foundUser.username;
-      }
-
-      let [player] = await sql`
-        SELECT p.* FROM players p
-        JOIN group_players gp ON gp.player_id = p.id
-        WHERE gp.group_id = ${groupId} AND LOWER(p.name) = LOWER(${resolvedName})
-      `;
+    for (const { raw, resolvedName, inviteUserId, inviteUsername } of requested) {
+      let player = existingByName.get(resolvedName.toLowerCase());
       if (!player) {
-        [player] = await sql`
-          INSERT INTO players (id, name) VALUES (${uid()}, ${resolvedName}) RETURNING *
-        `;
+        player = { id: uid(), name: resolvedName, user_id: null };
+        newPlayers.push(player);
       }
-      await sql`INSERT INTO group_players (group_id, player_id)
-        VALUES (${groupId}, ${player.id}) ON CONFLICT DO NOTHING
-      `;
       players.push(player);
-      nameMap[trimmed.toLowerCase()] = player;
+      nameMap[raw.toLowerCase()] = player;
 
-      if (inviteUserId && req.user && inviteUserId === req.user.id) {
-        // El creador se suma a sí mismo → vincular automáticamente, sin invitación
+      if (inviteUserId && inviteUserId === req.user?.id) {
+        // El creador se suma a sí mismo → vincular directo, sin invitación.
         if (!player.user_id) {
-          await sql`UPDATE players SET user_id = ${req.user.id} WHERE id = ${player.id}`;
+          autoLink.push(player.id);
           player.user_id = req.user.id;
         }
       } else if (inviteUserId && !player.user_id && req.user) {
-        pendingInvitations.push({ player, inviteUserId, inviteUsername });
+        if (hasPendingInvite.has(player.id)) continue;
+        const autoAccept = hasPriorAccept.has(inviteUserId);
+        invitations.push({ player, inviteUserId, inviteUsername, autoAccept });
+        if (autoAccept) player.user_id = inviteUserId;
       }
     }
 
-    const [tournament] = await sql`
-        INSERT INTO tournaments (id, group_id, name, mode, format, number_of_courts, club_id, event_date, pending_club_request_id)
-        VALUES (${tId}, ${groupId}, ${name.trim()}, ${mode}, ${format}, ${number_of_courts ?? 1}, ${club_id ?? null}, ${event_date || null}, ${pending_club_request_id ?? null})
-      RETURNING *`;
-
-    for (const player of players) {
-      await sql`
-        INSERT INTO tournament_players (tournament_id, player_id)
-        VALUES (${tId}, ${player.id}) ON CONFLICT DO NOTHING
-      `;
-    }
-
-    // Crear parejas — el nameMap permite que @username matchee con el jugador resuelto
-    const pairs = [];
+    const pairsToInsert = [];
     for (const { p1Name, p2Name } of pairsInput) {
       const p1 = nameMap[p1Name.toLowerCase()] ?? players.find((p) => p.name.toLowerCase() === p1Name.toLowerCase());
       const p2 = nameMap[p2Name.toLowerCase()] ?? players.find((p) => p.name.toLowerCase() === p2Name.toLowerCase());
       if (!p1 || !p2) continue;
-      const [pair] = await sql`
-        INSERT INTO pairs (id, tournament_id, p1_id, p2_id)
-        VALUES (${uid()}, ${tId}, ${p1.id}, ${p2.id}) RETURNING *
-      `;
-      pairs.push(pair);
+      pairsToInsert.push({ id: uid(), tournament_id: tId, p1_id: p1.id, p2_id: p2.id });
     }
 
-    // Crear invitaciones para jugadores agregados por @username (+ notificación).
-    // Auto-aceptar si el usuario ya aceptó antes una invitación en esta misma categoría.
-    for (const { player, inviteUserId, inviteUsername } of pendingInvitations) {
-      const [existing] = await sql`
-        SELECT id FROM player_invitations WHERE player_id = ${player.id} AND status = 'pending'
-      `;
-      if (existing) continue;
-
-      const [prior] = await sql`
-        SELECT 1 FROM player_invitations
-        WHERE group_id = ${groupId} AND invited_user_id = ${inviteUserId} AND status = 'accepted'
-        LIMIT 1
-      `;
-      const autoAccept = !!prior;
-
-      const [invitation] = await sql`
-        INSERT INTO player_invitations
-          (id, player_id, group_id, invited_by, invited_identifier, invited_user_id, status)
-        VALUES
-          (${uid()}, ${player.id}, ${groupId}, ${req.user.id}, ${'@' + inviteUsername}, ${inviteUserId},
-           ${autoAccept ? 'accepted' : 'pending'})
-        RETURNING id
-      `;
-
-      // Si se auto-acepta, vincular el slot de jugador a la cuenta al instante
-      if (autoAccept) {
-        await sql`UPDATE players SET user_id = ${inviteUserId} WHERE id = ${player.id}`;
+    // ── Fase 3: escritura atómica ───────────────────────────────────────────
+    // Sin transacción, un fallo a mitad dejaba la jornada creada con los
+    // jugadores a medias y sin parejas, sin forma de deshacerlo.
+    const { tournament, pairs } = await withTransaction(async (client) => {
+      if (newPlayers.length) {
+        await client.query(
+          `INSERT INTO players (id, name) SELECT * FROM UNNEST($1::text[], $2::text[])`,
+          [newPlayers.map((p) => p.id), newPlayers.map((p) => p.name)]
+        );
       }
 
-      await sql`
-        INSERT INTO notifications (id, user_id, type, actor_id, entity_id)
-        VALUES (${uid()}, ${inviteUserId}, 'invitation', ${req.user.id}, ${invitation.id})
-      `;
-    }
+      if (players.length) {
+        await client.query(
+          `INSERT INTO group_players (group_id, player_id)
+           SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING`,
+          [groupId, players.map((p) => p.id)]
+        );
+      }
+
+      const { rows: [tournamentRow] } = await client.query(
+        `INSERT INTO tournaments
+           (id, group_id, name, mode, format, number_of_courts, club_id, event_date, pending_club_request_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        [tId, groupId, name.trim(), mode, format, number_of_courts ?? 1,
+         club_id ?? null, event_date || null, pending_club_request_id ?? null]
+      );
+
+      if (players.length) {
+        await client.query(
+          `INSERT INTO tournament_players (tournament_id, player_id)
+           SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING`,
+          [tId, players.map((p) => p.id)]
+        );
+      }
+
+      let pairRows = [];
+      if (pairsToInsert.length) {
+        const res = await client.query(
+          `INSERT INTO pairs (id, tournament_id, p1_id, p2_id)
+           SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[]) RETURNING *`,
+          [pairsToInsert.map((p) => p.id), pairsToInsert.map(() => tId),
+           pairsToInsert.map((p) => p.p1_id), pairsToInsert.map((p) => p.p2_id)]
+        );
+        pairRows = res.rows;
+      }
+
+      // Vinculación directa del creador + auto-aceptadas, en una sentencia.
+      const linkToCreator = autoLink;
+      if (linkToCreator.length) {
+        await client.query(
+          `UPDATE players SET user_id = $1 WHERE id = ANY($2::text[])`,
+          [req.user.id, linkToCreator]
+        );
+      }
+
+      if (invitations.length) {
+        const invIds = invitations.map(() => uid());
+        await client.query(
+          `INSERT INTO player_invitations
+             (id, player_id, group_id, invited_by, invited_identifier, invited_user_id, status)
+           SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[])`,
+          [
+            invIds,
+            invitations.map((i) => i.player.id),
+            invitations.map(() => groupId),
+            invitations.map(() => req.user.id),
+            invitations.map((i) => '@' + i.inviteUsername),
+            invitations.map((i) => i.inviteUserId),
+            invitations.map((i) => (i.autoAccept ? 'accepted' : 'pending')),
+          ]
+        );
+
+        const accepted = invitations.filter((i) => i.autoAccept);
+        if (accepted.length) {
+          // Cada slot se vincula a su propia cuenta, así que va con UNNEST y no
+          // con un UPDATE de valor único.
+          await client.query(
+            `UPDATE players p SET user_id = v.user_id
+             FROM (SELECT * FROM UNNEST($1::text[], $2::text[]) AS t(player_id, user_id)) v
+             WHERE p.id = v.player_id`,
+            [accepted.map((i) => i.player.id), accepted.map((i) => i.inviteUserId)]
+          );
+        }
+
+        await client.query(
+          `INSERT INTO notifications (id, user_id, type, actor_id, entity_id)
+           SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])`,
+          [
+            invitations.map(() => uid()),
+            invitations.map((i) => i.inviteUserId),
+            invitations.map(() => 'invitation'),
+            invitations.map(() => req.user.id),
+            invIds,
+          ]
+        );
+      }
+
+      return { tournament: tournamentRow, pairs: pairRows };
+    });
 
     res.status(201).json({ ...tournament, players, pairs, matches: [] });
   } catch (err) { next(err); }

@@ -616,78 +616,49 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       }
     }
 
-    const playerStats = await sql`
-      SELECT
-        p.id, COALESCE(u.name, p.name) AS name, u.avatar_url AS linked_avatar_url,
-        COUNT(DISTINCT t.id)::int AS torneos,
-        SUM(CASE
-          WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
-          WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
-          ELSE 0 END)::int AS victorias,
-        COUNT(m.id)::int AS partidos
-      FROM   players p
-      JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = ${groupId}
-      JOIN   tournaments   t  ON t.group_id = ${groupId}
-      LEFT   JOIN users u ON u.id = p.user_id
-      LEFT JOIN matches    m  ON m.tournament_id = t.id
-        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
-          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
-      GROUP BY p.id, COALESCE(u.name, p.name), u.avatar_url
-      ORDER BY victorias DESC
-    `;
-
-    const tournamentWinners = await sql`
-      WITH pw AS (
-        SELECT t.id AS tid, t.name AS tname, t.created_at,
-               p.id AS pid, COALESCE(u.name, p.name) AS pname,
-               SUM(CASE
-                 WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
-                 WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
-                 ELSE 0 END) AS wins
-        FROM   tournaments t
-        JOIN   matches m ON m.tournament_id = t.id
-        JOIN   players p ON p.id IN (m.team1_p1, m.team1_p2, m.team2_p1, m.team2_p2)
-        LEFT   JOIN users u ON u.id = p.user_id
-        WHERE  t.group_id = ${groupId}
-        GROUP  BY t.id, t.name, t.created_at, p.id, COALESCE(u.name, p.name)
-      ),
-      ranked AS (
-        SELECT *, RANK() OVER (PARTITION BY tid ORDER BY wins DESC) AS rnk
-        FROM pw WHERE wins > 0
-      )
-      SELECT * FROM ranked WHERE rnk = 1 ORDER BY created_at DESC
-    `;
+    // Nota: acá se calculaban dos agregados pesados más, `playerStats` (con un
+    // JOIN a tournaments sin correlacionar, o sea un producto cartesiano
+    // jugadores × jornadas) y `tournamentWinners` (RANK() sobre todos los
+    // partidos de la categoría). Se devolvían bajo `stats` y ningún componente
+    // del frontend los consumía. Eliminados: si alguna vista los necesita en el
+    // futuro, van en su propio endpoint y se piden bajo demanda.
+    // El total de jornadas por categoría sigue viniendo en `tournament_count`
+    // de los listados de grupos, y el ganador de cada jornada en `winner_label`.
 
     // ── Permisos + co-organizadores ─────────────────────────────────────────
+    // Ambas consultas son independientes entre sí: sobre un driver donde cada
+    // sentencia es un round-trip, encadenarlas con await sumaba latencia sin
+    // motivo.
     const viewerId = req.user?.id ?? null;
-    const collaborators = await sql`
-      SELECT u.id AS user_id, u.name, u.username, u.avatar_url
-      FROM   group_collaborators gc
-      JOIN   users u ON u.id = gc.user_id
-      WHERE  gc.group_id = ${groupId}
-      ORDER  BY gc.added_at ASC
-    `;
-    const is_owner   = !!viewerId && group.user_id === viewerId;
-    const can_manage = is_owner || (!!viewerId && collaborators.some((c) => c.user_id === viewerId));
+    const is_owner = !!viewerId && group.user_id === viewerId;
 
-    // Transferencia de propiedad pendiente (solo la ve el dueño)
-    let pending_transfer = null;
-    if (is_owner) {
-      const [pt] = await sql`
-        SELECT ot.id, ot.created_at,
-               u.name AS to_name, u.username AS to_username
-        FROM   ownership_transfers ot
-        LEFT   JOIN users u ON u.id = ot.to_user_id
-        WHERE  ot.group_id = ${groupId} AND ot.status = 'pending'
-        ORDER  BY ot.created_at DESC
-        LIMIT  1
-      `;
-      pending_transfer = pt ?? null;
-    }
+    const [collaborators, transferRows] = await Promise.all([
+      sql`
+        SELECT u.id AS user_id, u.name, u.username, u.avatar_url
+        FROM   group_collaborators gc
+        JOIN   users u ON u.id = gc.user_id
+        WHERE  gc.group_id = ${groupId}
+        ORDER  BY gc.added_at ASC
+      `,
+      // Transferencia de propiedad pendiente (sólo la ve el dueño)
+      is_owner
+        ? sql`
+            SELECT ot.id, ot.created_at,
+                   u.name AS to_name, u.username AS to_username
+            FROM   ownership_transfers ot
+            LEFT   JOIN users u ON u.id = ot.to_user_id
+            WHERE  ot.group_id = ${groupId} AND ot.status = 'pending'
+            ORDER  BY ot.created_at DESC
+            LIMIT  1
+          `
+        : Promise.resolve([]),
+    ]);
+
+    const can_manage = is_owner || (!!viewerId && collaborators.some((c) => c.user_id === viewerId));
+    const pending_transfer = transferRows[0] ?? null;
 
     res.json({
       ...group, tournaments,
-      stats: { playerStats, tournamentWinners },
       collaborators, is_owner, can_manage, pending_transfer,
     });
   } catch (err) { next(err); }
