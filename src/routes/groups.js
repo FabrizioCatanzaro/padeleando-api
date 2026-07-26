@@ -519,7 +519,11 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     const { groupId } = req.params;
     const sql = getDb();
 
-    const [group] = await sql`
+    // Tanda 1: el grupo, sus jornadas y los co-organizadores sólo dependen de
+    // groupId, así que no hay motivo para encadenarlas. Con el driver HTTP de
+    // Neon cada await en serie es un round-trip más a São Paulo.
+    const [[group], tournaments, collaborators] = await Promise.all([
+    sql`
       SELECT g.*, u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
              c.name AS club_name, c.location_name AS club_location_name, c.photo_url AS club_photo_url,
              c.courts AS club_courts,
@@ -533,10 +537,9 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       LEFT JOIN clubs c ON c.id = g.club_id
       LEFT JOIN club_requests cr ON cr.id = g.pending_club_request_id
       WHERE g.id = ${groupId}
-    `;
-    if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
+    `,
 
-    const tournaments = await sql`
+    sql`
       SELECT t.*,
              c.name AS club_name,
              COUNT(DISTINCT m.id)::int  AS match_count,
@@ -550,12 +553,37 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       WHERE  t.group_id = ${groupId}
       GROUP  BY t.id, c.name
       ORDER  BY t.created_at DESC
-    `;
+    `,
+
+    sql`
+      SELECT u.id AS user_id, u.name, u.username, u.avatar_url
+      FROM   group_collaborators gc
+      JOIN   users u ON u.id = gc.user_id
+      WHERE  gc.group_id = ${groupId}
+      ORDER  BY gc.added_at ASC
+    `,
+    ]);
+
+    if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
+
+    const viewerId = req.user?.id ?? null;
+    const is_owner = !!viewerId && group.user_id === viewerId;
 
     // ── Ganador por jornada finalizada ──────────────────────────────────────
-    const finishedIds = tournaments.filter((t) => t.status === 'finished').map((t) => t.id);
-    if (finishedIds.length > 0) {
-      const wins = await sql`
+    const finishedIds  = tournaments.filter((t) => t.status === 'finished').map((t) => t.id);
+    const pairsModeIds = tournaments
+      .filter((t) => t.status === 'finished' && t.mode === 'pairs')
+      .map((t) => t.id);
+    // Americano: resolver ganador desde pares actuales (no desde el string guardado en el bracket)
+    const americanoFinished = tournaments.filter(
+      (t) => t.status === 'finished' && t.format === 'americano' && t.bracket?.final?.winner_id
+    );
+    const americanoPairIds = americanoFinished.map((t) => t.bracket.final.winner_id);
+
+    // Tanda 2: los tres agregados derivan de `tournaments`, no unos de otros, y
+    // la transferencia pendiente sólo necesitaba saber si mira el dueño.
+    const [wins, allPairs, americanoPairs, transferRows] = await Promise.all([
+      finishedIds.length ? sql`
         SELECT tournament_id, player_id,
                SUM(won)::int AS wins, SUM(diff)::int AS gdiff
         FROM (
@@ -576,43 +604,50 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team2_p2 IS NOT NULL
         ) sub WHERE player_id IS NOT NULL
         GROUP BY tournament_id, player_id
-      `;
+      ` : [],
 
-      const playerIds = [...new Set(wins.map((w) => w.player_id))];
-      const pNames = playerIds.length
-        ? await sql`
-            SELECT p.id, COALESCE(u.name, p.name) AS name
-            FROM players p LEFT JOIN users u ON u.id = p.user_id
-            WHERE p.id = ANY(${playerIds})
-          `
-        : [];
-      const nameById = Object.fromEntries(pNames.map((p) => [p.id, p.name]));
+      pairsModeIds.length
+        ? sql`SELECT * FROM pairs WHERE tournament_id = ANY(${pairsModeIds})`
+        : [],
 
-      const pairsModeIds = tournaments
-        .filter((t) => t.status === 'finished' && t.mode === 'pairs')
-        .map((t) => t.id);
-      const allPairs = pairsModeIds.length
-        ? await sql`SELECT * FROM pairs WHERE tournament_id = ANY(${pairsModeIds})`
-        : [];
+      americanoPairIds.length ? sql`
+        SELECT pr.id,
+          COALESCE(u1.name, p1.name) AS p1_name,
+          COALESCE(u2.name, p2.name) AS p2_name
+        FROM pairs pr
+        JOIN players p1 ON p1.id = pr.p1_id LEFT JOIN users u1 ON u1.id = p1.user_id
+        JOIN players p2 ON p2.id = pr.p2_id LEFT JOIN users u2 ON u2.id = p2.user_id
+        WHERE pr.id = ANY(${americanoPairIds})
+      ` : [],
 
+      // Transferencia de propiedad pendiente (sólo la ve el dueño)
+      is_owner ? sql`
+        SELECT ot.id, ot.created_at,
+               u.name AS to_name, u.username AS to_username
+        FROM   ownership_transfers ot
+        LEFT   JOIN users u ON u.id = ot.to_user_id
+        WHERE  ot.group_id = ${groupId} AND ot.status = 'pending'
+        ORDER  BY ot.created_at DESC
+        LIMIT  1
+      ` : [],
+    ]);
+
+    // Tanda 3: los nombres son lo único que depende de un resultado anterior.
+    const playerIds = [...new Set(wins.map((w) => w.player_id))];
+    const pNames = playerIds.length
+      ? await sql`
+          SELECT p.id, COALESCE(u.name, p.name) AS name
+          FROM players p LEFT JOIN users u ON u.id = p.user_id
+          WHERE p.id = ANY(${playerIds})
+        `
+      : [];
+    const nameById = Object.fromEntries(pNames.map((p) => [p.id, p.name]));
+
+    if (finishedIds.length > 0) {
       const winsByT = {};
       wins.forEach((w) => { (winsByT[w.tournament_id] ??= []).push(w); });
 
-      // Americano: resolver ganador desde pares actuales (no desde el string guardado en el bracket)
-      const americanoFinished = tournaments.filter(
-        (t) => t.status === 'finished' && t.format === 'americano' && t.bracket?.final?.winner_id
-      );
       if (americanoFinished.length > 0) {
-        const americanoPairIds = americanoFinished.map((t) => t.bracket.final.winner_id);
-        const americanoPairs = await sql`
-          SELECT pr.id,
-            COALESCE(u1.name, p1.name) AS p1_name,
-            COALESCE(u2.name, p2.name) AS p2_name
-          FROM pairs pr
-          JOIN players p1 ON p1.id = pr.p1_id LEFT JOIN users u1 ON u1.id = p1.user_id
-          JOIN players p2 ON p2.id = pr.p2_id LEFT JOIN users u2 ON u2.id = p2.user_id
-          WHERE pr.id = ANY(${americanoPairIds})
-        `;
         const americanoWinnerByPair = Object.fromEntries(
           americanoPairs.map((p) => [p.id, `${p.p1_name} & ${p.p2_name}`])
         );
@@ -652,35 +687,6 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     // futuro, van en su propio endpoint y se piden bajo demanda.
     // El total de jornadas por categoría sigue viniendo en `tournament_count`
     // de los listados de grupos, y el ganador de cada jornada en `winner_label`.
-
-    // ── Permisos + co-organizadores ─────────────────────────────────────────
-    // Ambas consultas son independientes entre sí: sobre un driver donde cada
-    // sentencia es un round-trip, encadenarlas con await sumaba latencia sin
-    // motivo.
-    const viewerId = req.user?.id ?? null;
-    const is_owner = !!viewerId && group.user_id === viewerId;
-
-    const [collaborators, transferRows] = await Promise.all([
-      sql`
-        SELECT u.id AS user_id, u.name, u.username, u.avatar_url
-        FROM   group_collaborators gc
-        JOIN   users u ON u.id = gc.user_id
-        WHERE  gc.group_id = ${groupId}
-        ORDER  BY gc.added_at ASC
-      `,
-      // Transferencia de propiedad pendiente (sólo la ve el dueño)
-      is_owner
-        ? sql`
-            SELECT ot.id, ot.created_at,
-                   u.name AS to_name, u.username AS to_username
-            FROM   ownership_transfers ot
-            LEFT   JOIN users u ON u.id = ot.to_user_id
-            WHERE  ot.group_id = ${groupId} AND ot.status = 'pending'
-            ORDER  BY ot.created_at DESC
-            LIMIT  1
-          `
-        : Promise.resolve([]),
-    ]);
 
     const can_manage = is_owner || (!!viewerId && collaborators.some((c) => c.user_id === viewerId));
     const pending_transfer = transferRows[0] ?? null;
