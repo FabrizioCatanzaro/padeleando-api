@@ -12,10 +12,6 @@ const WEBHOOK_SECRET = process.env.RESEND_WEBHOOK_SECRET;
 
 const router = Router();
 
-// El header From del reenvío debe ser una dirección de un dominio verificado en
-// Resend — no se puede poner la del remitente original. Lo que sí se puede es
-// mostrarlo en el display name, que es lo que se ve en la bandeja de entrada.
-// `original` viene como `"Nombre" <mail@x.com>` o como `mail@x.com` a secas.
 // Devuelve solo la dirección de un `Nombre <mail@x.com>` (o el string tal cual
 // si ya viene pelado).
 function addressOf(value) {
@@ -23,6 +19,10 @@ function addressOf(value) {
   return (/<([^>]+)>/.exec(value)?.[1] ?? value).trim();
 }
 
+// El header From del reenvío debe ser una dirección de un dominio verificado en
+// Resend — no se puede poner la del remitente original. Lo que sí se puede es
+// mostrarlo en el display name, que es lo que se ve en la bandeja de entrada.
+// `original` viene como `"Nombre" <mail@x.com>` o como `mail@x.com` a secas.
 function buildForwardFrom(original) {
   if (!original) return FORWARD_FROM;
 
@@ -37,6 +37,56 @@ function buildForwardFrom(original) {
   if (!label) return FORWARD_FROM;
 
   return `"${label}" <${addressOf(FORWARD_FROM)}>`;
+}
+
+// Los adjuntos del inbound no viajan solos: hay que bajarlos de su URL firmada y
+// re-adjuntarlos al reenvío. El tope evita que una tanda de fotos pesadas haga
+// rebotar el envío (base64 infla ~33%) o se coma la memoria del contenedor.
+const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+
+async function collectAttachments(emailId) {
+  const attachments = [];
+  const skipped     = [];
+
+  const { data, error } = await resend.emails.receiving.attachments.list({ emailId });
+  if (error) {
+    console.error('Webhook Resend: fallo al listar adjuntos —', error);
+    return { attachments, skipped };
+  }
+
+  let total = 0;
+  for (const att of data?.data ?? []) {
+    const name = att.filename || `adjunto-${att.id}`;
+
+    if (total + att.size > MAX_ATTACHMENT_BYTES) {
+      skipped.push(name);
+      continue;
+    }
+
+    try {
+      const resp = await fetch(att.download_url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      const buffer = Buffer.from(await resp.arrayBuffer());
+      total += buffer.length;
+
+      attachments.push({
+        filename:    name,
+        content:     buffer.toString('base64'),
+        contentType: att.content_type,
+        // Las imágenes incrustadas en el HTML se referencian por cid: — sin el
+        // contentId el cuerpo llegaría con los huecos rotos.
+        ...(att.content_disposition === 'inline' && att.content_id
+          ? { contentId: att.content_id }
+          : {}),
+      });
+    } catch (err) {
+      console.error(`Webhook Resend: no se pudo bajar el adjunto ${name} —`, err.message);
+      skipped.push(name);
+    }
+  }
+
+  return { attachments, skipped };
 }
 
 // ── POST /api/emails/webhook ─────────────────────────────────────────────────
@@ -96,24 +146,37 @@ router.post('/webhook', async (req, res) => {
 
     const replyTo = mail.reply_to?.length ? mail.reply_to : mail.from;
 
+    const { attachments, skipped } = mail.attachments?.length
+      ? await collectAttachments(event.data.email_id)
+      : { attachments: [], skipped: [] };
+
+    // Lo que no se pudo adjuntar se avisa en el cuerpo: el original siempre
+    // queda entero en el panel de Resend.
+    const notice = skipped.length
+      ? `No se pudieron adjuntar: ${skipped.join(', ')}. El mail original está en Resend.`
+      : '';
+
+    const html = mail.html
+      ? (notice ? `${mail.html}<hr><p><em>${notice}</em></p>` : mail.html)
+      : null;
+    const text = mail.text
+      ? (notice ? `${mail.text}\n\n---\n${notice}` : mail.text)
+      : (html ? null : notice || '(mensaje sin cuerpo)');
+
     const { error } = await resend.emails.send({
       from:    buildForwardFrom(mail.from),
       to:      FORWARD_TO,
       replyTo,
       subject: mail.subject || '(sin asunto)',
       // send exige html o text; si el original no trae ninguno se manda un texto mínimo.
-      ...(mail.html ? { html: mail.html } : {}),
-      ...(mail.text || !mail.html ? { text: mail.text || '(mensaje sin cuerpo)' } : {}),
+      ...(html !== null ? { html } : {}),
+      ...(text !== null ? { text } : {}),
+      ...(attachments.length ? { attachments } : {}),
     });
 
     if (error) {
       console.error('Webhook Resend: fallo al reenviar —', error);
       return res.sendStatus(500);
-    }
-
-    // Los adjuntos no viajan: habría que descargarlos uno a uno y re-subirlos.
-    if (mail.attachments?.length) {
-      console.warn(`Webhook Resend: ${mail.attachments.length} adjunto(s) no reenviado(s) — ver el mail en Resend`);
     }
   } catch (err) {
     console.error('Webhook Resend: excepción al reenviar —', err.message);
