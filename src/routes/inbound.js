@@ -12,6 +12,27 @@ const WEBHOOK_SECRET = process.env.RESEND_WEBHOOK_SECRET;
 
 const router = Router();
 
+// El header From del reenvío debe ser una dirección de un dominio verificado en
+// Resend — no se puede poner la del remitente original. Lo que sí se puede es
+// mostrarlo en el display name, que es lo que se ve en la bandeja de entrada.
+// `original` viene como `"Nombre" <mail@x.com>` o como `mail@x.com` a secas.
+function buildForwardFrom(original) {
+  if (!original) return FORWARD_FROM;
+
+  const parsed = /^\s*(.*?)\s*<([^>]+)>\s*$/.exec(original);
+  const name   = parsed ? parsed[1].replace(/^"|"$/g, '').trim() : '';
+  const email  = parsed ? parsed[2].trim() : original.trim();
+
+  // Se quita todo lo que pueda romper el header (comillas, <>, comas, saltos).
+  const label = (name ? `${name} (${email})` : email)
+    .replace(/["<>,\r\n]/g, '')
+    .slice(0, 70);
+  if (!label) return FORWARD_FROM;
+
+  const address = /<([^>]+)>/.exec(FORWARD_FROM)?.[1] ?? FORWARD_FROM;
+  return `"${label}" <${address}>`;
+}
+
 // ── POST /api/emails/webhook ─────────────────────────────────────────────────
 // Webhook de Resend para inbound email (evento email.received). Reenvía cada
 // correo recibido en hola@padeleando.ar a la casilla configurada.
@@ -51,7 +72,7 @@ router.post('/webhook', async (req, res) => {
   try {
     const { error } = await resend.emails.receiving.forward({
       emailId:     event.data.email_id,
-      from:        FORWARD_FROM,
+      from:        buildForwardFrom(event.data?.from),
       to:          FORWARD_TO,
       passthrough: true,   // reenvía el correo original tal cual (Reply-To → remitente real)
     });

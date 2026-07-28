@@ -402,28 +402,36 @@ router.patch('/:id/live', requireAuth, requireTournamentManage, async (req, res,
 
 // POST /api/tournaments/:id/schedule
 // Genera un calendario aleatorio para la fase previa del Americano.
-// Cada pareja juega exactamente 2 partidos contra rivales distintos.
+// Cada pareja juega 2 partidos contra rivales distintos, contando los partidos
+// que ya estaban registrados: una pareja que ya jugó 2 no vuelve a aparecer y
+// no se repiten cruces ya jugados.
 // No crea partidos en BD — devuelve el calendario propuesto.
 router.post('/:id/schedule', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
     const sql = getDb();
-    const [tournament] = await sql`SELECT * FROM tournaments WHERE id = ${req.params.id}`;
+    const [[tournament], pairsRaw, matches] = await Promise.all([
+      sql`SELECT * FROM tournaments WHERE id = ${req.params.id}`,
+      sql`
+        SELECT pr.id, pr.p1_id, pr.p2_id, p1.name AS p1_name, p2.name AS p2_name
+        FROM pairs pr
+        JOIN players p1 ON p1.id = pr.p1_id
+        JOIN players p2 ON p2.id = pr.p2_id
+        WHERE pr.tournament_id = ${req.params.id}
+      `,
+      sql`
+        SELECT team1_p1, team1_p2, team2_p1, team2_p2, created_at
+        FROM matches WHERE tournament_id = ${req.params.id}
+        ORDER BY created_at
+      `,
+    ]);
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
     if (tournament.format !== 'americano') return res.status(400).json({ error: 'Solo disponible en formato Americano' });
-
-    const pairsRaw = await sql`
-      SELECT pr.id, p1.name AS p1_name, p2.name AS p2_name
-      FROM pairs pr
-      JOIN players p1 ON p1.id = pr.p1_id
-      JOIN players p2 ON p2.id = pr.p2_id
-      WHERE pr.tournament_id = ${req.params.id}
-    `;
 
     if (pairsRaw.length < 8 || pairsRaw.length > 16) {
       return res.status(400).json({ error: 'Se necesitan entre 8 y 16 parejas para generar el calendario' });
     }
 
-    const schedule = generatePreviaSchedule(pairsRaw);
+    const schedule = generatePreviaSchedule(pairsRaw, matches);
     res.json({ schedule });
   } catch (err) { next(err); }
 });
@@ -533,65 +541,246 @@ router.patch('/:id/bracket/:matchId', requireAuth, requireTournamentManage, asyn
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+const MAX_PREVIA_MATCHES = 2;
+const SCHEDULE_ATTEMPTS  = 200;
+
 /**
- * Genera un calendario de fase previa donde cada pareja juega exactamente 2 partidos
- * contra rivales distintos.
- * @param {Array} pairs - [{ id, p1_name, p2_name }]
+ * Genera un calendario de fase previa donde cada pareja llega a 2 partidos
+ * contra rivales distintos, contando los que ya jugó.
+ *
+ * Los partidos ya registrados se devuelven como parte del calendario (el front
+ * los muestra con su resultado) y consumen cupo: una pareja con 2 partidos
+ * jugados no recibe nuevos cruces, y una con 1 recibe uno solo, contra un rival
+ * al que todavía no enfrentó.
+ *
+ * @param {Array} pairs   - [{ id, p1_id, p2_id, p1_name, p2_name }]
+ * @param {Array} matches - registros de matches (fase previa) del torneo
  * @returns {Array} - [{ round, team1: { id, name }, team2: { id, name } }]
  */
-function generatePreviaSchedule(pairs) {
-  const shuffled = [...pairs].sort(() => Math.random() - 0.5);
-  const rounds = buildRoundRobin(shuffled);
-  const schedule = [];
-  const byePairs = [];
+function generatePreviaSchedule(pairs, matches = []) {
+  const key      = (p) => String(p.id);
+  const pairName = (p) => `${p.p1_name} & ${p.p2_name}`;
+  const findPair = (a, b) => pairs.find((pr) =>
+    (String(pr.p1_id) === String(a) && String(pr.p2_id) === String(b)) ||
+    (String(pr.p1_id) === String(b) && String(pr.p2_id) === String(a))
+  );
 
-  for (let r = 0; r < Math.min(2, rounds.length); r++) {
-    for (const [a, b] of rounds[r].matches) {
-      schedule.push({
-        round: r + 1,
-        team1: { id: a.id, name: `${a.p1_name} & ${a.p2_name}` },
-        team2: { id: b.id, name: `${b.p1_name} & ${b.p2_name}` },
-      });
+  // Partidos ya jugados: cuentan para el cupo de 2 y bloquean la revancha.
+  const playedFixtures = [];
+  const played = new Map(pairs.map((p) => [key(p), 0]));
+  const faced  = new Map(pairs.map((p) => [key(p), new Set()]));
+  for (const m of matches) {
+    const a = findPair(m.team1_p1, m.team1_p2);
+    const b = findPair(m.team2_p1, m.team2_p2);
+    if (!a || !b || key(a) === key(b)) continue;   // partido que no mapea a las parejas actuales
+    played.set(key(a), played.get(key(a)) + 1);
+    played.set(key(b), played.get(key(b)) + 1);
+    faced.get(key(a)).add(key(b));
+    faced.get(key(b)).add(key(a));
+    playedFixtures.push([a, b]);
+  }
+
+  const need = new Map(pairs.map((p) => [key(p), Math.max(0, MAX_PREVIA_MATCHES - played.get(key(p)))]));
+
+  // Con 2 partidos por pareja el calendario es una unión de ciclos, y un ciclo de
+  // largo impar obliga a una 3ª ronda. Encadenar todo en un único ciclo mantiene
+  // el calendario en 2 rondas (3 sólo si el total de parejas es impar).
+  let best = buildCycleFixtures(pairs, need, faced, playedFixtures);
+
+  // Si la topología de los partidos ya jugados no permite un ciclo único (o no se
+  // encontró encadenado válido), greedy aleatorio con reintentos: puede quedar una
+  // pareja cuyos únicos rivales disponibles ya enfrentó, así que probamos varias
+  // veces y nos quedamos con la que deja menos cupo libre.
+  if (!best) {
+    for (const allowRematch of [false, true]) {
+      for (let i = 0; i < SCHEDULE_ATTEMPTS; i++) {
+        const attempt = buildFixtures(pairs, need, faced, allowRematch);
+        if (!best || attempt.leftover < best.leftover) best = attempt;
+        if (best.leftover === 0) break;
+      }
+      if (best.leftover === 0) break;
     }
-    if (rounds[r].bye) byePairs.push(rounds[r].bye);
   }
 
-  // N impar: las 2 parejas con bye se enfrentan entre sí
-  if (byePairs.length === 2) {
-    const [a, b] = byePairs;
-    schedule.push({
-      round: 3,
-      team1: { id: a.id, name: `${a.p1_name} & ${a.p2_name}` },
-      team2: { id: b.id, name: `${b.p1_name} & ${b.p2_name}` },
-    });
-  }
-
-  return schedule;
+  return assignRounds([...playedFixtures, ...best.fixtures], pairName);
 }
 
 /**
- * Genera rondas de round-robin. Cada ronda retorna { matches, bye }.
- * Si N es impar, agrega un null temporario; la pareja que cae con null queda como bye.
+ * Arma los cruces faltantes encadenando todo en un único ciclo.
+ *
+ * Los partidos ya jugados forman cadenas (caminos) de parejas; las parejas sin
+ * partidos son cadenas de una. Ordenando las cadenas al azar y uniendo el final
+ * de cada una con el principio de la siguiente se cierra un ciclo único, donde
+ * cada pareja queda con exactamente 2 partidos y el calendario entra en 2 rondas.
+ *
+ * @returns {{ fixtures: Array<[pair, pair]>, leftover: 0 } | null} null si la
+ *   topología no lo permite (una pareja con 3+ partidos jugados, ramificaciones)
+ *   o si no se encontró un encadenado sin revanchas.
  */
-function buildRoundRobin(teams) {
-  const list = [...teams];
-  if (list.length % 2 !== 0) list.push(null);
-  const n = list.length;
-  const rounds = [];
-
-  for (let r = 0; r < n - 1; r++) {
-    const round = { matches: [], bye: null };
-    for (let i = 0; i < n / 2; i++) {
-      const a = list[i];
-      const b = list[n - 1 - i];
-      if (a === null) round.bye = b;
-      else if (b === null) round.bye = a;
-      else round.matches.push([a, b]);
-    }
-    rounds.push(round);
-    list.splice(1, 0, list.pop());
+function buildCycleFixtures(pairs, need, faced, playedFixtures) {
+  const byKey = new Map(pairs.map((p) => [String(p.id), p]));
+  const adj   = new Map(pairs.map((p) => [String(p.id), new Set()]));
+  for (const [a, b] of playedFixtures) {
+    adj.get(String(a.id)).add(String(b.id));
+    adj.get(String(b.id)).add(String(a.id));
   }
-  return rounds;
+
+  // Cada componente conexo aporta una cadena con sus dos extremos libres.
+  const visited = new Set();
+  const chains  = [];
+  for (const p of pairs) {
+    const start = String(p.id);
+    if (visited.has(start)) continue;
+    const comp  = [];
+    const stack = [start];
+    visited.add(start);
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      comp.push(cur);
+      for (const nb of adj.get(cur)) if (!visited.has(nb)) { visited.add(nb); stack.push(nb); }
+    }
+    const free = comp.filter((v) => need.get(v) > 0);
+    if (free.length === 0) continue;                                  // ya completó sus 2 partidos
+    if (comp.length === 1) { chains.push([start, start]); continue; } // pareja sin partidos: cadena de una
+    if (free.length === 2 && free.every((v) => need.get(v) === 1)) { chains.push([free[0], free[1]]); continue; }
+    return null;                                                      // topología inesperada
+  }
+
+  if (chains.length === 0) return { fixtures: [], leftover: 0 };
+
+  for (let attempt = 0; attempt < SCHEDULE_ATTEMPTS; attempt++) {
+    // Orden y orientación de las cadenas al azar → ciclo distinto en cada intento.
+    const order = chains
+      .map((c) => ({ c, r: Math.random() }))
+      .sort((x, y) => x.r - y.r)
+      .map(({ c }) => (Math.random() < 0.5 ? [c[1], c[0]] : c));
+
+    const fixtures = [];
+    const used = new Set();
+    let ok = true;
+    for (let i = 0; i < order.length && ok; i++) {
+      const a = order[i][1];
+      const b = order[(i + 1) % order.length][0];
+      const edge = [a, b].sort().join('|');
+      if (a === b || used.has(edge) || faced.get(a).has(b)) { ok = false; break; }
+      used.add(edge);
+      fixtures.push([byKey.get(a), byKey.get(b)]);
+    }
+    if (ok) return { fixtures, leftover: 0 };
+  }
+
+  return null;
+}
+
+/**
+ * Arma cruces respetando el cupo restante de cada pareja (`need`) y, salvo que
+ * `allowRematch` lo permita, sin repetir rivales ya enfrentados.
+ * @returns {{ fixtures: Array<[pair, pair]>, leftover: number }} leftover = cupo que no se pudo cubrir
+ */
+function buildFixtures(pairs, need, faced, allowRematch) {
+  const remaining = new Map(need);
+  const scheduled = new Map(pairs.map((p) => [String(p.id), new Set()]));
+  const fixtures  = [];
+  let leftover    = 0;
+
+  // De los candidatos con más cupo pendiente, uno al azar.
+  const pickHungriest = (list) => {
+    const max = Math.max(...list.map((p) => remaining.get(String(p.id))));
+    const top = list.filter((p) => remaining.get(String(p.id)) === max);
+    return top[Math.floor(Math.random() * top.length)];
+  };
+
+  for (;;) {
+    const active = pairs.filter((p) => remaining.get(String(p.id)) > 0);
+    if (active.length < 2) break;
+
+    const a  = pickHungriest(active);
+    const ka = String(a.id);
+    const candidates = active.filter((p) => {
+      const kp = String(p.id);
+      if (kp === ka) return false;
+      if (scheduled.get(ka).has(kp)) return false;
+      return allowRematch || !faced.get(ka).has(kp);
+    });
+
+    if (candidates.length === 0) {
+      leftover += remaining.get(ka);
+      remaining.set(ka, 0);
+      continue;
+    }
+
+    const b  = pickHungriest(candidates);
+    const kb = String(b.id);
+    remaining.set(ka, remaining.get(ka) - 1);
+    remaining.set(kb, remaining.get(kb) - 1);
+    scheduled.get(ka).add(kb);
+    scheduled.get(kb).add(ka);
+    fixtures.push([a, b]);
+  }
+
+  // Las parejas que quedaron solas (sin rival con cupo) también cuentan.
+  for (const p of pairs) leftover += remaining.get(String(p.id));
+
+  return { fixtures, leftover };
+}
+
+/**
+ * Agrupa los cruces en rondas donde ninguna pareja juega dos veces — así toda una
+ * ronda puede jugarse en paralelo.
+ *
+ * Los cruces se recorren siguiendo las cadenas del calendario (cada partido
+ * arranca donde terminó el anterior) y a cada uno se le da la ronda más baja
+ * libre: alternando así, un ciclo par entra en 2 rondas y uno impar en 3, que es
+ * el mínimo posible. Ordenar por orden de aparición, en cambio, estira el
+ * calendario con rondas de relleno.
+ */
+function assignRounds(fixtures, pairName) {
+  const edges = fixtures.map(([a, b], i) => ({ i, a: String(a.id), b: String(b.id) }));
+  const incident = new Map();
+  for (const e of edges) {
+    for (const v of [e.a, e.b]) {
+      if (!incident.has(v)) incident.set(v, []);
+      incident.get(v).push(e);
+    }
+  }
+
+  // Arrancar por las parejas con un solo partido (extremos de cadena) para que el
+  // recorrido siga caminos completos antes de entrar en los ciclos.
+  const starts = [...incident.keys()].sort(
+    (x, y) => incident.get(x).length - incident.get(y).length
+  );
+
+  const walked = new Set();
+  const order  = [];
+  for (const start of starts) {
+    let v = start;
+    for (;;) {
+      const next = incident.get(v).find((e) => !walked.has(e.i));
+      if (!next) break;
+      walked.add(next.i);
+      order.push(next);
+      v = next.a === v ? next.b : next.a;
+    }
+  }
+
+  const busy   = [];   // busy[r] = Set de parejas que ya juegan en la ronda r
+  const rounds = new Array(edges.length);
+  for (const e of order) {
+    let r = 0;
+    while (busy[r] && (busy[r].has(e.a) || busy[r].has(e.b))) r++;
+    if (!busy[r]) busy[r] = new Set();
+    busy[r].add(e.a);
+    busy[r].add(e.b);
+    rounds[e.i] = r + 1;
+  }
+
+  return fixtures
+    .map(([a, b], i) => ({
+      round: rounds[i],
+      team1: { id: a.id, name: pairName(a) },
+      team2: { id: b.id, name: pairName(b) },
+    }))
+    .sort((x, y) => x.round - y.round);
 }
 
 /**
