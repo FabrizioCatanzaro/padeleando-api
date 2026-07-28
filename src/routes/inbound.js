@@ -16,6 +16,13 @@ const router = Router();
 // Resend — no se puede poner la del remitente original. Lo que sí se puede es
 // mostrarlo en el display name, que es lo que se ve en la bandeja de entrada.
 // `original` viene como `"Nombre" <mail@x.com>` o como `mail@x.com` a secas.
+// Devuelve solo la dirección de un `Nombre <mail@x.com>` (o el string tal cual
+// si ya viene pelado).
+function addressOf(value) {
+  if (!value) return '';
+  return (/<([^>]+)>/.exec(value)?.[1] ?? value).trim();
+}
+
 function buildForwardFrom(original) {
   if (!original) return FORWARD_FROM;
 
@@ -29,8 +36,7 @@ function buildForwardFrom(original) {
     .slice(0, 70);
   if (!label) return FORWARD_FROM;
 
-  const address = /<([^>]+)>/.exec(FORWARD_FROM)?.[1] ?? FORWARD_FROM;
-  return `"${label}" <${address}>`;
+  return `"${label}" <${addressOf(FORWARD_FROM)}>`;
 }
 
 // ── POST /api/emails/webhook ─────────────────────────────────────────────────
@@ -69,17 +75,45 @@ router.post('/webhook', async (req, res) => {
     return res.sendStatus(200);
   }
 
+  // Corta el bucle: si el que escribe es la propia casilla de destino, reenviar
+  // le devolvería su mismo mensaje (pasa al responder a soporte@ en vez de al
+  // remitente real). Se acusa 200 para que Resend no reintente.
+  if (addressOf(event.data?.from).toLowerCase() === addressOf(FORWARD_TO).toLowerCase()) {
+    console.warn('Webhook Resend: mail originado en la casilla de destino — no se reenvía');
+    return res.sendStatus(200);
+  }
+
   try {
-    const { error } = await resend.emails.receiving.forward({
-      emailId:     event.data.email_id,
-      from:        buildForwardFrom(event.data?.from),
-      to:          FORWARD_TO,
-      passthrough: true,   // reenvía el correo original tal cual (Reply-To → remitente real)
+    // `receiving.forward()` no permite fijar Reply-To, así que la respuesta
+    // volvía a soporte@ y reentraba por el inbound. Se trae el mail y se reenvía
+    // con emails.send(), que sí acepta replyTo → apunta al remitente real.
+    const { data: mail, error: fetchError } = await resend.emails.receiving.get(event.data.email_id);
+
+    if (fetchError || !mail) {
+      console.error('Webhook Resend: fallo al leer el mail entrante —', fetchError);
+      return res.sendStatus(500);   // 5xx → Resend reintenta
+    }
+
+    const replyTo = mail.reply_to?.length ? mail.reply_to : mail.from;
+
+    const { error } = await resend.emails.send({
+      from:    buildForwardFrom(mail.from),
+      to:      FORWARD_TO,
+      replyTo,
+      subject: mail.subject || '(sin asunto)',
+      // send exige html o text; si el original no trae ninguno se manda un texto mínimo.
+      ...(mail.html ? { html: mail.html } : {}),
+      ...(mail.text || !mail.html ? { text: mail.text || '(mensaje sin cuerpo)' } : {}),
     });
 
     if (error) {
       console.error('Webhook Resend: fallo al reenviar —', error);
-      return res.sendStatus(500);   // 5xx → Resend reintenta
+      return res.sendStatus(500);
+    }
+
+    // Los adjuntos no viajan: habría que descargarlos uno a uno y re-subirlos.
+    if (mail.attachments?.length) {
+      console.warn(`Webhook Resend: ${mail.attachments.length} adjunto(s) no reenviado(s) — ver el mail en Resend`);
     }
   } catch (err) {
     console.error('Webhook Resend: excepción al reenviar —', err.message);
