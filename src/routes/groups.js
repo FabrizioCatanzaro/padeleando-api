@@ -161,6 +161,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         COALESCE(SUM(m.duration_seconds), 0)::int AS segundos_jugados,
         COUNT(m.id) FILTER (WHERE m.duration_seconds > 0)::int AS partidos_con_duracion,
         -- Partidos definidos por un solo game.
+        COUNT(DISTINCT CASE WHEN m.played_at >= DATE_TRUNC('month', CURRENT_DATE)
+                            THEN tp.tournament_id END)::int AS torneos_este_mes,
         COUNT(m.id) FILTER (WHERE ABS(m.score1 - m.score2) = 1)::int AS ajustados,
         COUNT(m.id) FILTER (WHERE ABS(m.score1 - m.score2) = 1 AND (
           (m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id)) OR
@@ -414,7 +416,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     // Clubes donde jugó; los torneos sin club quedan afuera.
     sql`
       SELECT
-        c.id, c.name, c.location_name,
+        c.id, c.name, c.location_name, c.photo_url,
         COUNT(m.id)::int AS partidos,
         COALESCE(SUM(CASE
           WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
@@ -428,7 +430,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       JOIN tournaments t ON t.id = m.tournament_id
       JOIN clubs c ON c.id = t.club_id
       WHERE p.user_id = ${owner.id}
-      GROUP BY c.id, c.name, c.location_name
+      GROUP BY c.id, c.name, c.location_name, c.photo_url
       ORDER BY partidos DESC
       LIMIT 5
     `,
@@ -542,7 +544,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const base = playerStats ?? {
       torneos: 0, partidos: 0, victorias: 0, torneos_americanos: 0, games_favor: 0, games_contra: 0,
       segundos_jugados: 0, partidos_con_duracion: 0,
-      ajustados: 0, ajustados_ganados: 0,
+      ajustados: 0, ajustados_ganados: 0, torneos_este_mes: 0,
     };
     const titulosLiga      = countLeagueTitles(leagueRows);
     const titulosAmericano = americanoChamp?.campeon_americano ?? 0;
@@ -713,7 +715,7 @@ router.get('/:groupId/history', async (req, res, next) => {
 
     const tournaments = await sql`
       SELECT t.id, t.name, t.created_at, t.status, t.mode, t.format, t.bracket,
-             t.event_date, t.club_id, c.name AS club_name
+             t.event_date, t.club_id, c.name AS club_name, c.photo_url AS club_photo_url
       FROM   tournaments t
       LEFT   JOIN clubs c ON c.id = t.club_id
       WHERE  t.group_id = ${groupId}
