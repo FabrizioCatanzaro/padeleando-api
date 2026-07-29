@@ -1,21 +1,10 @@
-// Helpers del perfil público (GET /groups/user/:username).
-//
-// Los partidos de la fase eliminatoria de un americano NO viven en la tabla
-// `matches`: están dentro de `tournaments.bracket` (JSONB). Todas las stats del
-// perfil se calculaban en SQL contra `matches`, así que un usuario veía
-// "campeón americano: 1" pero los partidos con los que ganó ese título no
-// contaban en sus partidos, victorias, racha, games ni actividad. Estas
-// funciones expanden el bracket para que el perfil mida lo mismo que la vista
-// del torneo (ver getAllMatches en src/components/Stats/Stats.jsx).
+// Helpers del perfil público (GET /groups/user/:username). Los partidos de la
+// fase eliminatoria viven en tournaments.bracket (JSONB), no en la tabla
+// matches: acá se expanden para que el perfil mida lo mismo que el torneo.
 
 const ROUNDS = ['octavos', 'cuartos', 'semis'];
 
-/**
- * Día comparable (YYYY-MM-DD) de un played_at. El driver de Neon devuelve las
- * columnas DATE como objetos Date, y `String(date).slice(0, 10)` da "Tue Jul
- * 28": ordenar por eso es ordenar por día de la semana. Los partidos del cuadro
- * ya vienen como texto porque los castea la consulta.
- */
+/** Día comparable (YYYY-MM-DD): Neon devuelve las columnas DATE como Date. */
 export function dayKey(value) {
   if (!value) return '';
   if (value instanceof Date) return value.toISOString().slice(0, 10);
@@ -23,10 +12,8 @@ export function dayKey(value) {
 }
 
 /**
- * Expande los partidos jugados del bracket en los que participó el usuario.
- * @param {Array} rows filas de la consulta de brackets: { tournament_id, group_id,
- *   tournament_name, day, bracket, pairs: [{ id, mine, my_index, names: [n1, n2] }] }
- * @returns {Array} partidos normalizados con la misma forma que recent_matches
+ * Expande los partidos jugados del cuadro en los que participó el usuario, con
+ * la misma forma que recent_matches.
  */
 export function expandBracketMatches(rows) {
   const out = [];
@@ -43,7 +30,6 @@ export function expandBracketMatches(rows) {
     ];
 
     for (const m of matches) {
-      // Sin winner_id el partido no se jugó todavía.
       if (m.winner_id == null || m.pair1_id == null || m.pair2_id == null) continue;
       if (m.score1 == null || m.score2 == null) continue;
 
@@ -53,8 +39,6 @@ export function expandBracketMatches(rows) {
 
       const isMine1 = !!p1.mine;
       const isMine2 = !!p2.mine;
-      // Una pareja del usuario contra otra pareja del usuario es imposible
-      // (un jugador está en una sola pareja), pero si pasara se contaría una vez.
       if (!isMine1 && !isMine2) continue;
 
       const mine  = isMine1 ? p1 : p2;
@@ -83,7 +67,6 @@ export function expandBracketMatches(rows) {
         club_id:          row.club_id ?? null,
         opp1_name:        other.names?.[0] ?? null,
         opp2_name:        other.names?.[1] ?? null,
-        // Marca para la UI: no es un partido de la tabla `matches`.
         bracket_round:    m.round,
       });
     }
@@ -93,11 +76,8 @@ export function expandBracketMatches(rows) {
 }
 
 /**
- * Cuenta los títulos de liga/parejas del usuario a partir de las filas
- * agregadas por (torneo, jugador). Replica la lógica cliente de
- * getTournamentWinnerLabel: gana quien tiene más victorias y, a igualdad,
- * mejor diferencia de games; los empates en la cima cuentan como título para
- * todos los involucrados.
+ * Títulos de liga/parejas: gana quien tiene más victorias y, a igualdad, mejor
+ * diferencia de games. Un empate en la cima cuenta como título para todos.
  * @param {Array} rows { tournament_id, mine, pj, pg, diff }
  */
 export function countLeagueTitles(rows) {
@@ -118,11 +98,7 @@ export function countLeagueTitles(rows) {
   return titles;
 }
 
-/**
- * Deriva la racha actual y la máxima de una lista de resultados ordenada de
- * más reciente a más antiguo.
- * @param {Array<{won: boolean}>} results
- */
+/** Racha actual y máxima, sobre resultados ordenados del más reciente al más viejo. */
 export function calcStreaks(results) {
   let racha = 0, rachaMax = 0, streak = 0, currentDone = false;
   for (const row of results) {
@@ -139,13 +115,8 @@ export function calcStreaks(results) {
 }
 
 /**
- * Suma los partidos del bracket al conteo de compañeros frecuentes. Se agrupa
- * por partner_key (user_id del compañero, o su player_id si no tiene cuenta),
- * la misma clave que usa la consulta SQL: agrupar por nombre fusionaría
- * homónimos.
- * @param {Array} partners filas de la consulta, ya ordenadas desc
- * @param {Array} bracketMatches salida de expandBracketMatches
- * @param {number} limit cuántos devolver
+ * Suma los partidos del cuadro a los compañeros frecuentes, agrupando por
+ * partner_key igual que la consulta SQL (por nombre fusionaría homónimos).
  */
 export function mergeFrequentPartners(partners, bracketMatches, limit = 5) {
   const byKey = new Map();
@@ -158,8 +129,7 @@ export function mergeFrequentPartners(partners, bracketMatches, limit = 5) {
     if (row) {
       row.partidos_juntos++;
     } else {
-      // Compañero que sólo aparece en la fase eliminatoria: no tenemos su
-      // avatar ni username porque la consulta de arriba no lo trajo.
+      // Sólo aparece en el cuadro: no tenemos su avatar ni username.
       byKey.set(key, {
         partner_key:     m.partner_key,
         name:            m.partner_name,
@@ -176,12 +146,62 @@ export function mergeFrequentPartners(partners, bracketMatches, limit = 5) {
     .slice(0, limit);
 }
 
+const PERFECT_SET = 6;
+
+/** Un set 6-0 a favor de quien lo ganó. */
+function isPerfectSet(set) {
+  if (!set) return false;
+  const hi = Math.max(set.s1, set.s2), lo = Math.min(set.s1, set.s2);
+  return hi === PERFECT_SET && lo === 0;
+}
+
+/**
+ * Paliza: 6-0 si el partido es a un set, o todos los sets 6-0 si es a tres.
+ * @param {Array} rows { my_score, opp_score, sets, sets_format, won }
+ */
+export function countBlowouts(rows) {
+  let ganadas = 0, sufridas = 0;
+  for (const r of rows) {
+    const sets = Array.isArray(r.sets) ? r.sets.filter((s) => s && (s.s1 > 0 || s.s2 > 0)) : [];
+    const perfect = r.sets_format === 3 && sets.length > 0
+      ? sets.every(isPerfectSet)
+      : Math.max(r.my_score, r.opp_score) === PERFECT_SET && Math.min(r.my_score, r.opp_score) === 0;
+    if (!perfect) continue;
+    if (r.my_score > r.opp_score) ganadas++;
+    else sufridas++;
+  }
+  return { palizas_ganadas: ganadas, palizas_sufridas: sufridas };
+}
+
+/**
+ * Sets, sólo sobre partidos al mejor de tres. `disponible: false` mientras no
+ * exista ninguno: con un set, "sets ganados" es igual a "partidos ganados".
+ */
+export function countSetStats(rows) {
+  const threeSet = rows.filter((r) => r.sets_format === 3 && Array.isArray(r.sets) && r.sets.length > 0);
+  if (threeSet.length === 0) return { disponible: false, partidos: 0, sets_favor: 0, sets_contra: 0, remontadas: 0 };
+
+  let favor = 0, contra = 0, remontadas = 0;
+  for (const r of threeSet) {
+    const jugados = r.sets.filter((s) => s && s.s1 !== s.s2);
+    let perdioPrimero = false;
+    jugados.forEach((s, i) => {
+      const mio = r.is_team1 ? s.s1 : s.s2;
+      const suyo = r.is_team1 ? s.s2 : s.s1;
+      if (mio > suyo) favor++;
+      else {
+        contra++;
+        if (i === 0) perdioPrimero = true;
+      }
+    });
+    if (perdioPrimero && r.won) remontadas++;
+  }
+  return { disponible: true, partidos: threeSet.length, sets_favor: favor, sets_contra: contra, remontadas };
+}
+
 /**
  * Suma los partidos del cuadro a las series por día de la semana y por club.
- * Sin esto el americano quedaría fuera justo de las dos dimensiones donde más
- * se nota (la final se juega el mismo día y en el mismo club que la previa).
- * @param {Array} weekdays filas { dow, partidos, victorias } — DOW de Postgres, 0 = domingo
- * @param {Array} clubs filas { id, name, location_name, partidos, victorias, torneos }
+ * @param {Array} weekdays { dow, partidos, victorias } — DOW de Postgres, 0 = domingo
  */
 export function mergeWeekdayAndClub(weekdays, clubs, bracketMatches) {
   const byDow = new Map((weekdays ?? []).map((w) => [w.dow, { ...w }]));
@@ -189,16 +209,13 @@ export function mergeWeekdayAndClub(weekdays, clubs, bracketMatches) {
 
   for (const m of bracketMatches) {
     if (m.played_at) {
-      // played_at viene como YYYY-MM-DD: se parsea a mediodía para que el
-      // desplazamiento horario no corra el día.
+      // Mediodía para que el desplazamiento horario no corra el día.
       const dow = new Date(`${m.played_at}T12:00:00`).getDay();
       const row = byDow.get(dow) ?? { dow, partidos: 0, victorias: 0 };
       row.partidos++;
       if (m.result === 'win') row.victorias++;
       byDow.set(dow, row);
     }
-    // Un club que sólo aparece en el cuadro es imposible (la previa del mismo
-    // torneo ya lo trajo), así que sólo se incrementa lo que ya existe.
     const club = m.club_id != null ? byClub.get(String(m.club_id)) : null;
     if (club) {
       club.partidos++;
@@ -210,6 +227,60 @@ export function mergeWeekdayAndClub(weekdays, clubs, bracketMatches) {
     weekdayStats: [...byDow.values()].sort((a, b) => a.dow - b.dow),
     clubStats: [...byClub.values()].sort((a, b) => b.partidos - a.partidos),
   };
+}
+
+/** Partidos y victorias del cuadro por usuario, para el ranking entre seguidos. */
+export function bracketStatsByUser(rows) {
+  const out = new Map();
+  const add = (uid, won) => {
+    if (!uid) return;
+    const row = out.get(String(uid)) ?? { partidos: 0, victorias: 0 };
+    row.partidos++;
+    if (won) row.victorias++;
+    out.set(String(uid), row);
+  };
+
+  for (const row of rows) {
+    if (!row.bracket) continue;
+    const pairById = Object.fromEntries((row.pairs ?? []).map((p) => [String(p.id), p]));
+    const matches = [
+      ...ROUNDS.flatMap((r) => row.bracket[r] ?? []),
+      ...(row.bracket.final ? [row.bracket.final] : []),
+    ];
+    for (const m of matches) {
+      if (m.winner_id == null || m.pair1_id == null || m.pair2_id == null) continue;
+      for (const pairId of [m.pair1_id, m.pair2_id]) {
+        const pair = pairById[String(pairId)];
+        if (!pair) continue;
+        const won = String(m.winner_id) === String(pairId);
+        (pair.user_ids ?? []).forEach((uid) => add(uid, won));
+      }
+    }
+  }
+  return out;
+}
+
+/** Ranking entre el usuario y la gente que sigue, ordenado por victorias. */
+export function buildFollowRanking(rows, bracketByUser, ownerId) {
+  return rows
+    .map((r) => {
+      const extra = bracketByUser.get(String(r.id)) ?? { partidos: 0, victorias: 0 };
+      const partidos = r.partidos + extra.partidos;
+      const victorias = r.victorias + extra.victorias;
+      return {
+        id: r.id,
+        name: r.name,
+        username: r.username,
+        avatar_url: r.avatar_url,
+        is_premium: !!r.is_premium,
+        is_me: String(r.id) === String(ownerId),
+        partidos,
+        victorias,
+        win_rate: partidos > 0 ? Math.round((victorias / partidos) * 100) : 0,
+      };
+    })
+    .filter((r) => r.partidos > 0)
+    .sort((a, b) => b.victorias - a.victorias || b.win_rate - a.win_rate || b.partidos - a.partidos);
 }
 
 /** Suma los partidos del bracket a las series diaria y mensual. */

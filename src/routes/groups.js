@@ -7,7 +7,7 @@ import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
-  mergeWeekdayAndClub, dayKey,
+  mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
 } from '../lib/profileStats.js';
 
 // GET /api/groups — solo los del usuario autenticado
@@ -113,6 +113,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       leagueRows,
       weekdayStats,
       clubStats,
+      followRows,
+      followBracketRows,
       sub,
     ] = await Promise.all([
     sql`
@@ -155,13 +157,10 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           WHEN m.team1_p1 = p.id OR m.team1_p2 = p.id THEN m.score2
           WHEN m.team2_p1 = p.id OR m.team2_p2 = p.id THEN m.score1
           ELSE 0 END), 0)::int AS games_contra,
-        -- Tiempo en cancha. Sólo ~2 de cada 3 partidos tienen duración cargada,
-        -- así que se cuentan aparte para poder decir sobre cuántos se calcula.
+        -- La duración no está en todos los partidos: se cuentan los que sí la tienen.
         COALESCE(SUM(m.duration_seconds), 0)::int AS segundos_jugados,
         COUNT(m.id) FILTER (WHERE m.duration_seconds > 0)::int AS partidos_con_duracion,
-        -- Partidos definidos por un solo game. Es la única medida de "partido
-        -- parejo" que significa lo mismo con cualquier extensión de partido:
-        -- un umbral fijo de games no sirve porque acá se juega a 3, 4 o 6.
+        -- Partidos definidos por un solo game.
         COUNT(m.id) FILTER (WHERE ABS(m.score1 - m.score2) = 1)::int AS ajustados,
         COUNT(m.id) FILTER (WHERE ABS(m.score1 - m.score2) = 1 AND (
           (m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id)) OR
@@ -215,6 +214,11 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     sql`
       SELECT
         m.played_at,
+        m.sets,
+        m.sets_format,
+        CASE WHEN m.team1_p1 = p.id OR m.team1_p2 = p.id THEN m.score1 ELSE m.score2 END AS my_score,
+        CASE WHEN m.team1_p1 = p.id OR m.team1_p2 = p.id THEN m.score2 ELSE m.score1 END AS opp_score,
+        (m.team1_p1 = p.id OR m.team1_p2 = p.id) AS is_team1,
         CASE
           WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN true
           WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN true
@@ -327,9 +331,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       LIMIT 12
     `,
 
-    // Fase eliminatoria de los americanos donde jugó el usuario. Estos partidos
-    // viven en tournaments.bracket (JSONB), no en la tabla matches, así que
-    // ninguna de las consultas de arriba los ve. Se expanden en memoria.
+    // Fase eliminatoria: vive en tournaments.bracket, no en la tabla matches.
     sql`
       SELECT
         t.id        AS tournament_id,
@@ -360,11 +362,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         )
     `,
 
-    // Títulos de liga/parejas: el ganador de un torneo no americano se deriva de
-    // la tabla de posiciones (más victorias, luego diferencia de games), que se
-    // calcula del lado del cliente. Acá se traen los agregados por jugador de
-    // cada torneo terminado del usuario y el ganador se resuelve en memoria con
-    // esa misma lógica (countLeagueTitles).
+    // Agregados por jugador de cada torneo terminado: el campeón lo resuelve
+    // countLeagueTitles con la misma lógica que la tabla de posiciones.
     sql`
       SELECT
         t.id                         AS tournament_id,
@@ -394,9 +393,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       GROUP BY t.id, pl.id
     `,
 
-    // Rendimiento por día de la semana. played_at está cargado en todos los
-    // partidos, así que ésta es la dimensión temporal con mejor cobertura.
-    // DOW de Postgres: 0 = domingo.
+    // Rendimiento por día de la semana (DOW de Postgres: 0 = domingo).
     isOwner ? sql`
       SELECT
         EXTRACT(DOW FROM m.played_at)::int AS dow,
@@ -414,8 +411,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       GROUP BY EXTRACT(DOW FROM m.played_at)
     ` : [],
 
-    // Clubes donde jugó. Sólo una parte de los torneos tiene club asignado; los
-    // que no lo tienen quedan fuera y la UI lo aclara.
+    // Clubes donde jugó; los torneos sin club quedan afuera.
     sql`
       SELECT
         c.id, c.name, c.location_name,
@@ -437,26 +433,73 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       LIMIT 5
     `,
 
+    // Ranking del usuario contra la gente que sigue. Sólo lo ve él.
+    isOwner ? sql`
+      WITH circle AS (
+        SELECT following_id AS uid FROM user_follows WHERE follower_id = ${owner.id}
+        UNION SELECT ${owner.id}
+      )
+      SELECT
+        u.id, u.name, u.username, u.avatar_url,
+        (s.id IS NOT NULL) AS is_premium,
+        COUNT(m.id)::int   AS partidos,
+        COALESCE(SUM(CASE
+          WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
+          WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
+          ELSE 0 END), 0)::int AS victorias
+      FROM circle
+      JOIN users u ON u.id = circle.uid
+      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT JOIN players p ON p.user_id = u.id
+      LEFT JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      GROUP BY u.id, u.name, u.username, u.avatar_url, s.id
+    ` : [],
+
+    // Cuadros de ese círculo, para que el ranking cuente lo mismo que el perfil.
+    isOwner ? sql`
+      WITH circle AS (
+        SELECT following_id AS uid FROM user_follows WHERE follower_id = ${owner.id}
+        UNION SELECT ${owner.id}
+      )
+      SELECT
+        t.bracket,
+        (SELECT json_agg(json_build_object(
+            'id',       pr.id,
+            'user_ids', json_build_array(p1.user_id, p2.user_id)))
+         FROM pairs pr
+         JOIN players p1 ON p1.id = pr.p1_id
+         JOIN players p2 ON p2.id = pr.p2_id
+         WHERE pr.tournament_id = t.id) AS pairs
+      FROM tournaments t
+      WHERE t.format = 'americano'
+        AND t.bracket IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM pairs pr
+          JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
+          WHERE pr.tournament_id = t.id
+            AND p.user_id IN (SELECT uid FROM circle)
+        )
+    ` : [],
+
     getActiveSubscription(sql, owner.id),
     ]);
 
-    // ── Partidos del bracket americano ────────────────────────────────────────
-    // Se suman a todo lo que se calculó en SQL sobre la tabla matches.
+    // Los partidos del cuadro se suman a todo lo calculado en SQL.
     const bracketMatches = expandBracketMatches(bracketRows);
     const bracketWins    = bracketMatches.filter((m) => m.result === 'win').length;
     const bracketGf      = bracketMatches.reduce((acc, m) => acc + m.my_score, 0);
     const bracketGc      = bracketMatches.reduce((acc, m) => acc + m.opp_score, 0);
 
-    // La racha se deriva en memoria del listado ya ordenado por fecha. Dentro de
-    // una misma fecha el bracket va primero (es lo más reciente: se juega al
-    // cierre de la jornada) para que la racha actual lo tome en cuenta.
+    // Dentro de una misma fecha el cuadro va primero: se juega al cierre.
     const streakRows = [
       ...matchResults.map((r) => ({ won: r.won, day: dayKey(r.played_at), bracket: false })),
       ...bracketMatches.map((m) => ({ won: m.result === 'win', day: dayKey(m.played_at), bracket: true })),
     ].sort((a, b) => (a.day === b.day ? (b.bracket ? 1 : 0) - (a.bracket ? 1 : 0) : (a.day > b.day ? -1 : 1)));
     const { racha, racha_max: rachaMax } = calcStreaks(streakRows);
 
-    // Últimos partidos: se intercalan por fecha y se recorta al mismo tope de 20.
+    // Se intercalan por fecha y se recorta al mismo tope de 20.
     const allRecent = [...recentMatches, ...bracketMatches]
       .sort((a, b) => {
         const da = dayKey(a.played_at), db = dayKey(b.played_at);
@@ -465,8 +508,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       })
       .slice(0, 20);
 
-    // Heatmap y serie mensual: sólo el dueño las recibe, y respetando las mismas
-    // ventanas temporales que las consultas (364 días / 12 meses).
+    // Sólo el dueño las recibe, con las mismas ventanas que las consultas.
     const dayLimit   = new Date(Date.now() - 364 * 86400000).toISOString().slice(0, 10);
     const monthLimit = (() => {
       const d = new Date();
@@ -485,13 +527,17 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       merged.monthlyStats = merged.monthlyStats.filter((m) => m.month >= monthLimit);
     }
 
-    // Día de la semana y club también tienen que ver los partidos del cuadro.
     const { weekdayStats: weekdays, clubStats: clubs } =
       mergeWeekdayAndClub(weekdayStats, clubStats, bracketMatches);
 
     const bracketSeconds = bracketMatches.reduce((acc, m) => acc + (m.duration_seconds ?? 0), 0);
     const bracketTimed   = bracketMatches.filter((m) => (m.duration_seconds ?? 0) > 0).length;
     const bracketTight   = bracketMatches.filter((m) => Math.abs(m.my_score - m.opp_score) === 1);
+
+    // El cuadro no guarda sets, así que sólo aporta al criterio de 6-0.
+    const blowouts = countBlowouts([...matchResults, ...bracketMatches]);
+    const setStats = countSetStats(matchResults);
+    const followRanking = buildFollowRanking(followRows, bracketStatsByUser(followBracketRows), owner.id);
 
     const base = playerStats ?? {
       torneos: 0, partidos: 0, victorias: 0, torneos_americanos: 0, games_favor: 0, games_contra: 0,
@@ -527,11 +573,14 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         campeon_americano: titulosAmericano,
         titulos_liga:      titulosLiga,
         titulos:           titulosLiga + titulosAmericano,
+        ...blowouts,
+        sets: setStats,
       },
       monthly_stats:  merged.monthlyStats,
       daily_activity: merged.dailyActivity,
       weekday_stats:  weekdays,
       club_stats:     clubs,
+      follow_ranking: followRanking,
       recent_matches: allRecent,
       frequent_partners: mergeFrequentPartners(frequentPartners, bracketMatches),
     });
