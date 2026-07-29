@@ -79,6 +79,8 @@ export function expandBracketMatches(rows) {
         opp_score:        oppScore,
         partner_name:     partnerName ?? null,
         partner_key:      partnerKey ?? null,
+        duration_seconds: m.duration_seconds ?? null,
+        club_id:          row.club_id ?? null,
         opp1_name:        other.names?.[0] ?? null,
         opp2_name:        other.names?.[1] ?? null,
         // Marca para la UI: no es un partido de la tabla `matches`.
@@ -172,6 +174,42 @@ export function mergeFrequentPartners(partners, bracketMatches, limit = 5) {
   return [...byKey.values()]
     .sort((a, b) => b.partidos_juntos - a.partidos_juntos)
     .slice(0, limit);
+}
+
+/**
+ * Suma los partidos del cuadro a las series por día de la semana y por club.
+ * Sin esto el americano quedaría fuera justo de las dos dimensiones donde más
+ * se nota (la final se juega el mismo día y en el mismo club que la previa).
+ * @param {Array} weekdays filas { dow, partidos, victorias } — DOW de Postgres, 0 = domingo
+ * @param {Array} clubs filas { id, name, location_name, partidos, victorias, torneos }
+ */
+export function mergeWeekdayAndClub(weekdays, clubs, bracketMatches) {
+  const byDow = new Map((weekdays ?? []).map((w) => [w.dow, { ...w }]));
+  const byClub = new Map((clubs ?? []).map((c) => [String(c.id), { ...c }]));
+
+  for (const m of bracketMatches) {
+    if (m.played_at) {
+      // played_at viene como YYYY-MM-DD: se parsea a mediodía para que el
+      // desplazamiento horario no corra el día.
+      const dow = new Date(`${m.played_at}T12:00:00`).getDay();
+      const row = byDow.get(dow) ?? { dow, partidos: 0, victorias: 0 };
+      row.partidos++;
+      if (m.result === 'win') row.victorias++;
+      byDow.set(dow, row);
+    }
+    // Un club que sólo aparece en el cuadro es imposible (la previa del mismo
+    // torneo ya lo trajo), así que sólo se incrementa lo que ya existe.
+    const club = m.club_id != null ? byClub.get(String(m.club_id)) : null;
+    if (club) {
+      club.partidos++;
+      if (m.result === 'win') club.victorias++;
+    }
+  }
+
+  return {
+    weekdayStats: [...byDow.values()].sort((a, b) => a.dow - b.dow),
+    clubStats: [...byClub.values()].sort((a, b) => b.partidos - a.partidos),
+  };
 }
 
 /** Suma los partidos del bracket a las series diaria y mensual. */

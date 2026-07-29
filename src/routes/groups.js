@@ -6,7 +6,8 @@ import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
 import {
-  expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners, dayKey,
+  expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
+  mergeWeekdayAndClub, dayKey,
 } from '../lib/profileStats.js';
 
 // GET /api/groups — solo los del usuario autenticado
@@ -110,6 +111,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       frequentPartners,
       bracketRows,
       leagueRows,
+      weekdayStats,
+      clubStats,
       sub,
     ] = await Promise.all([
     sql`
@@ -151,7 +154,19 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         COALESCE(SUM(CASE
           WHEN m.team1_p1 = p.id OR m.team1_p2 = p.id THEN m.score2
           WHEN m.team2_p1 = p.id OR m.team2_p2 = p.id THEN m.score1
-          ELSE 0 END), 0)::int AS games_contra
+          ELSE 0 END), 0)::int AS games_contra,
+        -- Tiempo en cancha. Sólo ~2 de cada 3 partidos tienen duración cargada,
+        -- así que se cuentan aparte para poder decir sobre cuántos se calcula.
+        COALESCE(SUM(m.duration_seconds), 0)::int AS segundos_jugados,
+        COUNT(m.id) FILTER (WHERE m.duration_seconds > 0)::int AS partidos_con_duracion,
+        -- Partidos definidos por un solo game. Es la única medida de "partido
+        -- parejo" que significa lo mismo con cualquier extensión de partido:
+        -- un umbral fijo de games no sirve porque acá se juega a 3, 4 o 6.
+        COUNT(m.id) FILTER (WHERE ABS(m.score1 - m.score2) = 1)::int AS ajustados,
+        COUNT(m.id) FILTER (WHERE ABS(m.score1 - m.score2) = 1 AND (
+          (m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id)) OR
+          (m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id))
+        ))::int AS ajustados_ganados
       FROM players p
       JOIN tournament_players tp ON tp.player_id = p.id
       JOIN tournaments t ON t.id = tp.tournament_id
@@ -320,6 +335,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         t.id        AS tournament_id,
         t.group_id,
         t.name      AS tournament_name,
+        t.club_id,
         COALESCE(t.event_date, t.created_at::date)::text AS day,
         t.bracket,
         (SELECT json_agg(json_build_object(
@@ -378,6 +394,49 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       GROUP BY t.id, pl.id
     `,
 
+    // Rendimiento por día de la semana. played_at está cargado en todos los
+    // partidos, así que ésta es la dimensión temporal con mejor cobertura.
+    // DOW de Postgres: 0 = domingo.
+    isOwner ? sql`
+      SELECT
+        EXTRACT(DOW FROM m.played_at)::int AS dow,
+        COUNT(m.id)::int AS partidos,
+        COALESCE(SUM(CASE
+          WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
+          WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
+          ELSE 0 END), 0)::int AS victorias
+      FROM players p
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      WHERE p.user_id = ${owner.id}
+        AND m.played_at IS NOT NULL
+      GROUP BY EXTRACT(DOW FROM m.played_at)
+    ` : [],
+
+    // Clubes donde jugó. Sólo una parte de los torneos tiene club asignado; los
+    // que no lo tienen quedan fuera y la UI lo aclara.
+    sql`
+      SELECT
+        c.id, c.name, c.location_name,
+        COUNT(m.id)::int AS partidos,
+        COALESCE(SUM(CASE
+          WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
+          WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
+          ELSE 0 END), 0)::int AS victorias,
+        COUNT(DISTINCT t.id)::int AS torneos
+      FROM players p
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      JOIN tournaments t ON t.id = m.tournament_id
+      JOIN clubs c ON c.id = t.club_id
+      WHERE p.user_id = ${owner.id}
+      GROUP BY c.id, c.name, c.location_name
+      ORDER BY partidos DESC
+      LIMIT 5
+    `,
+
     getActiveSubscription(sql, owner.id),
     ]);
 
@@ -426,7 +485,19 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       merged.monthlyStats = merged.monthlyStats.filter((m) => m.month >= monthLimit);
     }
 
-    const base = playerStats ?? { torneos: 0, partidos: 0, victorias: 0, torneos_americanos: 0, games_favor: 0, games_contra: 0 };
+    // Día de la semana y club también tienen que ver los partidos del cuadro.
+    const { weekdayStats: weekdays, clubStats: clubs } =
+      mergeWeekdayAndClub(weekdayStats, clubStats, bracketMatches);
+
+    const bracketSeconds = bracketMatches.reduce((acc, m) => acc + (m.duration_seconds ?? 0), 0);
+    const bracketTimed   = bracketMatches.filter((m) => (m.duration_seconds ?? 0) > 0).length;
+    const bracketTight   = bracketMatches.filter((m) => Math.abs(m.my_score - m.opp_score) === 1);
+
+    const base = playerStats ?? {
+      torneos: 0, partidos: 0, victorias: 0, torneos_americanos: 0, games_favor: 0, games_contra: 0,
+      segundos_jugados: 0, partidos_con_duracion: 0,
+      ajustados: 0, ajustados_ganados: 0,
+    };
     const titulosLiga      = countLeagueTitles(leagueRows);
     const titulosAmericano = americanoChamp?.campeon_americano ?? 0;
     const baseStats = {
@@ -435,6 +506,10 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       victorias:    base.victorias    + bracketWins,
       games_favor:  base.games_favor  + bracketGf,
       games_contra: base.games_contra + bracketGc,
+      segundos_jugados:      base.segundos_jugados      + bracketSeconds,
+      partidos_con_duracion: base.partidos_con_duracion + bracketTimed,
+      ajustados:         base.ajustados         + bracketTight.length,
+      ajustados_ganados: base.ajustados_ganados + bracketTight.filter((m) => m.result === 'win').length,
     };
     res.json({
       owner: {
@@ -455,6 +530,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       },
       monthly_stats:  merged.monthlyStats,
       daily_activity: merged.dailyActivity,
+      weekday_stats:  weekdays,
+      club_stats:     clubs,
       recent_matches: allRecent,
       frequent_partners: mergeFrequentPartners(frequentPartners, bracketMatches),
     });
@@ -586,10 +663,12 @@ router.get('/:groupId/history', async (req, res, next) => {
     const sql = getDb();
 
     const tournaments = await sql`
-      SELECT id, name, created_at, status, mode, format, bracket
-      FROM   tournaments
-      WHERE  group_id = ${groupId}
-      ORDER  BY created_at ASC
+      SELECT t.id, t.name, t.created_at, t.status, t.mode, t.format, t.bracket,
+             t.event_date, t.club_id, c.name AS club_name
+      FROM   tournaments t
+      LEFT   JOIN clubs c ON c.id = t.club_id
+      WHERE  t.group_id = ${groupId}
+      ORDER  BY t.created_at ASC
     `;
 
     if (tournaments.length === 0) return res.json([]);
