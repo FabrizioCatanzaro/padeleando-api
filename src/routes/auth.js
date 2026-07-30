@@ -553,7 +553,7 @@ router.post('/reset-password', async (req, res, next) => {
 // ── PATCH /api/auth/me ────────────────────────────────────────────
 router.patch('/me', requireAuth, async (req, res, next) => {
   try {
-    const { name, username, current_password, new_password, social_links, bio } = req.body;
+    const { name, username, current_password, new_password, social_links, bio, advanced_stats_public } = req.body;
     const sql = getDb();
 
     const [user] = await sql`SELECT * FROM users WHERE id = ${req.user.id}`;
@@ -587,6 +587,23 @@ router.patch('/me', requireAuth, async (req, res, next) => {
       updates.bio = bio.trim().slice(0, 200) || null;
     }
 
+    // Visibilidad de las estadísticas avanzadas del perfil (sólo premium).
+    // Apagarlo siempre se permite: si la cuenta dejó de ser premium igual tiene
+    // que poder volver a privado.
+    if (advanced_stats_public !== undefined) {
+      if (typeof advanced_stats_public !== 'boolean')
+        return res.status(400).json({ error: 'advanced_stats_public debe ser booleano' });
+      if (advanced_stats_public) {
+        const [premium] = await sql`
+          SELECT 1 FROM subscriptions
+          WHERE user_id = ${req.user.id} AND status = 'active' AND plan = 'premium'
+        `;
+        if (!premium)
+          return res.status(403).json({ error: 'Publicar las estadísticas avanzadas es una función premium' });
+      }
+      updates.advanced_stats_public = advanced_stats_public;
+    }
+
     // Redes sociales
     if (social_links !== undefined) {
       if (!Array.isArray(social_links)) return res.status(400).json({ error: 'social_links debe ser un arreglo' });
@@ -615,7 +632,7 @@ router.patch('/me', requireAuth, async (req, res, next) => {
     const values = Object.values(updates);
     const setClauses = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
     const [updated] = await sql.query(
-      `UPDATE users SET ${setClauses} WHERE id = $${keys.length + 1} RETURNING id, name, username, avatar_url, social_links, bio`,
+      `UPDATE users SET ${setClauses} WHERE id = $${keys.length + 1} RETURNING id, name, username, avatar_url, social_links, bio, advanced_stats_public`,
       [...values, req.user.id]
     );
 

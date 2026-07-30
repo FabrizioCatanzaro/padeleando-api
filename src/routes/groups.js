@@ -5,6 +5,10 @@ const router = Router();
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
+import {
+  expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
+  mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
+} from '../lib/profileStats.js';
 
 // GET /api/groups — solo los del usuario autenticado
 router.get('/', requireAuth, async (req, res, next) => {
@@ -12,12 +16,22 @@ router.get('/', requireAuth, async (req, res, next) => {
     const sql = getDb();
     const groups = await sql`
       SELECT g.*,
+        COALESCE(gclub.name, lastclub.name) AS club_name,
         (SELECT COUNT(DISTINCT tp.player_id)::int
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
         (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
       FROM groups g
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.user_id = ${req.user.id}
       ORDER BY g.created_at DESC
     `;
@@ -38,14 +52,29 @@ router.get('/participating', requireAuth, async (req, res, next) => {
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
-        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.user_id != ${req.user.id}
         AND EXISTS (
           SELECT 1 FROM group_players ugp
           JOIN players p ON p.id = ugp.player_id AND p.user_id = ${req.user.id}
           WHERE ugp.group_id = g.id
+            AND EXISTS (
+              SELECT 1 FROM tournament_players tp
+              JOIN tournaments t ON t.id = tp.tournament_id AND t.group_id = g.id
+              WHERE tp.player_id = p.id
+            )
         )
       ORDER BY g.created_at DESC
     `;
@@ -66,10 +95,20 @@ router.get('/collaborating', requireAuth, async (req, res, next) => {
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
-        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
       JOIN group_collaborators gc ON gc.group_id = g.id AND gc.user_id = ${req.user.id}
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       ORDER BY g.created_at DESC
     `;
     res.json(groups);
@@ -80,7 +119,16 @@ router.get('/collaborating', requireAuth, async (req, res, next) => {
 router.get('/user/:username', optionalAuth, async (req, res, next) => {
   try {
     const sql = getDb();
-    const [owner] = await sql`SELECT id, name, username, avatar_url, created_at, social_links, bio FROM users WHERE username = ${req.params.username}`;
+    const [owner] = await sql`
+      SELECT u.id, u.name, u.username, u.avatar_url, u.created_at, u.social_links, u.bio,
+             u.advanced_stats_public,
+             EXISTS (
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+             ) AS has_premium_row
+      FROM users u
+      WHERE u.username = ${req.params.username}
+    `;
     if (!owner) return res.status(404).json({ error: 'Usuario no encontrado' });
     // La cuenta anónima que hereda torneos huérfanos no tiene perfil público.
     if (owner.id === ANON_ID) return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -89,6 +137,13 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const viewerId = req.user?.id ?? null;
     // Sólo tiene sentido preguntar por el seguimiento si mira otra persona.
     const followerId = isOwner ? null : viewerId;
+
+    // Las avanzadas son del dueño, o de cualquiera si el premium las publicó.
+    // `has_premium_row` sale de la consulta de arriba y sólo decide si vale la
+    // pena traerlas: el veredicto final lo da `showAdvanced` con la suscripción
+    // ya resuelta (getActiveSubscription puede expirarla contra Mercado Pago).
+    // Preguntarle a getActiveSubscription acá costaría un round-trip en serie.
+    const wantAdvanced = isOwner || (owner.advanced_stats_public === true && owner.has_premium_row === true);
 
     // A partir de acá todo depende únicamente de owner.id (y del espectador),
     // nada de una consulta alimenta a la siguiente. Con el driver HTTP de Neon
@@ -105,6 +160,12 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       [americanoChamp],
       recentMatches,
       frequentPartners,
+      bracketRows,
+      leagueRows,
+      weekdayStats,
+      clubStats,
+      followRows,
+      followBracketRows,
       sub,
     ] = await Promise.all([
     sql`
@@ -123,8 +184,18 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
-        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.user_id = ${owner.id}
         AND (${isOwner} OR g.is_public = true)
       ORDER BY g.created_at DESC
@@ -146,24 +217,37 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         COALESCE(SUM(CASE
           WHEN m.team1_p1 = p.id OR m.team1_p2 = p.id THEN m.score2
           WHEN m.team2_p1 = p.id OR m.team2_p2 = p.id THEN m.score1
-          ELSE 0 END), 0)::int AS games_contra
+          ELSE 0 END), 0)::int AS games_contra,
+        -- La duración no está en todos los partidos: se cuentan los que sí la tienen.
+        COALESCE(SUM(m.duration_seconds), 0)::int AS segundos_jugados,
+        COUNT(m.id) FILTER (WHERE m.duration_seconds > 0)::int AS partidos_con_duracion,
+        -- Partidos definidos por un solo game.
+        COUNT(DISTINCT CASE WHEN m.played_at >= DATE_TRUNC('month', CURRENT_DATE)
+                            THEN tp.tournament_id END)::int AS torneos_este_mes,
+        COUNT(m.id) FILTER (WHERE ABS(m.score1 - m.score2) = 1)::int AS ajustados,
+        COUNT(m.id) FILTER (WHERE ABS(m.score1 - m.score2) = 1 AND (
+          (m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id)) OR
+          (m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id))
+        ))::int AS ajustados_ganados
       FROM players p
       JOIN tournament_players tp ON tp.player_id = p.id
       JOIN tournaments t ON t.id = tp.tournament_id
       LEFT JOIN matches m ON m.tournament_id = tp.tournament_id
+        AND m.score1 <> m.score2
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
     `,
 
-    // Actividad diaria para heatmap (últimos 365 días, solo owner)
-    isOwner ? sql`
+    // Actividad diaria para heatmap (últimos 365 días)
+    wantAdvanced ? sql`
       SELECT
         m.played_at::date::text AS day,
         COUNT(m.id)::int        AS partidos
       FROM players p
-      JOIN matches m ON (m.team1_p1 = p.id OR m.team1_p2 = p.id
-        OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
         AND m.played_at IS NOT NULL
         AND m.played_at >= CURRENT_DATE - INTERVAL '364 days'
@@ -172,7 +256,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     ` : [],
 
     // Estadísticas mensuales (últimos 12 meses)
-    isOwner ? sql`
+    wantAdvanced ? sql`
       SELECT
         TO_CHAR(DATE_TRUNC('month', m.played_at), 'YYYY-MM') AS month,
         COUNT(m.id)::int AS partidos,
@@ -181,8 +265,9 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
           ELSE 0 END), 0)::int AS victorias
       FROM players p
-      JOIN matches m ON (m.team1_p1 = p.id OR m.team1_p2 = p.id
-        OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
         AND m.played_at >= DATE_TRUNC('month', NOW()) - INTERVAL '11 months'
       GROUP BY DATE_TRUNC('month', m.played_at)
@@ -191,14 +276,21 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
 
     sql`
       SELECT
+        m.played_at,
+        m.sets,
+        m.sets_format,
+        CASE WHEN m.team1_p1 = p.id OR m.team1_p2 = p.id THEN m.score1 ELSE m.score2 END AS my_score,
+        CASE WHEN m.team1_p1 = p.id OR m.team1_p2 = p.id THEN m.score2 ELSE m.score1 END AS opp_score,
+        (m.team1_p1 = p.id OR m.team1_p2 = p.id) AS is_team1,
         CASE
           WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN true
           WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN true
           ELSE false
         END AS won
       FROM players p
-      JOIN matches m ON (m.team1_p1 = p.id OR m.team1_p2 = p.id
-        OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
       ORDER BY m.played_at DESC, m.created_at DESC
     `,
@@ -260,8 +352,9 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           ELSE COALESCE(u1b.name, pb.name)
         END AS opp2_name
       FROM players p
-      JOIN matches m ON (m.team1_p1 = p.id OR m.team1_p2 = p.id
-        OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       JOIN tournaments t ON t.id = m.tournament_id
       JOIN players pa ON pa.id = m.team1_p1 LEFT JOIN users u1a ON u1a.id = pa.user_id
       JOIN players pb ON pb.id = m.team1_p2 LEFT JOIN users u1b ON u1b.id = pb.user_id
@@ -274,14 +367,16 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
 
     sql`
       SELECT
+        COALESCE(partner.user_id, partner.id) AS partner_key,
         COALESCE(u.name, partner.name)     AS name,
         u.username,
         u.avatar_url,
         (s.id IS NOT NULL)                 AS is_premium,
         COUNT(*)::int                      AS partidos_juntos
       FROM players p
-      JOIN matches m ON (m.team1_p1 = p.id OR m.team1_p2 = p.id
-        OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       JOIN players partner ON partner.id = (
         CASE
           WHEN m.team1_p1 = p.id THEN m.team1_p2
@@ -296,45 +391,285 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       GROUP BY COALESCE(partner.user_id, partner.id),
                COALESCE(u.name, partner.name), u.username, u.avatar_url, s.id
       ORDER BY partidos_juntos DESC
+      LIMIT 12
+    `,
+
+    // Fase eliminatoria: vive en tournaments.bracket, no en la tabla matches.
+    sql`
+      SELECT
+        t.id        AS tournament_id,
+        t.group_id,
+        t.name      AS tournament_name,
+        t.club_id,
+        COALESCE(t.event_date, t.created_at::date)::text AS day,
+        t.bracket,
+        (SELECT json_agg(json_build_object(
+            'id',       pr.id,
+            'mine',     COALESCE(p1.user_id = ${owner.id} OR p2.user_id = ${owner.id}, false),
+            'my_index', CASE WHEN p1.user_id = ${owner.id} THEN 0
+                             WHEN p2.user_id = ${owner.id} THEN 1 END,
+            'names',    json_build_array(COALESCE(u1.name, p1.name), COALESCE(u2.name, p2.name)),
+            'keys',     json_build_array(COALESCE(p1.user_id, p1.id), COALESCE(p2.user_id, p2.id))
+          ))
+         FROM pairs pr
+         JOIN players p1 ON p1.id = pr.p1_id LEFT JOIN users u1 ON u1.id = p1.user_id
+         JOIN players p2 ON p2.id = pr.p2_id LEFT JOIN users u2 ON u2.id = p2.user_id
+         WHERE pr.tournament_id = t.id) AS pairs
+      FROM tournaments t
+      WHERE t.format = 'americano'
+        AND t.bracket IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM pairs pr
+          JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
+          WHERE pr.tournament_id = t.id AND p.user_id = ${owner.id}
+        )
+    `,
+
+    // Agregados por jugador de cada torneo terminado: el campeón lo resuelve
+    // countLeagueTitles con la misma lógica que la tabla de posiciones.
+    sql`
+      SELECT
+        t.id                         AS tournament_id,
+        (pl.user_id = ${owner.id})   AS mine,
+        COUNT(m.id)::int             AS pj,
+        COALESCE(SUM(CASE
+          WHEN (m.team1_p1 = pl.id OR m.team1_p2 = pl.id) AND m.score1 > m.score2 THEN 1
+          WHEN (m.team2_p1 = pl.id OR m.team2_p2 = pl.id) AND m.score2 > m.score1 THEN 1
+          ELSE 0 END), 0)::int       AS pg,
+        COALESCE(SUM(CASE
+          WHEN (m.team1_p1 = pl.id OR m.team1_p2 = pl.id) THEN m.score1 - m.score2
+          ELSE m.score2 - m.score1 END), 0)::int AS diff
+      FROM tournaments t
+      JOIN tournament_players tp ON tp.tournament_id = t.id
+      JOIN players pl            ON pl.id = tp.player_id
+      LEFT JOIN matches m ON m.tournament_id = t.id
+        AND m.score1 <> m.score2
+        AND (m.team1_p1 = pl.id OR m.team1_p2 = pl.id
+          OR m.team2_p1 = pl.id OR m.team2_p2 = pl.id)
+      WHERE t.status = 'finished'
+        AND t.format <> 'americano'
+        AND EXISTS (
+          SELECT 1 FROM tournament_players tp2
+          JOIN players p2 ON p2.id = tp2.player_id
+          WHERE tp2.tournament_id = t.id AND p2.user_id = ${owner.id}
+        )
+      GROUP BY t.id, pl.id
+    `,
+
+    // Rendimiento por día de la semana (DOW de Postgres: 0 = domingo).
+    wantAdvanced ? sql`
+      SELECT
+        EXTRACT(DOW FROM m.played_at)::int AS dow,
+        COUNT(m.id)::int AS partidos,
+        COALESCE(SUM(CASE
+          WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
+          WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
+          ELSE 0 END), 0)::int AS victorias
+      FROM players p
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      WHERE p.user_id = ${owner.id}
+        AND m.played_at IS NOT NULL
+      GROUP BY EXTRACT(DOW FROM m.played_at)
+    ` : [],
+
+    // Clubes donde jugó; los torneos sin club quedan afuera.
+    sql`
+      SELECT
+        c.id, c.name, c.location_name, c.photo_url,
+        COUNT(m.id)::int AS partidos,
+        COALESCE(SUM(CASE
+          WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
+          WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
+          ELSE 0 END), 0)::int AS victorias,
+        COUNT(DISTINCT t.id)::int AS torneos
+      FROM players p
+      JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      JOIN tournaments t ON t.id = m.tournament_id
+      JOIN clubs c ON c.id = t.club_id
+      WHERE p.user_id = ${owner.id}
+      GROUP BY c.id, c.name, c.location_name, c.photo_url
+      ORDER BY partidos DESC
       LIMIT 5
     `,
+
+    // Ranking del usuario contra la gente que sigue. Sólo lo ve él.
+    isOwner ? sql`
+      WITH circle AS (
+        SELECT following_id AS uid FROM user_follows WHERE follower_id = ${owner.id}
+        UNION SELECT ${owner.id}
+      )
+      SELECT
+        u.id, u.name, u.username, u.avatar_url,
+        (s.id IS NOT NULL) AS is_premium,
+        COUNT(m.id)::int   AS partidos,
+        COALESCE(SUM(CASE
+          WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
+          WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
+          ELSE 0 END), 0)::int AS victorias
+      FROM circle
+      JOIN users u ON u.id = circle.uid
+      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT JOIN players p ON p.user_id = u.id
+      LEFT JOIN matches m ON m.score1 <> m.score2
+        AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+          OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+      GROUP BY u.id, u.name, u.username, u.avatar_url, s.id
+    ` : [],
+
+    // Cuadros de ese círculo, para que el ranking cuente lo mismo que el perfil.
+    isOwner ? sql`
+      WITH circle AS (
+        SELECT following_id AS uid FROM user_follows WHERE follower_id = ${owner.id}
+        UNION SELECT ${owner.id}
+      )
+      SELECT
+        t.bracket,
+        (SELECT json_agg(json_build_object(
+            'id',       pr.id,
+            'user_ids', json_build_array(p1.user_id, p2.user_id)))
+         FROM pairs pr
+         JOIN players p1 ON p1.id = pr.p1_id
+         JOIN players p2 ON p2.id = pr.p2_id
+         WHERE pr.tournament_id = t.id) AS pairs
+      FROM tournaments t
+      WHERE t.format = 'americano'
+        AND t.bracket IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM pairs pr
+          JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
+          WHERE pr.tournament_id = t.id
+            AND p.user_id IN (SELECT uid FROM circle)
+        )
+    ` : [],
 
     getActiveSubscription(sql, owner.id),
     ]);
 
-    // La racha se deriva en memoria del listado ya ordenado por fecha.
-    let racha = 0, rachaMax = 0, streak = 0, currentDone = false;
-    for (const row of matchResults) {
-      if (row.won) {
-        streak++;
-        rachaMax = Math.max(rachaMax, streak);
-        if (!currentDone) racha = streak;
-      } else {
-        currentDone = true;
-        streak = 0;
-      }
+    // Los partidos del cuadro se suman a todo lo calculado en SQL.
+    const bracketMatches = expandBracketMatches(bracketRows);
+    const bracketWins    = bracketMatches.filter((m) => m.result === 'win').length;
+    const bracketGf      = bracketMatches.reduce((acc, m) => acc + m.my_score, 0);
+    const bracketGc      = bracketMatches.reduce((acc, m) => acc + m.opp_score, 0);
+
+    // Dentro de una misma fecha el cuadro va primero: se juega al cierre.
+    const streakRows = [
+      ...matchResults.map((r) => ({ won: r.won, day: dayKey(r.played_at), bracket: false })),
+      ...bracketMatches.map((m) => ({ won: m.result === 'win', day: dayKey(m.played_at), bracket: true })),
+    ].sort((a, b) => (a.day === b.day ? (b.bracket ? 1 : 0) - (a.bracket ? 1 : 0) : (a.day > b.day ? -1 : 1)));
+    const { racha, racha_max: rachaMax } = calcStreaks(streakRows);
+
+    // Se intercalan por fecha y se recorta al mismo tope de 20.
+    const allRecent = [...recentMatches, ...bracketMatches]
+      .sort((a, b) => {
+        const da = dayKey(a.played_at), db = dayKey(b.played_at);
+        if (da !== db) return da > db ? -1 : 1;
+        return (b.bracket_round ? 1 : 0) - (a.bracket_round ? 1 : 0);
+      })
+      .slice(0, 20);
+
+    // Con las mismas ventanas que las consultas de arriba.
+    const dayLimit   = new Date(Date.now() - 364 * 86400000).toISOString().slice(0, 10);
+    const monthLimit = (() => {
+      const d = new Date();
+      d.setDate(1);
+      d.setMonth(d.getMonth() - 11);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    })();
+    const merged = wantAdvanced
+      ? mergeActivity(
+          dailyActivity,
+          monthlyStats,
+          bracketMatches.filter((m) => m.played_at && m.played_at >= dayLimit),
+        )
+      : { dailyActivity, monthlyStats };
+    if (wantAdvanced) {
+      merged.monthlyStats = merged.monthlyStats.filter((m) => m.month >= monthLimit);
     }
 
-    const baseStats = playerStats ?? { torneos: 0, partidos: 0, victorias: 0, torneos_americanos: 0, games_favor: 0, games_contra: 0 };
+    const { weekdayStats: weekdays, clubStats: clubs } =
+      mergeWeekdayAndClub(weekdayStats, clubStats, bracketMatches);
+
+    const bracketSeconds = bracketMatches.reduce((acc, m) => acc + (m.duration_seconds ?? 0), 0);
+    const bracketTimed   = bracketMatches.filter((m) => (m.duration_seconds ?? 0) > 0).length;
+    const bracketTight   = bracketMatches.filter((m) => Math.abs(m.my_score - m.opp_score) === 1);
+
+    // El cuadro no guarda sets, así que sólo aporta al criterio de 6-0.
+    const blowouts = countBlowouts([...matchResults, ...bracketMatches]);
+    const setStats = countSetStats(matchResults);
+    const followRanking = buildFollowRanking(followRows, bracketStatsByUser(followBracketRows), owner.id);
+
+    const base = playerStats ?? {
+      torneos: 0, partidos: 0, victorias: 0, torneos_americanos: 0, games_favor: 0, games_contra: 0,
+      segundos_jugados: 0, partidos_con_duracion: 0,
+      ajustados: 0, ajustados_ganados: 0, torneos_este_mes: 0,
+    };
+    const titulosLiga      = countLeagueTitles(leagueRows);
+    const titulosAmericano = americanoChamp?.campeon_americano ?? 0;
+    const baseStats = {
+      ...base,
+      partidos:     base.partidos     + bracketMatches.length,
+      victorias:    base.victorias    + bracketWins,
+      games_favor:  base.games_favor  + bracketGf,
+      games_contra: base.games_contra + bracketGc,
+      segundos_jugados:      base.segundos_jugados      + bracketSeconds,
+      partidos_con_duracion: base.partidos_con_duracion + bracketTimed,
+      ajustados:         base.ajustados         + bracketTight.length,
+      ajustados_ganados: base.ajustados_ganados + bracketTight.filter((m) => m.result === 'win').length,
+    };
+
+    // Veredicto final sobre las avanzadas, ya con la suscripción resuelta: si
+    // wantAdvanced las trajo pero la suscripción resultó vencida, no salen.
+    const isPremium    = sub.plan === 'premium';
+    const showAdvanced = isOwner || (owner.advanced_stats_public === true && isPremium);
+
+    // `has_premium_row` es un detalle interno de la decisión de arriba.
+    const { has_premium_row: _hasPremiumRow, ...ownerFields } = owner;
+
+    // Lo que queda fuera del perfil cuando las avanzadas son privadas. El resto
+    // de baseStats (torneos, partidos, victorias, torneos_este_mes...) es lo que
+    // el perfil muestra a cualquiera.
+    const {
+      games_favor, games_contra, segundos_jugados, partidos_con_duracion,
+      ajustados, ajustados_ganados, ...basicStats
+    } = baseStats;
+    const advancedStats = showAdvanced
+      ? {
+          games_favor, games_contra, segundos_jugados, partidos_con_duracion,
+          ajustados, ajustados_ganados,
+          racha_max: rachaMax,
+          ...blowouts,
+          sets: setStats,
+        }
+      : {};
+
     res.json({
       owner: {
-        ...owner,
-        is_premium:      sub.plan === 'premium',
+        ...ownerFields,
+        is_premium:      isPremium,
         followers_count: follows.followers_count,
         following_count: follows.following_count,
       },
       is_following: follows.is_following,
       groups,
       stats: {
-        ...baseStats,
+        ...basicStats,
         racha,
-        racha_max: rachaMax,
-        campeon_americano: americanoChamp?.campeon_americano ?? 0,
+        campeon_americano: titulosAmericano,
+        titulos_liga:      titulosLiga,
+        titulos:           titulosLiga + titulosAmericano,
+        ...advancedStats,
       },
-      monthly_stats:  monthlyStats,
-      daily_activity: dailyActivity,
-      recent_matches: recentMatches,
-      frequent_partners: frequentPartners,
+      monthly_stats:  showAdvanced ? merged.monthlyStats  : [],
+      daily_activity: showAdvanced ? merged.dailyActivity : [],
+      weekday_stats:  showAdvanced ? weekdays : [],
+      club_stats:     clubs,
+      follow_ranking: followRanking,
+      recent_matches: allRecent,
+      frequent_partners: mergeFrequentPartners(frequentPartners, bracketMatches),
     });
   } catch (err) { next(err); }
 });
@@ -347,9 +682,19 @@ router.get('/search', async (req, res, next) => {
     const sql = getDb();
     const groups = await sql`
       SELECT g.id, g.name, g.description, g.emojis, g.created_at,
-             u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url
+             u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
+             COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.is_public = true
         AND g.name ILIKE ${'%' + q + '%'}
       ORDER BY g.created_at DESC
@@ -408,9 +753,19 @@ router.get('/featured', async (req, res, next) => {
               JOIN tournaments t ON t.id = tp.tournament_id
               WHERE t.group_id = g.id) AS player_count,
              (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
-             (SELECT MAX(t.created_at) FROM tournaments t WHERE t.group_id = g.id) AS last_activity
+             (SELECT MAX(t.created_at) FROM tournaments t WHERE t.group_id = g.id) AS last_activity,
+             COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.is_public = true
         AND EXISTS (SELECT 1 FROM tournaments t WHERE t.group_id = g.id)
       ORDER BY last_activity DESC NULLS LAST
@@ -464,10 +819,12 @@ router.get('/:groupId/history', async (req, res, next) => {
     const sql = getDb();
 
     const tournaments = await sql`
-      SELECT id, name, created_at, status, mode, format, bracket
-      FROM   tournaments
-      WHERE  group_id = ${groupId}
-      ORDER  BY created_at ASC
+      SELECT t.id, t.name, t.created_at, t.status, t.mode, t.format, t.bracket,
+             t.event_date, t.club_id, c.name AS club_name, c.photo_url AS club_photo_url
+      FROM   tournaments t
+      LEFT   JOIN clubs c ON c.id = t.club_id
+      WHERE  t.group_id = ${groupId}
+      ORDER  BY t.created_at ASC
     `;
 
     if (tournaments.length === 0) return res.json([]);
@@ -541,7 +898,8 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
     sql`
       SELECT t.*,
-             c.name AS club_name,
+             c.name AS club_name, c.location_name AS club_location_name,
+             c.courts AS club_courts, c.photo_url AS club_photo_url,
              COUNT(DISTINCT m.id)::int  AS match_count,
              COUNT(DISTINCT tp.player_id)::int AS player_count,
              COUNT(DISTINCT pr.id)::int AS pair_count
@@ -551,7 +909,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       LEFT JOIN tournament_players tp ON tp.tournament_id = t.id
       LEFT JOIN pairs             pr ON pr.tournament_id = t.id
       WHERE  t.group_id = ${groupId}
-      GROUP  BY t.id, c.name
+      GROUP  BY t.id, c.id
       ORDER  BY t.created_at DESC
     `,
 
@@ -582,7 +940,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
     // Tanda 2: los tres agregados derivan de `tournaments`, no unos de otros, y
     // la transferencia pendiente sólo necesitaba saber si mira el dueño.
-    const [wins, allPairs, americanoPairs, transferRows] = await Promise.all([
+    const [wins, allPairs, americanoPairs, transferRows, invitationRows, myPlayerRows] = await Promise.all([
       finishedIds.length ? sql`
         SELECT tournament_id, player_id,
                SUM(won)::int AS wins, SUM(diff)::int AS gdiff
@@ -628,6 +986,40 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
         LEFT   JOIN users u ON u.id = ot.to_user_id
         WHERE  ot.group_id = ${groupId} AND ot.status = 'pending'
         ORDER  BY ot.created_at DESC
+        LIMIT  1
+      ` : [],
+
+      // Invitación de jugador pendiente para quien mira: sin esto la única forma
+      // de aceptarla era la campana de notificaciones.
+      viewerId ? sql`
+        SELECT pi.id, pi.player_id, pi.created_at,
+               p.name AS player_name,
+               u.name AS invited_by_name, u.username AS invited_by_username
+        FROM   player_invitations pi
+        JOIN   players p ON p.id = pi.player_id
+        JOIN   users   u ON u.id = pi.invited_by
+        WHERE  pi.group_id = ${groupId}
+          AND  pi.invited_user_id = ${viewerId}
+          AND  pi.status = 'pending'
+        ORDER  BY pi.created_at DESC
+        LIMIT  1
+      ` : [],
+
+      // Slot de jugador de quien mira, si aceptó una invitación en esta
+      // categoría: habilita el botón de desvincularse. Exige participación real
+      // en alguna jornada — un slot vinculado pero sin jornadas no es jugar.
+      viewerId ? sql`
+        SELECT p.id, p.name
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = ${groupId}
+        WHERE  p.user_id = ${viewerId}
+          AND  EXISTS (
+            SELECT 1
+            FROM   tournament_players tp
+            JOIN   tournaments t ON t.id = tp.tournament_id AND t.group_id = ${groupId}
+            WHERE  tp.player_id = p.id
+          )
+        ORDER  BY p.name ASC
         LIMIT  1
       ` : [],
     ]);
@@ -694,6 +1086,8 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     res.json({
       ...group, tournaments,
       collaborators, is_owner, can_manage, pending_transfer,
+      my_invitation: invitationRows[0] ?? null,
+      my_player: myPlayerRows[0] ?? null,
     });
   } catch (err) { next(err); }
 });

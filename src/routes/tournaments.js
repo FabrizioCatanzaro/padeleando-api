@@ -20,6 +20,8 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
+             c.courts        AS club_courts,
+             cr.name         AS pending_club_name,
              (EXISTS (
                SELECT 1 FROM subscriptions s
                JOIN   groups g ON g.user_id = s.user_id
@@ -28,6 +30,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
       LEFT JOIN clubs c ON c.id = t.club_id
+      LEFT JOIN club_requests cr ON cr.id = t.pending_club_request_id
       WHERE t.id = ${id}
     `;
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
@@ -166,21 +169,27 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
       });
     }
 
-    // Jugadores que ya existen en la categoría, en una sola consulta.
-    const lowerNames = requested.map((r) => r.resolvedName.toLowerCase());
+    // Jugadores que ya existen en la categoría, en una sola consulta. Se traen
+    // también los slots ya vinculados a las cuentas pedidas: una cuenta tiene un
+    // único slot por categoría y buscar sólo por nombre creaba un segundo cuando
+    // el nombre de la cuenta no coincidía con el del slot vinculado.
+    const lowerNames   = requested.map((r) => r.resolvedName.toLowerCase());
+    const inviteUserIds = requested.map((r) => r.inviteUserId).filter(Boolean);
     const existing = lowerNames.length
       ? await sql`
           SELECT p.* FROM players p
           JOIN group_players gp ON gp.player_id = p.id
-          WHERE gp.group_id = ${groupId} AND LOWER(p.name) = ANY(${lowerNames})
+          WHERE gp.group_id = ${groupId}
+            AND (LOWER(p.name) = ANY(${lowerNames})
+                 OR p.user_id = ANY(${inviteUserIds.length ? inviteUserIds : ['']}))
         `
       : [];
-    const existingByName = new Map(existing.map((p) => [p.name.toLowerCase(), p]));
+    const existingByName   = new Map(existing.map((p) => [p.name.toLowerCase(), p]));
+    const existingByUserId = new Map(existing.filter((p) => p.user_id).map((p) => [p.user_id, p]));
 
     // Invitaciones ya pendientes y aceptaciones previas del usuario en la categoría:
     // determinan si se omite la invitación o si se auto-acepta.
-    const inviteUserIds = requested.map((r) => r.inviteUserId).filter(Boolean);
-    const existingPlayerIds = [...existingByName.values()].map((p) => p.id);
+    const existingPlayerIds = existing.map((p) => p.id);
     const [pendingRows, priorRows] = await Promise.all([
       existingPlayerIds.length
         ? sql`SELECT player_id FROM player_invitations
@@ -203,7 +212,16 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     const invitations = [];         // { player, inviteUserId, inviteUsername, autoAccept }
 
     for (const { raw, resolvedName, inviteUserId, inviteUsername } of requested) {
-      let player = existingByName.get(resolvedName.toLowerCase());
+      let player = (inviteUserId ? existingByUserId.get(inviteUserId) : null)
+                ?? existingByName.get(resolvedName.toLowerCase());
+
+      // El slot que matcheó por nombre puede pertenecer a otra cuenta.
+      if (player && inviteUserId && player.user_id && player.user_id !== inviteUserId) {
+        return res.status(409).json({
+          error: `El jugador "${player.name}" ya está vinculado a otra cuenta. Usá un nombre distinto.`,
+        });
+      }
+
       if (!player) {
         player = { id: uid(), name: resolvedName, user_id: null };
         newPlayers.push(player);
@@ -341,7 +359,7 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
 router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
     const { id }           = req.params;
-    const { name, status, mode, number_of_courts, club_id, event_date } = req.body;
+    const { name, status, mode, number_of_courts, club_id, event_date, pending_club_request_id } = req.body;
     if (name !== undefined && name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
     if (name !== undefined && name.trim().length < 2) return res.status(400).json({ error: 'El nombre la jornada debe superar los 2 caracteres' });
     const sql = getDb();
@@ -358,6 +376,7 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           mode             = COALESCE(${mode   ?? null}, mode),
           number_of_courts = COALESCE(${number_of_courts ?? null}, number_of_courts),
           club_id          = CASE WHEN ${club_id !== undefined}::boolean    THEN ${club_id || null}    ELSE club_id    END,
+          pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id || null} ELSE pending_club_request_id END,
           event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END
       WHERE id = ${id} RETURNING *
     `;

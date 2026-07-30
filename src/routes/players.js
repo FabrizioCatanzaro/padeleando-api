@@ -3,12 +3,13 @@ import { getDb }  from '../db.js';
 import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
+import { canManageGroup } from '../lib/access.js';
 
 const router = Router();
 
 // GET /api/players?q=nombre[&groupId=xxx][&mine=true]
 // - groupId: filtra jugadores de ese grupo específico.
-// - mine=true: filtra jugadores de todos los grupos del usuario autenticado.
+// - mine=true: filtra jugadores de los grupos que el usuario gestiona (propios y co-organizados).
 // - Sin parámetros: resultados globales (compatibilidad).
 router.get('/', optionalAuth, async (req, res, next) => {
   try {
@@ -33,7 +34,10 @@ router.get('/', optionalAuth, async (req, res, next) => {
         FROM   players p
         JOIN   group_players gp ON gp.player_id = p.id
         JOIN   groups g         ON g.id = gp.group_id
-        WHERE  g.user_id = ${req.user.id}
+        WHERE  (g.user_id = ${req.user.id} OR EXISTS (
+                 SELECT 1 FROM group_collaborators gc
+                 WHERE  gc.group_id = g.id AND gc.user_id = ${req.user.id}
+               ))
           AND  unaccent(p.name) ILIKE '%' || unaccent(${rawQ}) || '%'
         ORDER  BY lower(unaccent(p.name)) ASC
         LIMIT  30`;
@@ -89,13 +93,37 @@ router.post('/resolve', requireAuth, requireGroupManage, async (req, res, next) 
       inviteUsername = foundUser.username;
     }
 
-    let [player] = await sql`
-      SELECT p.*
-      FROM   players p
-      JOIN   group_players gp ON gp.player_id = p.id
-      WHERE  gp.group_id = ${groupId}
-        AND  LOWER(p.name) = LOWER(${resolvedName})
-    `;
+    // Una cuenta tiene un único slot por categoría, así que si ya está vinculada
+    // se reusa ese slot. Buscar sólo por nombre creaba un segundo slot cuando el
+    // nombre de la cuenta no coincidía con el del slot ya vinculado.
+    let player = null;
+    if (inviteUserId) {
+      [player] = await sql`
+        SELECT p.*
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id
+        WHERE  gp.group_id = ${groupId} AND p.user_id = ${inviteUserId}
+        LIMIT  1
+      `;
+    }
+
+    if (!player) {
+      [player] = await sql`
+        SELECT p.*
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id
+        WHERE  gp.group_id = ${groupId}
+          AND  LOWER(p.name) = LOWER(${resolvedName})
+      `;
+    }
+
+    // El slot que matcheó por nombre puede pertenecer a otra cuenta: en ese caso
+    // no se puede reclamar, hay que crear uno nuevo con un nombre distinto.
+    if (player && inviteUserId && player.user_id && player.user_id !== inviteUserId) {
+      return res.status(409).json({
+        error: `El jugador "${player.name}" ya está vinculado a otra cuenta. Usá un nombre distinto.`,
+      });
+    }
 
     if (!player) {
       [player] = await sql`
@@ -159,6 +187,71 @@ router.delete('/:playerId/group/:groupId', requireAuth, requireGroupManage, asyn
       WHERE group_id = ${groupId} AND player_id = ${playerId}
     `;
     res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/players/:playerId/group/:groupId/link
+// Desvincula la cuenta del slot de jugador, sin tocar el slot ni sus partidos:
+// el historial queda en la categoría y sólo deja de contar en el perfil de esa
+// cuenta. Lo puede hacer el propio jugador o quien gestione la categoría.
+router.delete('/:playerId/group/:groupId/link', requireAuth, async (req, res, next) => {
+  try {
+    const { playerId, groupId } = req.params;
+    const sql = getDb();
+
+    const [[player], canManage] = await Promise.all([
+      sql`
+        SELECT p.id, p.name, p.user_id
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = ${groupId}
+        WHERE  p.id = ${playerId}
+      `,
+      canManageGroup(sql, req.user.id, groupId),
+    ]);
+
+    if (!player)         return res.status(404).json({ error: 'Jugador no encontrado en esta categoría' });
+    if (!player.user_id) return res.status(409).json({ error: 'Este jugador no está vinculado a ninguna cuenta' });
+
+    const isSelf = player.user_id === req.user.id;
+    if (!isSelf && !canManage) return res.status(403).json({ error: 'No autorizado' });
+
+    const unlinkedUserId = player.user_id;
+
+    await sql`UPDATE players SET user_id = NULL WHERE id = ${playerId}`;
+
+    // Sin esto la desvinculación sería reversible por el organizador solo: una
+    // invitación ya aceptada en esta categoría hace que las siguientes se
+    // auto-acepten (ver routes/invitations.js), así que volvería a vincularse
+    // sin que el usuario pueda decidir. Se borran las aceptadas que ya no
+    // corresponden a ningún slot suyo — si tiene otro slot en el grupo, la suya
+    // sobrevive.
+    await sql`
+      DELETE FROM player_invitations pi
+      WHERE pi.group_id = ${groupId}
+        AND pi.invited_user_id = ${unlinkedUserId}
+        AND pi.status = 'accepted'
+        AND NOT EXISTS (
+          SELECT 1 FROM players p
+          WHERE p.id = pi.player_id AND p.user_id = pi.invited_user_id
+        )
+    `;
+
+    // Notificar al otro lado: al jugador si lo desvinculó el organizador, al
+    // dueño de la categoría si el jugador se fue por su cuenta.
+    const [group] = await sql`SELECT name, user_id AS owner_id FROM groups WHERE id = ${groupId}`;
+    const notifyUserId = isSelf ? group?.owner_id : unlinkedUserId;
+    if (notifyUserId && notifyUserId !== req.user.id) {
+      const body = isSelf
+        ? `${req.user.name} se desvinculó del jugador ${player.name} en ${group.name}. El historial se mantiene en la categoría.`
+        : `Ya no estás vinculado al jugador ${player.name} en ${group.name}. El historial se mantiene en la categoría.`;
+      await sql`
+        INSERT INTO notifications (id, user_id, type, actor_id, entity_id, title, body)
+        VALUES (${uid()}, ${notifyUserId}, 'player_unlinked', ${req.user.id}, ${groupId},
+                ${'Jugador desvinculado'}, ${body})
+      `;
+    }
+
+    res.json({ ok: true, player_id: playerId });
   } catch (err) { next(err); }
 });
 

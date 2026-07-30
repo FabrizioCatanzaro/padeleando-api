@@ -6,6 +6,21 @@ import { requireTournamentManage, requireMatchManage } from '../middleware/acces
 
 const router = Router();
 
+/**
+ * Valida el marcador. En padel no existe el empate: el formulario ya no deja
+ * guardarlo (canSave en MatchForm), pero sin este chequeo la API lo aceptaba y
+ * quedaba un partido sin ganador que ninguna tabla de posiciones puede
+ * interpretar. La fase eliminatoria ya lo rechazaba.
+ * @returns {string|null} mensaje de error, o null si el marcador es válido
+ */
+function validateScore(score1, score2) {
+  if (score1 == null || score2 == null) return 'score1 y score2 requeridos';
+  if (!Number.isInteger(score1) || !Number.isInteger(score2)) return 'Los scores deben ser números enteros';
+  if (score1 < 0 || score2 < 0) return 'Los scores no pueden ser negativos';
+  if (score1 === score2) return 'No puede haber empate: un partido siempre tiene ganador';
+  return null;
+}
+
 // POST /api/matches
 router.post('/', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
@@ -17,6 +32,8 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     if (new Set([...team1, ...team2]).size !== 4) {
       return res.status(400).json({ error: 'Los 4 jugadores deben ser distintos' });
     }
+    const scoreError = validateScore(score1, score2);
+    if (scoreError) return res.status(400).json({ error: scoreError });
 
     const sql = getDb();
 
@@ -52,6 +69,9 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
 router.put('/:id', requireAuth, requireMatchManage, async (req, res, next) => {
   try {
     const { team1, team2, score1, score2, playedAt, duration_seconds, sets, sets_format, court } = req.body;
+    const scoreError = validateScore(score1, score2);
+    if (scoreError) return res.status(400).json({ error: scoreError });
+
     const sql = getDb();
     const setsJson = sets?.length ? JSON.stringify(sets) : null;
     const [match] = await sql`
