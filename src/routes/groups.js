@@ -323,6 +323,18 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         t.id   AS tournament_id,
         t.group_id,
         t.name AS tournament_name,
+        -- Una categoría privada no publica el nombre ni el enlace de sus jornadas.
+        COALESCE(
+          g.is_public
+          OR ${isOwner}::boolean
+          OR g.user_id = ${viewerId}::text
+          OR EXISTS (SELECT 1 FROM group_collaborators gc
+                     WHERE gc.group_id = g.id AND gc.user_id = ${viewerId}::text)
+          OR EXISTS (SELECT 1 FROM players vp
+                     JOIN tournament_players vtp ON vtp.player_id = vp.id
+                     WHERE vp.user_id = ${viewerId}::text AND vtp.tournament_id = t.id),
+          false
+        ) AS visible,
         CASE
           WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 'win'
           WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 'win'
@@ -356,6 +368,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       JOIN tournaments t ON t.id = m.tournament_id
+      JOIN groups g ON g.id = t.group_id
       JOIN players pa ON pa.id = m.team1_p1 LEFT JOIN users u1a ON u1a.id = pa.user_id
       JOIN players pb ON pb.id = m.team1_p2 LEFT JOIN users u1b ON u1b.id = pb.user_id
       JOIN players pc ON pc.id = m.team2_p1 LEFT JOIN users u2a ON u2a.id = pc.user_id
@@ -403,6 +416,17 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         t.club_id,
         COALESCE(t.event_date, t.created_at::date)::text AS day,
         t.bracket,
+        COALESCE(
+          g.is_public
+          OR ${isOwner}::boolean
+          OR g.user_id = ${viewerId}::text
+          OR EXISTS (SELECT 1 FROM group_collaborators gc
+                     WHERE gc.group_id = g.id AND gc.user_id = ${viewerId}::text)
+          OR EXISTS (SELECT 1 FROM players vp
+                     JOIN tournament_players vtp ON vtp.player_id = vp.id
+                     WHERE vp.user_id = ${viewerId}::text AND vtp.tournament_id = t.id),
+          false
+        ) AS visible,
         (SELECT json_agg(json_build_object(
             'id',       pr.id,
             'mine',     COALESCE(p1.user_id = ${owner.id} OR p2.user_id = ${owner.id}, false),
@@ -416,6 +440,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
          JOIN players p2 ON p2.id = pr.p2_id LEFT JOIN users u2 ON u2.id = p2.user_id
          WHERE pr.tournament_id = t.id) AS pairs
       FROM tournaments t
+      JOIN groups g ON g.id = t.group_id
       WHERE t.format = 'americano'
         AND t.bracket IS NOT NULL
         AND EXISTS (
@@ -571,6 +596,14 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       })
       .slice(0, 20);
 
+    // El partido de una categoría privada cuenta en las estadísticas, pero no
+    // publica de qué jornada salió: sin nombre y sin ids con los que abrirla.
+    const publicRecent = allRecent.map(({ visible, ...m }) =>
+      visible === false
+        ? { ...m, tournament_id: null, group_id: null, tournament_name: null, private_group: true }
+        : m,
+    );
+
     // Con las mismas ventanas que las consultas de arriba.
     const dayLimit   = new Date(Date.now() - 364 * 86400000).toISOString().slice(0, 10);
     const monthLimit = (() => {
@@ -668,7 +701,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       weekday_stats:  showAdvanced ? weekdays : [],
       club_stats:     clubs,
       follow_ranking: followRanking,
-      recent_matches: allRecent,
+      recent_matches: publicRecent,
       frequent_partners: mergeFrequentPartners(frequentPartners, bracketMatches),
     });
   } catch (err) { next(err); }

@@ -58,6 +58,7 @@ export function expandBracketMatches(rows) {
         tournament_id:    row.tournament_id,
         group_id:         row.group_id,
         tournament_name:  row.tournament_name,
+        visible:          row.visible !== false,
         result:           myScore > oppScore ? 'win' : myScore < oppScore ? 'loss' : 'draw',
         my_score:         myScore,
         opp_score:        oppScore,
