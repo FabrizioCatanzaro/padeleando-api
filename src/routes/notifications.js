@@ -28,8 +28,8 @@ router.get('/', requireAuth, async (req, res, next) => {
           EXISTS(SELECT 1 FROM user_follows WHERE follower_id = ${req.user.id} AND following_id = a.id)
         ELSE false END AS is_following_back,
         pi.status  AS invitation_status,
-        COALESCE(g.id, gci.id, got.id, gor.id)     AS group_id,
-        COALESCE(g.name, gci.name, got.name, gor.name) AS group_name,
+        COALESCE(g.id, gci.id, got.id, gor.id, gpu.id)     AS group_id,
+        COALESCE(g.name, gci.name, got.name, gor.name, gpu.name) AS group_name,
         p.name     AS player_name,
         tjr.status        AS request_status,
         rp.name           AS requested_player_name,
@@ -50,6 +50,7 @@ router.get('/', requireAuth, async (req, res, next) => {
       LEFT JOIN ownership_transfers ot ON n.type = 'ownership_transfer' AND ot.id = n.entity_id
       LEFT JOIN groups got ON got.id = ot.group_id
       LEFT JOIN groups gor ON n.type = 'ownership_received' AND gor.id = n.entity_id
+      LEFT JOIN groups gpu ON n.type = 'player_unlinked'    AND gpu.id = n.entity_id
       WHERE n.user_id = ${req.user.id}
       ORDER BY n.created_at DESC
       LIMIT ${limit} OFFSET ${offset}

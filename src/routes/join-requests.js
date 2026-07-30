@@ -80,30 +80,49 @@ router.get('/my-status/:tournamentId', requireAuth, async (req, res, next) => {
     const sql = getDb();
     const { tournamentId } = req.params;
 
-    const [tournament] = await sql`
-      SELECT g.user_id AS owner_id FROM tournaments t
-      JOIN groups g ON g.id = t.group_id
-      WHERE t.id = ${tournamentId}
-    `;
+    // Ninguna de las cuatro depende del resultado de otra: un solo round-trip.
+    const [[tournament], [alreadyPlayer], [request], [invitation]] = await Promise.all([
+      sql`
+        SELECT g.user_id AS owner_id FROM tournaments t
+        JOIN groups g ON g.id = t.group_id
+        WHERE t.id = ${tournamentId}
+      `,
 
-    const [alreadyPlayer] = await sql`
-      SELECT p.id FROM players p
-      INNER JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${tournamentId}
-      WHERE p.user_id = ${req.user.id}
-    `;
+      sql`
+        SELECT p.id FROM players p
+        INNER JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${tournamentId}
+        WHERE p.user_id = ${req.user.id}
+      `,
 
-    const [request] = await sql`
-      SELECT tjr.id, tjr.status, tjr.created_at, tjr.requested_player_id,
-             rp.name AS requested_player_name
-      FROM tournament_join_requests tjr
-      LEFT JOIN players rp ON rp.id = tjr.requested_player_id
-      WHERE tjr.tournament_id = ${tournamentId} AND tjr.user_id = ${req.user.id}
-    `;
+      sql`
+        SELECT tjr.id, tjr.status, tjr.created_at, tjr.requested_player_id,
+               rp.name AS requested_player_name
+        FROM tournament_join_requests tjr
+        LEFT JOIN players rp ON rp.id = tjr.requested_player_id
+        WHERE tjr.tournament_id = ${tournamentId} AND tjr.user_id = ${req.user.id}
+      `,
+
+      // Invitación pendiente a un jugador de este torneo. Sin esto la vista
+      // ofrecía "solicitar unirse" a alguien que ya estaba invitado.
+      sql`
+        SELECT pi.id, pi.player_id, pi.created_at,
+               p.name AS player_name,
+               u.name AS invited_by_name, u.username AS invited_by_username
+        FROM player_invitations pi
+        JOIN players p ON p.id = pi.player_id
+        JOIN tournament_players tp ON tp.player_id = pi.player_id AND tp.tournament_id = ${tournamentId}
+        JOIN users u ON u.id = pi.invited_by
+        WHERE pi.invited_user_id = ${req.user.id} AND pi.status = 'pending'
+        ORDER BY pi.created_at DESC
+        LIMIT 1
+      `,
+    ]);
 
     res.json({
       is_player: !!alreadyPlayer,
       is_owner: tournament?.owner_id === req.user.id,
-      request: request ?? null
+      request: request ?? null,
+      invitation: invitation ?? null
     });
   } catch (err) { next(err); }
 });
@@ -176,6 +195,21 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
       `;
       if (!player) return res.status(404).json({ error: 'Jugador no encontrado en el torneo' });
       if (player.user_id) return res.status(409).json({ error: 'El jugador ya está vinculado a una cuenta' });
+
+      // Una cuenta no puede tener dos slots en la misma categoría.
+      const [linked] = await sql`
+        SELECT p.name
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id
+        JOIN   tournaments t ON t.group_id = gp.group_id AND t.id = ${request.tournament_id}
+        WHERE  p.user_id = ${request.user_id} AND p.id != ${playerId}
+        LIMIT  1
+      `;
+      if (linked) {
+        return res.status(409).json({
+          error: `Este usuario ya juega en la categoría como "${linked.name}"`,
+        });
+      }
 
       const [user] = await sql`SELECT name FROM users WHERE id = ${request.user_id}`;
 

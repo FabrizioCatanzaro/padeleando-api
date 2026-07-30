@@ -12,6 +12,7 @@ router.get('/:tournamentId', async (req, res, next) => {
     const [tournament] = await sql`
       SELECT t.*, u.username AS owner_username,
              u.name          AS owner_name,
+             u.avatar_url    AS owner_avatar_url,
              g.name          AS group_name,
              -- La vista de espectador pedía esto en una segunda llamada a
              -- /groups/:id/meta que sólo podía salir cuando ya había respondido
@@ -93,6 +94,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       group_owner_is_premium: tournament.group_owner_is_premium ?? false,
       owner_username: tournament.owner_username,
       owner_name:     tournament.owner_name ?? null,
+      owner_avatar_url: tournament.owner_avatar_url ?? null,
       created_at:     tournament.created_at,
       event_date:          tournament.event_date ?? null,
       club_id:             tournament.club_id ?? null,

@@ -166,21 +166,27 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
       });
     }
 
-    // Jugadores que ya existen en la categoría, en una sola consulta.
-    const lowerNames = requested.map((r) => r.resolvedName.toLowerCase());
+    // Jugadores que ya existen en la categoría, en una sola consulta. Se traen
+    // también los slots ya vinculados a las cuentas pedidas: una cuenta tiene un
+    // único slot por categoría y buscar sólo por nombre creaba un segundo cuando
+    // el nombre de la cuenta no coincidía con el del slot vinculado.
+    const lowerNames   = requested.map((r) => r.resolvedName.toLowerCase());
+    const inviteUserIds = requested.map((r) => r.inviteUserId).filter(Boolean);
     const existing = lowerNames.length
       ? await sql`
           SELECT p.* FROM players p
           JOIN group_players gp ON gp.player_id = p.id
-          WHERE gp.group_id = ${groupId} AND LOWER(p.name) = ANY(${lowerNames})
+          WHERE gp.group_id = ${groupId}
+            AND (LOWER(p.name) = ANY(${lowerNames})
+                 OR p.user_id = ANY(${inviteUserIds.length ? inviteUserIds : ['']}))
         `
       : [];
-    const existingByName = new Map(existing.map((p) => [p.name.toLowerCase(), p]));
+    const existingByName   = new Map(existing.map((p) => [p.name.toLowerCase(), p]));
+    const existingByUserId = new Map(existing.filter((p) => p.user_id).map((p) => [p.user_id, p]));
 
     // Invitaciones ya pendientes y aceptaciones previas del usuario en la categoría:
     // determinan si se omite la invitación o si se auto-acepta.
-    const inviteUserIds = requested.map((r) => r.inviteUserId).filter(Boolean);
-    const existingPlayerIds = [...existingByName.values()].map((p) => p.id);
+    const existingPlayerIds = existing.map((p) => p.id);
     const [pendingRows, priorRows] = await Promise.all([
       existingPlayerIds.length
         ? sql`SELECT player_id FROM player_invitations
@@ -203,7 +209,16 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     const invitations = [];         // { player, inviteUserId, inviteUsername, autoAccept }
 
     for (const { raw, resolvedName, inviteUserId, inviteUsername } of requested) {
-      let player = existingByName.get(resolvedName.toLowerCase());
+      let player = (inviteUserId ? existingByUserId.get(inviteUserId) : null)
+                ?? existingByName.get(resolvedName.toLowerCase());
+
+      // El slot que matcheó por nombre puede pertenecer a otra cuenta.
+      if (player && inviteUserId && player.user_id && player.user_id !== inviteUserId) {
+        return res.status(409).json({
+          error: `El jugador "${player.name}" ya está vinculado a otra cuenta. Usá un nombre distinto.`,
+        });
+      }
+
       if (!player) {
         player = { id: uid(), name: resolvedName, user_id: null };
         newPlayers.push(player);

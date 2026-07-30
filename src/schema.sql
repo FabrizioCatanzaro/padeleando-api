@@ -241,7 +241,8 @@ CREATE TABLE IF NOT EXISTS ownership_transfers (
 ALTER TABLE IF EXISTS notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
 ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
   CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
-                  'collab_invite','ownership_transfer','ownership_received','premium_claim'));
+                  'collab_invite','ownership_transfer','ownership_received','premium_claim',
+                  'player_unlinked'));
 
 -- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
 -- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
@@ -287,3 +288,58 @@ CREATE INDEX IF NOT EXISTS idx_matches_t1p1          ON matches(team1_p1);
 CREATE INDEX IF NOT EXISTS idx_matches_t1p2          ON matches(team1_p2);
 CREATE INDEX IF NOT EXISTS idx_matches_t2p1          ON matches(team2_p1);
 CREATE INDEX IF NOT EXISTS idx_matches_t2p2          ON matches(team2_p2);
+
+-- Una cuenta no puede tener dos slots de jugador en la misma categoría.
+-- Cruza dos tablas, así que no se puede expresar con un índice único.
+-- Detalle en migration_unique_linked_player.sql.
+CREATE OR REPLACE FUNCTION assert_one_linked_player_per_group() RETURNS trigger AS $$
+DECLARE
+  v_user_id   text;
+  v_player_id text;
+  v_other     text;
+BEGIN
+  IF TG_TABLE_NAME = 'players' THEN
+    v_user_id   := NEW.user_id;
+    v_player_id := NEW.id;
+
+    SELECT p.name INTO v_other
+    FROM   players p
+    JOIN   group_players gp ON gp.player_id = p.id
+    WHERE  p.user_id = v_user_id
+      AND  p.id <> v_player_id
+      AND  gp.group_id IN (SELECT group_id FROM group_players WHERE player_id = v_player_id)
+    LIMIT  1;
+  ELSE
+    v_player_id := NEW.player_id;
+    SELECT p.user_id INTO v_user_id FROM players p WHERE p.id = v_player_id;
+    IF v_user_id IS NULL THEN RETURN NEW; END IF;
+
+    SELECT p.name INTO v_other
+    FROM   players p
+    JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = NEW.group_id
+    WHERE  p.user_id = v_user_id
+      AND  p.id <> v_player_id
+    LIMIT  1;
+  END IF;
+
+  IF v_other IS NOT NULL THEN
+    RAISE EXCEPTION 'La cuenta ya juega en esta categoría como "%"', v_other
+      USING ERRCODE = 'unique_violation';
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_players_one_link_per_group ON players;
+CREATE TRIGGER trg_players_one_link_per_group
+  BEFORE UPDATE OF user_id ON players
+  FOR EACH ROW
+  WHEN (NEW.user_id IS NOT NULL AND NEW.user_id IS DISTINCT FROM OLD.user_id)
+  EXECUTE FUNCTION assert_one_linked_player_per_group();
+
+DROP TRIGGER IF EXISTS trg_group_players_one_link_per_group ON group_players;
+CREATE TRIGGER trg_group_players_one_link_per_group
+  BEFORE INSERT ON group_players
+  FOR EACH ROW
+  EXECUTE FUNCTION assert_one_linked_player_per_group();

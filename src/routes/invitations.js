@@ -41,6 +41,22 @@ router.post('/', requireAuth, async (req, res, next) => {
     // No revelar si el usuario existe o no por seguridad — simplemente guardamos la invitación
     // Si no existe, invited_user_id queda NULL y el usuario podrá reclamarla al registrarse (futuro)
 
+    // Una cuenta no puede tener dos slots en la misma categoría.
+    if (invitedUser?.id) {
+      const [linked] = await sql`
+        SELECT p.name
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id
+        WHERE  gp.group_id = ${groupId} AND p.user_id = ${invitedUser.id}
+        LIMIT  1
+      `;
+      if (linked) {
+        return res.status(409).json({
+          error: `@${invitedUser.username} ya juega en esta categoría como "${linked.name}"`,
+        });
+      }
+    }
+
     // Verificar que no hay invitación pendiente duplicada
     const [existing] = await sql`
       SELECT id FROM player_invitations
@@ -157,6 +173,23 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
     }
 
     if (action === 'accept') {
+      // Una cuenta no puede tener dos slots en la misma categoría: la invitación
+      // pudo crearse antes de que el usuario se vinculara a otro slot.
+      const [linked] = await sql`
+        SELECT p.name
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id
+        WHERE  gp.group_id = ${invitation.group_id}
+          AND  p.user_id = ${req.user.id}
+          AND  p.id != ${invitation.player_id}
+        LIMIT  1
+      `;
+      if (linked) {
+        return res.status(409).json({
+          error: `Ya jugás en esta categoría como "${linked.name}"`,
+        });
+      }
+
       await sql`
         UPDATE players SET user_id = ${req.user.id}, name = ${req.user.name}
         WHERE id = ${invitation.player_id}

@@ -50,6 +50,11 @@ router.get('/participating', requireAuth, async (req, res, next) => {
           SELECT 1 FROM group_players ugp
           JOIN players p ON p.id = ugp.player_id AND p.user_id = ${req.user.id}
           WHERE ugp.group_id = g.id
+            AND EXISTS (
+              SELECT 1 FROM tournament_players tp
+              JOIN tournaments t ON t.id = tp.tournament_id AND t.group_id = g.id
+              WHERE tp.player_id = p.id
+            )
         )
       ORDER BY g.created_at DESC
     `;
@@ -834,7 +839,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
     // Tanda 2: los tres agregados derivan de `tournaments`, no unos de otros, y
     // la transferencia pendiente sólo necesitaba saber si mira el dueño.
-    const [wins, allPairs, americanoPairs, transferRows] = await Promise.all([
+    const [wins, allPairs, americanoPairs, transferRows, invitationRows, myPlayerRows] = await Promise.all([
       finishedIds.length ? sql`
         SELECT tournament_id, player_id,
                SUM(won)::int AS wins, SUM(diff)::int AS gdiff
@@ -880,6 +885,40 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
         LEFT   JOIN users u ON u.id = ot.to_user_id
         WHERE  ot.group_id = ${groupId} AND ot.status = 'pending'
         ORDER  BY ot.created_at DESC
+        LIMIT  1
+      ` : [],
+
+      // Invitación de jugador pendiente para quien mira: sin esto la única forma
+      // de aceptarla era la campana de notificaciones.
+      viewerId ? sql`
+        SELECT pi.id, pi.player_id, pi.created_at,
+               p.name AS player_name,
+               u.name AS invited_by_name, u.username AS invited_by_username
+        FROM   player_invitations pi
+        JOIN   players p ON p.id = pi.player_id
+        JOIN   users   u ON u.id = pi.invited_by
+        WHERE  pi.group_id = ${groupId}
+          AND  pi.invited_user_id = ${viewerId}
+          AND  pi.status = 'pending'
+        ORDER  BY pi.created_at DESC
+        LIMIT  1
+      ` : [],
+
+      // Slot de jugador de quien mira, si aceptó una invitación en esta
+      // categoría: habilita el botón de desvincularse. Exige participación real
+      // en alguna jornada — un slot vinculado pero sin jornadas no es jugar.
+      viewerId ? sql`
+        SELECT p.id, p.name
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = ${groupId}
+        WHERE  p.user_id = ${viewerId}
+          AND  EXISTS (
+            SELECT 1
+            FROM   tournament_players tp
+            JOIN   tournaments t ON t.id = tp.tournament_id AND t.group_id = ${groupId}
+            WHERE  tp.player_id = p.id
+          )
+        ORDER  BY p.name ASC
         LIMIT  1
       ` : [],
     ]);
@@ -946,6 +985,8 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     res.json({
       ...group, tournaments,
       collaborators, is_owner, can_manage, pending_transfer,
+      my_invitation: invitationRows[0] ?? null,
+      my_player: myPlayerRows[0] ?? null,
     });
   } catch (err) { next(err); }
 });
