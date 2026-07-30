@@ -20,6 +20,8 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
+             c.courts        AS club_courts,
+             cr.name         AS pending_club_name,
              (EXISTS (
                SELECT 1 FROM subscriptions s
                JOIN   groups g ON g.user_id = s.user_id
@@ -28,6 +30,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
       LEFT JOIN clubs c ON c.id = t.club_id
+      LEFT JOIN club_requests cr ON cr.id = t.pending_club_request_id
       WHERE t.id = ${id}
     `;
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
@@ -356,7 +359,7 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
 router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
     const { id }           = req.params;
-    const { name, status, mode, number_of_courts, club_id, event_date } = req.body;
+    const { name, status, mode, number_of_courts, club_id, event_date, pending_club_request_id } = req.body;
     if (name !== undefined && name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
     if (name !== undefined && name.trim().length < 2) return res.status(400).json({ error: 'El nombre la jornada debe superar los 2 caracteres' });
     const sql = getDb();
@@ -373,6 +376,7 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           mode             = COALESCE(${mode   ?? null}, mode),
           number_of_courts = COALESCE(${number_of_courts ?? null}, number_of_courts),
           club_id          = CASE WHEN ${club_id !== undefined}::boolean    THEN ${club_id || null}    ELSE club_id    END,
+          pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id || null} ELSE pending_club_request_id END,
           event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END
       WHERE id = ${id} RETURNING *
     `;

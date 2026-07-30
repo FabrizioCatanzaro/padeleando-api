@@ -9,7 +9,7 @@ const router = Router();
 
 // GET /api/players?q=nombre[&groupId=xxx][&mine=true]
 // - groupId: filtra jugadores de ese grupo específico.
-// - mine=true: filtra jugadores de todos los grupos del usuario autenticado.
+// - mine=true: filtra jugadores de los grupos que el usuario gestiona (propios y co-organizados).
 // - Sin parámetros: resultados globales (compatibilidad).
 router.get('/', optionalAuth, async (req, res, next) => {
   try {
@@ -34,7 +34,10 @@ router.get('/', optionalAuth, async (req, res, next) => {
         FROM   players p
         JOIN   group_players gp ON gp.player_id = p.id
         JOIN   groups g         ON g.id = gp.group_id
-        WHERE  g.user_id = ${req.user.id}
+        WHERE  (g.user_id = ${req.user.id} OR EXISTS (
+                 SELECT 1 FROM group_collaborators gc
+                 WHERE  gc.group_id = g.id AND gc.user_id = ${req.user.id}
+               ))
           AND  unaccent(p.name) ILIKE '%' || unaccent(${rawQ}) || '%'
         ORDER  BY lower(unaccent(p.name)) ASC
         LIMIT  30`;

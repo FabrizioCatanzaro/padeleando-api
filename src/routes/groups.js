@@ -16,12 +16,22 @@ router.get('/', requireAuth, async (req, res, next) => {
     const sql = getDb();
     const groups = await sql`
       SELECT g.*,
+        COALESCE(gclub.name, lastclub.name) AS club_name,
         (SELECT COUNT(DISTINCT tp.player_id)::int
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
         (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
       FROM groups g
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.user_id = ${req.user.id}
       ORDER BY g.created_at DESC
     `;
@@ -42,9 +52,19 @@ router.get('/participating', requireAuth, async (req, res, next) => {
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
-        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.user_id != ${req.user.id}
         AND EXISTS (
           SELECT 1 FROM group_players ugp
@@ -75,10 +95,20 @@ router.get('/collaborating', requireAuth, async (req, res, next) => {
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
-        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
       JOIN group_collaborators gc ON gc.group_id = g.id AND gc.user_id = ${req.user.id}
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       ORDER BY g.created_at DESC
     `;
     res.json(groups);
@@ -138,8 +168,18 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
-        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.user_id = ${owner.id}
         AND (${isOwner} OR g.is_public = true)
       ORDER BY g.created_at DESC
@@ -602,9 +642,19 @@ router.get('/search', async (req, res, next) => {
     const sql = getDb();
     const groups = await sql`
       SELECT g.id, g.name, g.description, g.emojis, g.created_at,
-             u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url
+             u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
+             COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.is_public = true
         AND g.name ILIKE ${'%' + q + '%'}
       ORDER BY g.created_at DESC
@@ -663,9 +713,19 @@ router.get('/featured', async (req, res, next) => {
               JOIN tournaments t ON t.id = tp.tournament_id
               WHERE t.group_id = g.id) AS player_count,
              (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
-             (SELECT MAX(t.created_at) FROM tournaments t WHERE t.group_id = g.id) AS last_activity
+             (SELECT MAX(t.created_at) FROM tournaments t WHERE t.group_id = g.id) AS last_activity,
+             COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
       WHERE g.is_public = true
         AND EXISTS (SELECT 1 FROM tournaments t WHERE t.group_id = g.id)
       ORDER BY last_activity DESC NULLS LAST
@@ -798,7 +858,8 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
     sql`
       SELECT t.*,
-             c.name AS club_name,
+             c.name AS club_name, c.location_name AS club_location_name,
+             c.courts AS club_courts, c.photo_url AS club_photo_url,
              COUNT(DISTINCT m.id)::int  AS match_count,
              COUNT(DISTINCT tp.player_id)::int AS player_count,
              COUNT(DISTINCT pr.id)::int AS pair_count
@@ -808,7 +869,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       LEFT JOIN tournament_players tp ON tp.tournament_id = t.id
       LEFT JOIN pairs             pr ON pr.tournament_id = t.id
       WHERE  t.group_id = ${groupId}
-      GROUP  BY t.id, c.name
+      GROUP  BY t.id, c.id
       ORDER  BY t.created_at DESC
     `,
 
