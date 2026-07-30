@@ -119,7 +119,16 @@ router.get('/collaborating', requireAuth, async (req, res, next) => {
 router.get('/user/:username', optionalAuth, async (req, res, next) => {
   try {
     const sql = getDb();
-    const [owner] = await sql`SELECT id, name, username, avatar_url, created_at, social_links, bio FROM users WHERE username = ${req.params.username}`;
+    const [owner] = await sql`
+      SELECT u.id, u.name, u.username, u.avatar_url, u.created_at, u.social_links, u.bio,
+             u.advanced_stats_public,
+             EXISTS (
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+             ) AS has_premium_row
+      FROM users u
+      WHERE u.username = ${req.params.username}
+    `;
     if (!owner) return res.status(404).json({ error: 'Usuario no encontrado' });
     // La cuenta anónima que hereda torneos huérfanos no tiene perfil público.
     if (owner.id === ANON_ID) return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -128,6 +137,13 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const viewerId = req.user?.id ?? null;
     // Sólo tiene sentido preguntar por el seguimiento si mira otra persona.
     const followerId = isOwner ? null : viewerId;
+
+    // Las avanzadas son del dueño, o de cualquiera si el premium las publicó.
+    // `has_premium_row` sale de la consulta de arriba y sólo decide si vale la
+    // pena traerlas: el veredicto final lo da `showAdvanced` con la suscripción
+    // ya resuelta (getActiveSubscription puede expirarla contra Mercado Pago).
+    // Preguntarle a getActiveSubscription acá costaría un round-trip en serie.
+    const wantAdvanced = isOwner || (owner.advanced_stats_public === true && owner.has_premium_row === true);
 
     // A partir de acá todo depende únicamente de owner.id (y del espectador),
     // nada de una consulta alimenta a la siguiente. Con el driver HTTP de Neon
@@ -223,8 +239,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       WHERE p.user_id = ${owner.id}
     `,
 
-    // Actividad diaria para heatmap (últimos 365 días, solo owner)
-    isOwner ? sql`
+    // Actividad diaria para heatmap (últimos 365 días)
+    wantAdvanced ? sql`
       SELECT
         m.played_at::date::text AS day,
         COUNT(m.id)::int        AS partidos
@@ -240,7 +256,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     ` : [],
 
     // Estadísticas mensuales (últimos 12 meses)
-    isOwner ? sql`
+    wantAdvanced ? sql`
       SELECT
         TO_CHAR(DATE_TRUNC('month', m.played_at), 'YYYY-MM') AS month,
         COUNT(m.id)::int AS partidos,
@@ -441,7 +457,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     `,
 
     // Rendimiento por día de la semana (DOW de Postgres: 0 = domingo).
-    isOwner ? sql`
+    wantAdvanced ? sql`
       SELECT
         EXTRACT(DOW FROM m.played_at)::int AS dow,
         COUNT(m.id)::int AS partidos,
@@ -555,7 +571,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       })
       .slice(0, 20);
 
-    // Sólo el dueño las recibe, con las mismas ventanas que las consultas.
+    // Con las mismas ventanas que las consultas de arriba.
     const dayLimit   = new Date(Date.now() - 364 * 86400000).toISOString().slice(0, 10);
     const monthLimit = (() => {
       const d = new Date();
@@ -563,14 +579,14 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       d.setMonth(d.getMonth() - 11);
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
     })();
-    const merged = isOwner
+    const merged = wantAdvanced
       ? mergeActivity(
           dailyActivity,
           monthlyStats,
           bracketMatches.filter((m) => m.played_at && m.played_at >= dayLimit),
         )
       : { dailyActivity, monthlyStats };
-    if (isOwner) {
+    if (wantAdvanced) {
       merged.monthlyStats = merged.monthlyStats.filter((m) => m.month >= monthLimit);
     }
 
@@ -604,28 +620,52 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       ajustados:         base.ajustados         + bracketTight.length,
       ajustados_ganados: base.ajustados_ganados + bracketTight.filter((m) => m.result === 'win').length,
     };
+
+    // Veredicto final sobre las avanzadas, ya con la suscripción resuelta: si
+    // wantAdvanced las trajo pero la suscripción resultó vencida, no salen.
+    const isPremium    = sub.plan === 'premium';
+    const showAdvanced = isOwner || (owner.advanced_stats_public === true && isPremium);
+
+    // `has_premium_row` es un detalle interno de la decisión de arriba.
+    const { has_premium_row: _hasPremiumRow, ...ownerFields } = owner;
+
+    // Lo que queda fuera del perfil cuando las avanzadas son privadas. El resto
+    // de baseStats (torneos, partidos, victorias, torneos_este_mes...) es lo que
+    // el perfil muestra a cualquiera.
+    const {
+      games_favor, games_contra, segundos_jugados, partidos_con_duracion,
+      ajustados, ajustados_ganados, ...basicStats
+    } = baseStats;
+    const advancedStats = showAdvanced
+      ? {
+          games_favor, games_contra, segundos_jugados, partidos_con_duracion,
+          ajustados, ajustados_ganados,
+          racha_max: rachaMax,
+          ...blowouts,
+          sets: setStats,
+        }
+      : {};
+
     res.json({
       owner: {
-        ...owner,
-        is_premium:      sub.plan === 'premium',
+        ...ownerFields,
+        is_premium:      isPremium,
         followers_count: follows.followers_count,
         following_count: follows.following_count,
       },
       is_following: follows.is_following,
       groups,
       stats: {
-        ...baseStats,
+        ...basicStats,
         racha,
-        racha_max: rachaMax,
         campeon_americano: titulosAmericano,
         titulos_liga:      titulosLiga,
         titulos:           titulosLiga + titulosAmericano,
-        ...blowouts,
-        sets: setStats,
+        ...advancedStats,
       },
-      monthly_stats:  merged.monthlyStats,
-      daily_activity: merged.dailyActivity,
-      weekday_stats:  weekdays,
+      monthly_stats:  showAdvanced ? merged.monthlyStats  : [],
+      daily_activity: showAdvanced ? merged.dailyActivity : [],
+      weekday_stats:  showAdvanced ? weekdays : [],
       club_stats:     clubs,
       follow_ranking: followRanking,
       recent_matches: allRecent,

@@ -129,6 +129,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
 -- Confirmación de email (registro con email/password)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
 
+-- Visibilidad de las estadísticas avanzadas del perfil. Sólo la puede activar
+-- una cuenta premium; en false (el default) el endpoint del perfil no las
+-- devuelve a nadie más que al dueño.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS advanced_stats_public BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- Rol de usuario (acceso a dashboard de administración)
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'
