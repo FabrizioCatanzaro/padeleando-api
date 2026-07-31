@@ -558,6 +558,29 @@ router.patch('/:id/bracket/:matchId', requireAuth, requireTournamentManage, asyn
   } catch (err) { next(err); }
 });
 
+// DELETE /api/tournaments/:id/bracket/:matchId
+// Deshace el resultado de un partido del cuadro. El nodo no se elimina (el árbol es
+// fijo): se limpian los scores y, en cascada, los partidos posteriores que dependían
+// de ese ganador.
+router.delete('/:id/bracket/:matchId', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [tournament] = await sql`SELECT * FROM tournaments WHERE id = ${req.params.id}`;
+    if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!tournament.bracket) return res.status(400).json({ error: 'El bracket aún no fue generado' });
+
+    const updated = clearBracketResult(tournament.bracket, req.params.matchId);
+    if (!updated) return res.status(404).json({ error: 'Partido de bracket no encontrado' });
+
+    const [saved] = await sql`
+      UPDATE tournaments SET bracket = ${JSON.stringify(updated)}::jsonb
+      WHERE id = ${req.params.id} RETURNING *
+    `;
+
+    res.json({ ...saved, bracket: updated });
+  } catch (err) { next(err); }
+});
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const MAX_PREVIA_MATCHES = 2;
@@ -940,42 +963,92 @@ function slotForSeed(seed, D, standings, octavos) {
 function applyBracketResult(bracket, matchId, score1, score2, duration_seconds = null, court = null) {
   const b = JSON.parse(JSON.stringify(bracket)); // clonar
 
+  const match = findBracketMatch(b, matchId);
+  if (!match) return null;
+
   const winner = score1 > score2 ? 'pair1' : 'pair2';
+  const winnerId = match[`${winner}_id`];
 
-  // Buscar el match en todas las rondas
-  let found = false;
+  // Al editar un resultado ya cargado puede cambiar el ganador: las rondas
+  // posteriores quedarían con la pareja eliminada, así que se deshacen antes.
+  if (match.winner_id !== null && match.winner_id !== winnerId) clearDescendants(b, matchId);
 
+  match.score1           = score1;
+  match.score2           = score2;
+  match.duration_seconds = duration_seconds;
+  match.court            = court;
+  match.winner_id        = winnerId;
+  match.winner_name      = match[`${winner}_name`];
+
+  if (b.final.id !== matchId) propagateWinner(b, matchId, match.winner_id, match.winner_name);
+
+  return b;
+}
+
+/**
+ * Deshace el resultado de un partido del cuadro y, en cascada, el de todos los
+ * partidos posteriores que se alimentaban de su ganador.
+ * @returns {Object|null} bracket actualizado, o null si no encontró el partido
+ */
+function clearBracketResult(bracket, matchId) {
+  const b = JSON.parse(JSON.stringify(bracket));
+  const match = findBracketMatch(b, matchId);
+  if (!match) return null;
+
+  clearDescendants(b, matchId);
+  resetMatchResult(match);
+  return b;
+}
+
+/** Limpia los slots y resultados de todo lo que cuelga de un partido. */
+function clearDescendants(bracket, matchId) {
+  const queue = [matchId];
+  while (queue.length) {
+    const child = findChildSlot(bracket, queue.shift());
+    if (!child) continue;
+    child.match[`pair${child.slot}_id`]   = null;
+    child.match[`pair${child.slot}_name`] = null;
+    if (child.match.winner_id !== null) {
+      resetMatchResult(child.match);
+      queue.push(child.match.id);
+    }
+  }
+}
+
+function resetMatchResult(match) {
+  match.score1           = null;
+  match.score2           = null;
+  match.duration_seconds = null;
+  match.court            = null;
+  match.winner_id        = null;
+  match.winner_name      = null;
+}
+
+function findBracketMatch(bracket, matchId) {
+  if (bracket.final?.id === matchId) return bracket.final;
   for (const round of ['octavos', 'cuartos', 'semis']) {
-    const arr = b[round];
-    const idx = arr.findIndex((m) => m.id === matchId);
-    if (idx === -1) continue;
-
-    const match = arr[idx];
-    match.score1            = score1;
-    match.score2            = score2;
-    match.duration_seconds  = duration_seconds;
-    match.court             = court;
-    match.winner_id         = match[`${winner}_id`];
-    match.winner_name       = match[`${winner}_name`];
-    found = true;
-
-    propagateWinner(b, matchId, match.winner_id, match.winner_name);
-    break;
+    const found = (bracket[round] ?? []).find((m) => m.id === matchId);
+    if (found) return found;
   }
+  return null;
+}
 
-  // Final
-  if (!found && b.final.id === matchId) {
-    const match = b.final;
-    match.score1           = score1;
-    match.score2           = score2;
-    match.duration_seconds = duration_seconds;
-    match.court            = court;
-    match.winner_id        = match[`${winner}_id`];
-    match.winner_name      = match[`${winner}_name`];
-    found = true;
+/**
+ * Inverso de propagateWinner: qué partido y qué slot alimenta el ganador de matchId.
+ * Los slots de cuartos sin source (parejas con bye) no dependen de ningún resultado.
+ */
+function findChildSlot(bracket, matchId) {
+  for (const qm of bracket.cuartos) {
+    if (qm.slot1_source === matchId) return { match: qm, slot: 1 };
+    if (qm.slot2_source === matchId) return { match: qm, slot: 2 };
   }
-
-  return found ? b : null;
+  for (const sm of bracket.semis) {
+    if (sm.source1 === matchId) return { match: sm, slot: 1 };
+    if (sm.source2 === matchId) return { match: sm, slot: 2 };
+  }
+  if (bracket.final.source1 === matchId) return { match: bracket.final, slot: 1 };
+  if (bracket.final.source2 === matchId) return { match: bracket.final, slot: 2 };
+  return null;
 }
 
 /**
