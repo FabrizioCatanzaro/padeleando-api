@@ -61,15 +61,46 @@ router.get('/', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /api/notifications/count — cantidad no leídas
+// GET /api/notifications/count — cantidad no leídas + la última, para el aviso
+// flotante. Va en una sola consulta (LATERAL) porque el header la pide cada 45s.
 router.get('/count', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
-    const [{ count }] = await sql`
-      SELECT COUNT(*)::int AS count FROM notifications
-      WHERE user_id = ${req.user.id} AND read = false
+    const [row] = await sql`
+      SELECT c.count,
+             l.id, l.type, l.title, l.body, l.created_at,
+             l.actor_username, l.actor_name, l.group_name, l.tournament_name, l.player_name
+      FROM (
+        SELECT COUNT(*)::int AS count FROM notifications
+        WHERE user_id = ${req.user.id} AND read = false
+      ) c
+      LEFT JOIN LATERAL (
+        SELECT n.id, n.type, n.title, n.body, n.created_at,
+               a.username AS actor_username, a.name AS actor_name,
+               COALESCE(gi.name, gci.name, got.name, gor.name, gnt.name) AS group_name,
+               COALESCE(tj.name, tnt.name) AS tournament_name,
+               p.name AS player_name
+        FROM   notifications n
+        LEFT   JOIN users a ON a.id = n.actor_id
+        LEFT   JOIN player_invitations pi ON n.type = 'invitation' AND pi.id = n.entity_id
+        LEFT   JOIN groups gi  ON gi.id  = pi.group_id
+        LEFT   JOIN players p  ON p.id   = pi.player_id
+        LEFT   JOIN collaborator_invitations ci ON n.type = 'collab_invite' AND ci.id = n.entity_id
+        LEFT   JOIN groups gci ON gci.id = ci.group_id
+        LEFT   JOIN ownership_transfers ot ON n.type = 'ownership_transfer' AND ot.id = n.entity_id
+        LEFT   JOIN groups got ON got.id = ot.group_id
+        LEFT   JOIN groups gor ON n.type = 'ownership_received' AND gor.id = n.entity_id
+        LEFT   JOIN tournament_join_requests tjr ON n.type = 'join_request' AND tjr.id = n.entity_id
+        LEFT   JOIN tournaments tj ON tj.id = tjr.tournament_id
+        LEFT   JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
+        LEFT   JOIN groups gnt ON gnt.id = tnt.group_id
+        WHERE  n.user_id = ${req.user.id} AND n.read = false
+        ORDER  BY n.created_at DESC
+        LIMIT  1
+      ) l ON true
     `;
-    res.json({ count });
+    const { count, ...latest } = row;
+    res.json({ count, latest: latest.id ? latest : null });
   } catch (err) { next(err); }
 });
 
