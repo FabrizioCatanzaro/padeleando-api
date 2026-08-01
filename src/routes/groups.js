@@ -115,8 +115,8 @@ router.get('/collaborating', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /api/groups/following — categorías que el usuario sigue
-router.get('/following', requireAuth, async (req, res, next) => {
+// GET /api/groups/favorites — categorías que el usuario marcó como favoritas
+router.get('/favorites', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const groups = await sql`
@@ -132,7 +132,7 @@ router.get('/following', requireAuth, async (req, res, next) => {
         COALESCE(gclub.name, lastclub.name) AS club_name
       FROM groups g
       JOIN users u ON u.id = g.user_id
-      JOIN group_follows gf ON gf.group_id = g.id AND gf.user_id = ${req.user.id}
+      JOIN group_favorites gf ON gf.group_id = g.id AND gf.user_id = ${req.user.id}
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
         SELECT c2.name
@@ -1006,7 +1006,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
     // Tanda 2: los tres agregados derivan de `tournaments`, no unos de otros, y
     // la transferencia pendiente sólo necesitaba saber si mira el dueño.
-    const [wins, allPairs, americanoPairs, transferRows, invitationRows, myPlayerRows, followRows] = await Promise.all([
+    const [wins, allPairs, americanoPairs, transferRows, invitationRows, myPlayerRows, favRows] = await Promise.all([
       finishedIds.length ? sql`
         SELECT tournament_id, player_id,
                SUM(won)::int AS wins, SUM(diff)::int AS gdiff
@@ -1090,9 +1090,9 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       ` : [],
 
       sql`
-        SELECT COUNT(*)::int AS followers_count,
-               COALESCE(BOOL_OR(gf.user_id = ${viewerId}), false) AS is_following
-        FROM   group_follows gf
+        SELECT COUNT(*)::int AS favorites_count,
+               COALESCE(BOOL_OR(gf.user_id = ${viewerId}), false) AS is_favorite
+        FROM   group_favorites gf
         WHERE  gf.group_id = ${groupId}
       `,
     ]);
@@ -1161,14 +1161,14 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       collaborators, is_owner, can_manage, pending_transfer,
       my_invitation: invitationRows[0] ?? null,
       my_player: myPlayerRows[0] ?? null,
-      followers_count: followRows[0]?.followers_count ?? 0,
-      is_following: followRows[0]?.is_following ?? false,
+      favorites_count: favRows[0]?.favorites_count ?? 0,
+      is_favorite: favRows[0]?.is_favorite ?? false,
     });
   } catch (err) { next(err); }
 });
 
-// POST /api/groups/:groupId/follow — seguir una categoría pública
-router.post('/:groupId/follow', requireAuth, async (req, res, next) => {
+// POST /api/groups/:groupId/favorite — marcar una categoría pública como favorita
+router.post('/:groupId/favorite', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const { groupId } = req.params;
@@ -1184,47 +1184,21 @@ router.post('/:groupId/follow', requireAuth, async (req, res, next) => {
     if (collab) return res.status(400).json({ error: 'Ya co-organizás esta categoría' });
 
     await sql`
-      INSERT INTO group_follows (user_id, group_id) VALUES (${req.user.id}, ${groupId})
+      INSERT INTO group_favorites (user_id, group_id) VALUES (${req.user.id}, ${groupId})
       ON CONFLICT DO NOTHING
     `;
     res.json({ ok: true });
   } catch (err) { next(err); }
 });
 
-// DELETE /api/groups/:groupId/follow — dejar de seguir
-router.delete('/:groupId/follow', requireAuth, async (req, res, next) => {
+// DELETE /api/groups/:groupId/favorite — sacar de favoritas
+router.delete('/:groupId/favorite', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     await sql`
-      DELETE FROM group_follows WHERE user_id = ${req.user.id} AND group_id = ${req.params.groupId}
+      DELETE FROM group_favorites WHERE user_id = ${req.user.id} AND group_id = ${req.params.groupId}
     `;
     res.json({ ok: true });
-  } catch (err) { next(err); }
-});
-
-// GET /api/groups/:groupId/followers — quiénes siguen la categoría
-router.get('/:groupId/followers', optionalAuth, async (req, res, next) => {
-  try {
-    const sql = getDb();
-    const viewerId = req.user?.id ?? null;
-    const followers = await sql`
-      SELECT
-        u.id, u.name, u.username, u.avatar_url,
-        EXISTS(
-          SELECT 1 FROM subscriptions s
-          WHERE s.user_id = u.id AND s.plan = 'premium' AND s.status = 'active'
-            AND (s.ends_at IS NULL OR s.ends_at > NOW())
-        ) AS is_premium,
-        EXISTS(
-          SELECT 1 FROM user_follows vf
-          WHERE vf.follower_id = ${viewerId} AND vf.following_id = u.id
-        ) AS is_following
-      FROM group_follows gf
-      JOIN users u ON u.id = gf.user_id
-      WHERE gf.group_id = ${req.params.groupId}
-      ORDER BY gf.created_at DESC
-    `;
-    res.json(followers);
   } catch (err) { next(err); }
 });
 

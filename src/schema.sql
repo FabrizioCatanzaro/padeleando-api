@@ -241,10 +241,21 @@ CREATE TABLE IF NOT EXISTS ownership_transfers (
   created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ─── Seguidores de una categoría ──────────────────────────────────────────────
--- Seguir una categoría pública: avisa cuando se crea una jornada nueva. Es
--- independiente de user_follows (seguir a una persona).
-CREATE TABLE IF NOT EXISTS group_follows (
+-- ─── Categorías favoritas ─────────────────────────────────────────────────────
+-- Marcar como favorita una categoría pública: avisa cuando se crea una jornada
+-- nueva. Es independiente de user_follows (seguir a una persona).
+-- Nació como group_follows; el rename conserva las filas ya marcadas.
+DO $$
+BEGIN
+  IF to_regclass('public.group_follows') IS NOT NULL
+     AND to_regclass('public.group_favorites') IS NULL THEN
+    ALTER TABLE group_follows RENAME TO group_favorites;
+    ALTER INDEX IF EXISTS idx_group_follows_user  RENAME TO idx_group_favorites_user;
+    ALTER INDEX IF EXISTS idx_group_follows_group RENAME TO idx_group_favorites_group;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS group_favorites (
   user_id    TEXT NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
   group_id   TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
   created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -273,8 +284,8 @@ CREATE INDEX IF NOT EXISTS idx_group_collab_group    ON group_collaborators(grou
 CREATE INDEX IF NOT EXISTS idx_collab_inv_user       ON collaborator_invitations(invited_user_id);
 CREATE INDEX IF NOT EXISTS idx_collab_inv_group      ON collaborator_invitations(group_id);
 CREATE INDEX IF NOT EXISTS idx_ownership_transfers_group ON ownership_transfers(group_id);
-CREATE INDEX IF NOT EXISTS idx_group_follows_user    ON group_follows(user_id);
-CREATE INDEX IF NOT EXISTS idx_group_follows_group   ON group_follows(group_id);
+CREATE INDEX IF NOT EXISTS idx_group_favorites_user  ON group_favorites(user_id);
+CREATE INDEX IF NOT EXISTS idx_group_favorites_group ON group_favorites(group_id);
 CREATE INDEX IF NOT EXISTS idx_tp_tournament         ON tournament_players(tournament_id);
 CREATE INDEX IF NOT EXISTS idx_clubs_name            ON clubs(name);
 CREATE INDEX IF NOT EXISTS idx_tournaments_club      ON tournaments(club_id);

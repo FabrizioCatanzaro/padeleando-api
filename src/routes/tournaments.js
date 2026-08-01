@@ -353,32 +353,32 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
 
     res.status(201).json({ ...tournament, players, pairs, matches: [] });
 
-    // Aviso a los seguidores de la categoría. Va después de responder: crear una
-    // jornada ya es la petición más pesada y esto no debe sumarle round-trips.
-    notifyFollowers(groupId, tId, req.user.id).catch((err) =>
-      console.error('No se pudo notificar a los seguidores:', err)
+    // Aviso a quienes tienen la categoría en favoritas. Va después de responder:
+    // crear una jornada ya es la petición más pesada y no debe sumar round-trips.
+    notifyFavorites(groupId, tId, req.user.id).catch((err) =>
+      console.error('No se pudo avisar a quienes la tienen en favoritas:', err)
     );
   } catch (err) { next(err); }
 });
 
-async function notifyFollowers(groupId, tournamentId, actorId) {
+async function notifyFavorites(groupId, tournamentId, actorId) {
   const sql = getDb();
-  const followers = await sql`
+  const targets = await sql`
     SELECT gf.user_id
-    FROM   group_follows gf
+    FROM   group_favorites gf
     JOIN   groups g ON g.id = gf.group_id AND g.is_public = true
     WHERE  gf.group_id = ${groupId} AND gf.user_id <> ${actorId}
   `;
-  if (!followers.length) return;
+  if (!targets.length) return;
 
   await sql`
     INSERT INTO notifications (id, user_id, type, actor_id, entity_id)
     SELECT * FROM UNNEST(
-      ${followers.map(() => uid())}::text[],
-      ${followers.map((f) => f.user_id)}::text[],
-      ${followers.map(() => 'new_tournament')}::text[],
-      ${followers.map(() => actorId)}::text[],
-      ${followers.map(() => tournamentId)}::text[]
+      ${targets.map(() => uid())}::text[],
+      ${targets.map((t) => t.user_id)}::text[],
+      ${targets.map(() => 'new_tournament')}::text[],
+      ${targets.map(() => actorId)}::text[],
+      ${targets.map(() => tournamentId)}::text[]
     )
   `;
 }
