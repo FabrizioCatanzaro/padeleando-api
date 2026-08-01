@@ -241,13 +241,23 @@ CREATE TABLE IF NOT EXISTS ownership_transfers (
   created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- ─── Seguidores de una categoría ──────────────────────────────────────────────
+-- Seguir una categoría pública: avisa cuando se crea una jornada nueva. Es
+-- independiente de user_follows (seguir a una persona).
+CREATE TABLE IF NOT EXISTS group_follows (
+  user_id    TEXT NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
+  group_id   TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (user_id, group_id)
+);
+
 -- Ampliar el CHECK de notifications.type con los tipos nuevos (la tabla vive en
 -- migration_notifications.sql; el IF EXISTS evita fallar si aún no se creó).
 ALTER TABLE IF EXISTS notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
 ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
   CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
                   'collab_invite','ownership_transfer','ownership_received','premium_claim',
-                  'player_unlinked'));
+                  'player_unlinked','new_tournament'));
 
 -- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
 -- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
@@ -263,6 +273,8 @@ CREATE INDEX IF NOT EXISTS idx_group_collab_group    ON group_collaborators(grou
 CREATE INDEX IF NOT EXISTS idx_collab_inv_user       ON collaborator_invitations(invited_user_id);
 CREATE INDEX IF NOT EXISTS idx_collab_inv_group      ON collaborator_invitations(group_id);
 CREATE INDEX IF NOT EXISTS idx_ownership_transfers_group ON ownership_transfers(group_id);
+CREATE INDEX IF NOT EXISTS idx_group_follows_user    ON group_follows(user_id);
+CREATE INDEX IF NOT EXISTS idx_group_follows_group   ON group_follows(group_id);
 CREATE INDEX IF NOT EXISTS idx_tp_tournament         ON tournament_players(tournament_id);
 CREATE INDEX IF NOT EXISTS idx_clubs_name            ON clubs(name);
 CREATE INDEX IF NOT EXISTS idx_tournaments_club      ON tournaments(club_id);
