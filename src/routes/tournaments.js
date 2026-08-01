@@ -35,7 +35,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     `;
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
 
-    const pairs = await sql`SELECT * FROM pairs WHERE tournament_id = ${id}`;
+    const pairs = await sql`SELECT * FROM pairs WHERE tournament_id = ${id} ORDER BY id`;
 
     const matches = await sql`
       SELECT * FROM matches WHERE tournament_id = ${id} ORDER BY created_at DESC
@@ -472,6 +472,7 @@ router.post('/:id/bracket', requireAuth, requireTournamentManage, async (req, re
       JOIN players p1 ON p1.id = pr.p1_id
       JOIN players p2 ON p2.id = pr.p2_id
       WHERE pr.tournament_id = ${req.params.id}
+      ORDER BY pr.id
     `;
 
     if (pairsRaw.length < 8 || pairsRaw.length > 16) {
@@ -825,38 +826,55 @@ function assignRounds(fixtures, pairName) {
     .sort((x, y) => x.round - y.round);
 }
 
+// Desempate de la tabla de parejas: victorias, diferencia, games a favor y,
+// si todo empata, el pair_id — sin ese último criterio el orden lo terminaba
+// decidiendo el orden de filas que devolvía Postgres, que difiere entre queries.
+function comparePairRows(a, b) {
+  return b.wins - a.wins
+      || b.diff - a.diff
+      || b.gf - a.gf
+      || String(a.pair_id).localeCompare(String(b.pair_id));
+}
+
 /**
  * Calcula la tabla de posiciones de la fase previa para cada pareja.
+ * El orden debe ser idéntico al de la tabla que arma el front (Standings.jsx):
+ * si divergen, el seed del cuadro no coincide con la posición de la tabla.
  * @param {Array} pairs  - [{ id, p1_id, p2_id, p1_name, p2_name }]
  * @param {Array} matches - registros de la tabla matches
- * @returns {Array} standings ordenados por wins DESC, diff DESC
+ * @returns {Array} standings ordenados por wins DESC, diff DESC, gf DESC, pair_id
  */
 function computeStandings(pairs, matches) {
   return pairs
     .map((pr) => {
       let wins = 0;
-      let diff = 0;
+      let gf = 0;
+      let gc = 0;
       for (const m of matches) {
+        const s1 = Number(m.score1), s2 = Number(m.score2);
+        // Igual que calcStandings: un partido sin cargar o igualado no cuenta.
+        if (!Number.isFinite(s1) || !Number.isFinite(s2) || s1 === s2) continue;
         const isTeam1 = m.team1_p1 === pr.p1_id || m.team1_p1 === pr.p2_id
                      || m.team1_p2 === pr.p1_id || m.team1_p2 === pr.p2_id;
         const isTeam2 = m.team2_p1 === pr.p1_id || m.team2_p1 === pr.p2_id
                      || m.team2_p2 === pr.p1_id || m.team2_p2 === pr.p2_id;
         if (isTeam1) {
-          if (m.score1 > m.score2) wins++;
-          diff += m.score1 - m.score2;
+          if (s1 > s2) wins++;
+          gf += s1; gc += s2;
         } else if (isTeam2) {
-          if (m.score2 > m.score1) wins++;
-          diff += m.score2 - m.score1;
+          if (s2 > s1) wins++;
+          gf += s2; gc += s1;
         }
       }
       return {
         pair_id:   pr.id,
         pair_name: `${pr.p1_name} & ${pr.p2_name}`,
         wins,
-        diff,
+        diff: gf - gc,
+        gf,
       };
     })
-    .sort((a, b) => b.wins - a.wins || b.diff - a.diff)
+    .sort(comparePairRows)
     .map((s, i) => ({ ...s, seed: i + 1 }));
 }
 

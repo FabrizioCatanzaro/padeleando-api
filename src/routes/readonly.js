@@ -35,7 +35,7 @@ router.get('/:tournamentId', async (req, res, next) => {
     `;
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
  
-    const pairs = await sql`SELECT * FROM pairs WHERE tournament_id = ${tournamentId}`;
+    const pairs = await sql`SELECT * FROM pairs WHERE tournament_id = ${tournamentId} ORDER BY id`;
  
     const matches = await sql`
       SELECT * FROM matches
