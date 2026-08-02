@@ -205,6 +205,27 @@ ALTER TABLE groups ADD COLUMN IF NOT EXISTS club_id TEXT REFERENCES clubs(id) ON
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS pending_club_request_id TEXT REFERENCES club_requests(id) ON DELETE SET NULL;
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS pending_club_request_id TEXT REFERENCES club_requests(id) ON DELETE SET NULL;
 
+-- ─── Inscripción: precio y medios de contacto ─────────────────────────────────
+-- Se cargan en la categoría y cada jornada los hereda; una jornada puede pisar
+-- cualquiera de los cuatro campos. NULL significa "heredar", no "vacío", así que
+-- signup_open es nullable a propósito.
+-- signup_contacts: [{ "type": "whatsapp|phone|email|instagram", "value": "..." }]
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_open       BOOLEAN;
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_price      INTEGER;
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_price_unit TEXT;
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_contacts   JSONB;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_open       BOOLEAN;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_price      INTEGER;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_price_unit TEXT;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_contacts   JSONB;
+
+ALTER TABLE groups      DROP CONSTRAINT IF EXISTS groups_signup_price_unit_check;
+ALTER TABLE groups      ADD  CONSTRAINT groups_signup_price_unit_check
+  CHECK (signup_price_unit IS NULL OR signup_price_unit IN ('player','pair'));
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_signup_price_unit_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_signup_price_unit_check
+  CHECK (signup_price_unit IS NULL OR signup_price_unit IN ('player','pair'));
+
 -- ─── Co-organizadores y transferencia de propiedad de categorías ───────────────
 -- Co-organizadores de una categoría: pueden gestionar sus jornadas (igual que el dueño),
 -- pero NO editar/borrar la categoría, transferir ni gestionar co-organizadores.

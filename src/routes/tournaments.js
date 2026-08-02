@@ -4,6 +4,7 @@ import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
 import { canManageGroup } from '../lib/access.js';
+import { parseSignupFields } from '../lib/signup.js';
 
 const router = Router();
 
@@ -17,6 +18,10 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       SELECT t.*,
              g.user_id       AS group_owner_id,
              g.name          AS group_name,
+             g.signup_open       AS group_signup_open,
+             g.signup_price      AS group_signup_price,
+             g.signup_price_unit AS group_signup_price_unit,
+             g.signup_contacts   AS group_signup_contacts,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
@@ -388,6 +393,9 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
   try {
     const { id }           = req.params;
     const { name, status, mode, number_of_courts, club_id, event_date, pending_club_request_id } = req.body;
+    let signup;
+    try { signup = parseSignupFields(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
     if (name !== undefined && name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
     if (name !== undefined && name.trim().length < 2) return res.status(400).json({ error: 'El nombre la jornada debe superar los 2 caracteres' });
     const sql = getDb();
@@ -405,7 +413,11 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           number_of_courts = COALESCE(${number_of_courts ?? null}, number_of_courts),
           club_id          = CASE WHEN ${club_id !== undefined}::boolean    THEN ${club_id || null}    ELSE club_id    END,
           pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id || null} ELSE pending_club_request_id END,
-          event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END
+          event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END,
+          signup_open       = CASE WHEN ${'signup_open'       in signup}::boolean THEN ${signup.signup_open       ?? null} ELSE signup_open END,
+          signup_price      = CASE WHEN ${'signup_price'      in signup}::boolean THEN ${signup.signup_price      ?? null} ELSE signup_price END,
+          signup_price_unit = CASE WHEN ${'signup_price_unit' in signup}::boolean THEN ${signup.signup_price_unit ?? null} ELSE signup_price_unit END,
+          signup_contacts   = CASE WHEN ${'signup_contacts'   in signup}::boolean THEN ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb ELSE signup_contacts END
       WHERE id = ${id} RETURNING *
     `;
     if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });

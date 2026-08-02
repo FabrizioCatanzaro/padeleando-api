@@ -5,6 +5,7 @@ const router = Router();
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
+import { parseSignupFields } from '../lib/signup.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
@@ -1232,6 +1233,9 @@ router.post('/', requireAuth, async (req, res, next) => {
 router.put('/:groupId', requireAuth, async (req, res, next) => {
   try {
     const { name, description, is_public, emojis, location_name, place_id, lat, lon, club_id, pending_club_request_id } = req.body;
+    let signup;
+    try { signup = parseSignupFields(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
     if (name !== undefined && name.trim().length > 30) return res.status(400).json({ error: 'El nombre del torneo no puede superar los 30 caracteres' });
     if (name !== undefined && name.trim().length < 2) return res.status(400).json({ error: 'El nombre del torneo debe tener mas de 2 caracteres' });
     if (description !== undefined && description !== null && description.trim().length > 50) return res.status(400).json({ error: 'La descripción no puede superar los 50 caracteres' });
@@ -1255,7 +1259,11 @@ router.put('/:groupId', requireAuth, async (req, res, next) => {
           lat = COALESCE(${lat ?? null}, lat),
           lon = COALESCE(${lon ?? null}, lon),
           club_id = CASE WHEN ${club_id !== undefined}::boolean THEN ${club_id ?? null} ELSE club_id END,
-          pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id ?? null} ELSE pending_club_request_id END
+          pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id ?? null} ELSE pending_club_request_id END,
+          signup_open       = CASE WHEN ${'signup_open'       in signup}::boolean THEN ${signup.signup_open       ?? null} ELSE signup_open END,
+          signup_price      = CASE WHEN ${'signup_price'      in signup}::boolean THEN ${signup.signup_price      ?? null} ELSE signup_price END,
+          signup_price_unit = CASE WHEN ${'signup_price_unit' in signup}::boolean THEN ${signup.signup_price_unit ?? null} ELSE signup_price_unit END,
+          signup_contacts   = CASE WHEN ${'signup_contacts'   in signup}::boolean THEN ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb ELSE signup_contacts END
       WHERE id = ${req.params.groupId} RETURNING *
     `;
     res.json(updated);
