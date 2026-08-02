@@ -61,8 +61,7 @@ router.get('/', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /api/notifications/count — cantidad no leídas + la última, para el aviso
-// flotante. Va en una sola consulta (LATERAL) porque el header la pide cada 45s.
+// GET /api/notifications/count — no leídas + la última, en una sola consulta.
 router.get('/count', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();

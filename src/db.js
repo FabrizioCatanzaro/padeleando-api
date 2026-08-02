@@ -2,10 +2,7 @@ import { neon, neonConfig, Pool, types } from '@neondatabase/serverless';
 import ws from 'ws';
 import "dotenv/config";
 
-// Una columna DATE es un día del calendario, no un instante. El driver la
-// convertía a Date usando la zona horaria del proceso: en Render (UTC) el
-// 2026-07-02 salía como 2026-07-02T00:00:00Z y un navegador argentino lo
-// mostraba como 01/07. Se devuelve el 'YYYY-MM-DD' crudo, igual en todo lado.
+// Un DATE es un día del calendario: sin esto el driver lo movía según la zona del proceso.
 const DATE_OID = 1082;
 types.setTypeParser(DATE_OID, (v) => v);
 

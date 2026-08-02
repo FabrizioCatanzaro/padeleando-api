@@ -206,10 +206,7 @@ ALTER TABLE groups      ADD COLUMN IF NOT EXISTS pending_club_request_id TEXT RE
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS pending_club_request_id TEXT REFERENCES club_requests(id) ON DELETE SET NULL;
 
 -- ─── Inscripción: precio y medios de contacto ─────────────────────────────────
--- Se cargan en la categoría y cada jornada los hereda; una jornada puede pisar
--- cualquiera de los cuatro campos. NULL significa "heredar", no "vacío", así que
--- signup_open es nullable a propósito.
--- signup_contacts: [{ "type": "whatsapp|phone|email|instagram", "value": "..." }]
+-- NULL significa "heredar de la categoría", por eso signup_open es nullable.
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_open       BOOLEAN;
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_price      INTEGER;
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_price_unit TEXT;
@@ -263,9 +260,7 @@ CREATE TABLE IF NOT EXISTS ownership_transfers (
 );
 
 -- ─── Categorías favoritas ─────────────────────────────────────────────────────
--- Marcar como favorita una categoría pública: avisa cuando se crea una jornada
--- nueva. Es independiente de user_follows (seguir a una persona).
--- Nació como group_follows; el rename conserva las filas ya marcadas.
+-- Independiente de user_follows (seguir a una persona).
 DO $$
 BEGIN
   IF to_regclass('public.group_follows') IS NOT NULL

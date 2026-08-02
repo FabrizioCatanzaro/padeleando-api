@@ -368,8 +368,7 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
 
     res.status(201).json({ ...tournament, players, pairs, matches: [] });
 
-    // Aviso a quienes tienen la categoría en favoritas. Va después de responder:
-    // crear una jornada ya es la petición más pesada y no debe sumar round-trips.
+    // Después de responder: crear una jornada ya es la petición más pesada.
     notifyFavorites(groupId, tId, req.user.id).catch((err) =>
       console.error('No se pudo avisar a quienes la tienen en favoritas:', err)
     );

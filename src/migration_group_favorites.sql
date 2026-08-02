@@ -1,4 +1,3 @@
--- Categorías favoritas: avisa al usuario cuando se crea una jornada nueva.
 -- Nació como group_follows; el rename conserva las filas ya marcadas.
 DO $$
 BEGIN

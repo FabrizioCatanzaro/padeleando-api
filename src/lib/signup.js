@@ -1,5 +1,4 @@
-// Precio y contactos de inscripción. Los mismos cuatro campos viven en groups y
-// en tournaments: la jornada hereda de la categoría el que tenga en NULL.
+// Los mismos cuatro campos viven en groups y en tournaments; NULL = heredar.
 
 export const CONTACT_TYPES = ['whatsapp', 'phone', 'email', 'instagram'];
 
@@ -9,8 +8,7 @@ const MAX_PRICE    = 100_000_000;
 
 class SignupError extends Error {}
 
-// Devuelve sólo las claves presentes en el body, para no pisar con NULL lo que
-// el cliente no mandó. `undefined` = no tocar; `null` = volver a heredar.
+// Sólo las claves presentes en el body: `undefined` no toca, `null` vuelve a heredar.
 export function parseSignupFields(body) {
   const out = {};
 
@@ -69,10 +67,7 @@ export function parseSignupFields(body) {
   return out;
 }
 
-// Contactos que salen del perfil del organizador. Sólo WhatsApp e Instagram:
-// el resto de las redes no son canales de inscripción. El perfil guarda la url
-// con formatos irregulares (wa.me/54..., el número suelto, la url de Instagram),
-// así que se normaliza acá sin inventar el código de país que falte.
+// El perfil guarda la url en formatos irregulares; no se inventa el país que falte.
 export function profileContacts(socialLinks) {
   if (!Array.isArray(socialLinks)) return [];
   const out = [];
@@ -96,8 +91,7 @@ export function mergeContacts(profile, own) {
   return [...(profile ?? []).filter((c) => !ownTypes.has(c.type)), ...(own ?? [])];
 }
 
-// Valor efectivo de la jornada: lo suyo, o lo de la categoría; los contactos
-// suman además los del perfil del dueño.
+// Lo de la jornada, o lo de la categoría; los contactos suman los del perfil.
 export function resolveSignup(tournament, group, ownerSocialLinks = null) {
   const pick = (k) => (tournament?.[k] ?? group?.[k] ?? null);
   return {

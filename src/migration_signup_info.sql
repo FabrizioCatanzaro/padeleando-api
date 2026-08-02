@@ -1,6 +1,4 @@
--- Precio y medios de contacto para inscribirse. Se cargan en la categoría y las
--- jornadas los heredan; NULL significa "heredar", por eso signup_open es nullable.
--- signup_contacts: [{ "type": "whatsapp|phone|email|instagram", "value": "..." }]
+-- NULL significa "heredar de la categoría", por eso signup_open es nullable.
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_open       BOOLEAN;
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_price      INTEGER;
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_price_unit TEXT;
