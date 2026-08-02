@@ -198,12 +198,31 @@ ALTER TABLE club_requests ADD COLUMN IF NOT EXISTS previous_data JSONB;
 -- Cada torneo se juega (opcionalmente) en un club, con fecha programada del evento.
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS club_id    TEXT REFERENCES clubs(id) ON DELETE SET NULL;
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS event_date DATE;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS event_time TIME;
 
 -- Club por defecto de la categoría (se hereda a los torneos que se crean dentro).
 ALTER TABLE groups ADD COLUMN IF NOT EXISTS club_id TEXT REFERENCES clubs(id) ON DELETE SET NULL;
 -- Referencia a una solicitud de club pendiente: al aprobarse, se backfillea club_id.
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS pending_club_request_id TEXT REFERENCES club_requests(id) ON DELETE SET NULL;
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS pending_club_request_id TEXT REFERENCES club_requests(id) ON DELETE SET NULL;
+
+-- ─── Inscripción: precio y medios de contacto ─────────────────────────────────
+-- NULL significa "heredar de la categoría", por eso signup_open es nullable.
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_open       BOOLEAN;
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_price      INTEGER;
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_price_unit TEXT;
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_contacts   JSONB;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_open       BOOLEAN;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_price      INTEGER;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_price_unit TEXT;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_contacts   JSONB;
+
+ALTER TABLE groups      DROP CONSTRAINT IF EXISTS groups_signup_price_unit_check;
+ALTER TABLE groups      ADD  CONSTRAINT groups_signup_price_unit_check
+  CHECK (signup_price_unit IS NULL OR signup_price_unit IN ('player','pair'));
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_signup_price_unit_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_signup_price_unit_check
+  CHECK (signup_price_unit IS NULL OR signup_price_unit IN ('player','pair'));
 
 -- ─── Co-organizadores y transferencia de propiedad de categorías ───────────────
 -- Co-organizadores de una categoría: pueden gestionar sus jornadas (igual que el dueño),
@@ -241,13 +260,32 @@ CREATE TABLE IF NOT EXISTS ownership_transfers (
   created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- ─── Categorías favoritas ─────────────────────────────────────────────────────
+-- Independiente de user_follows (seguir a una persona).
+DO $$
+BEGIN
+  IF to_regclass('public.group_follows') IS NOT NULL
+     AND to_regclass('public.group_favorites') IS NULL THEN
+    ALTER TABLE group_follows RENAME TO group_favorites;
+    ALTER INDEX IF EXISTS idx_group_follows_user  RENAME TO idx_group_favorites_user;
+    ALTER INDEX IF EXISTS idx_group_follows_group RENAME TO idx_group_favorites_group;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS group_favorites (
+  user_id    TEXT NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
+  group_id   TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (user_id, group_id)
+);
+
 -- Ampliar el CHECK de notifications.type con los tipos nuevos (la tabla vive en
 -- migration_notifications.sql; el IF EXISTS evita fallar si aún no se creó).
 ALTER TABLE IF EXISTS notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
 ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
   CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
                   'collab_invite','ownership_transfer','ownership_received','premium_claim',
-                  'player_unlinked'));
+                  'player_unlinked','new_tournament'));
 
 -- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
 -- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
@@ -263,6 +301,8 @@ CREATE INDEX IF NOT EXISTS idx_group_collab_group    ON group_collaborators(grou
 CREATE INDEX IF NOT EXISTS idx_collab_inv_user       ON collaborator_invitations(invited_user_id);
 CREATE INDEX IF NOT EXISTS idx_collab_inv_group      ON collaborator_invitations(group_id);
 CREATE INDEX IF NOT EXISTS idx_ownership_transfers_group ON ownership_transfers(group_id);
+CREATE INDEX IF NOT EXISTS idx_group_favorites_user  ON group_favorites(user_id);
+CREATE INDEX IF NOT EXISTS idx_group_favorites_group ON group_favorites(group_id);
 CREATE INDEX IF NOT EXISTS idx_tp_tournament         ON tournament_players(tournament_id);
 CREATE INDEX IF NOT EXISTS idx_clubs_name            ON clubs(name);
 CREATE INDEX IF NOT EXISTS idx_tournaments_club      ON tournaments(club_id);

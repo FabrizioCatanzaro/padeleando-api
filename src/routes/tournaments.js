@@ -4,6 +4,7 @@ import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
 import { canManageGroup } from '../lib/access.js';
+import { parseSignupFields } from '../lib/signup.js';
 
 const router = Router();
 
@@ -17,6 +18,11 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       SELECT t.*,
              g.user_id       AS group_owner_id,
              g.name          AS group_name,
+             g.signup_open       AS group_signup_open,
+             g.signup_price      AS group_signup_price,
+             g.signup_price_unit AS group_signup_price_unit,
+             g.signup_contacts   AS group_signup_contacts,
+             ow.social_links     AS owner_social_links,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
@@ -29,6 +35,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              )) AS owner_is_premium
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
+      JOIN users ow ON ow.id = g.user_id
       LEFT JOIN clubs c ON c.id = t.club_id
       LEFT JOIN club_requests cr ON cr.id = t.pending_club_request_id
       WHERE t.id = ${id}
@@ -107,7 +114,7 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     const {
       groupId, name, mode = 'free', format = 'liga',
       playerNames = [], pairs: pairsInput = [],
-      number_of_courts = 1, club_id = null, event_date = null,
+      number_of_courts = 1, club_id = null, event_date = null, event_time = null,
       pending_club_request_id = null,
     } = req.body;
 
@@ -116,6 +123,11 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     if (name.trim().length < 2) return res.status(400).json({ error: 'El nombre la jornada tiene que tener mas de 2 caracteres' });
     if (name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
     if (!['liga', 'americano'].includes(format)) return res.status(400).json({ error: 'format debe ser "liga" o "americano"' });
+
+    // Lo que no venga queda en NULL: la jornada hereda ese campo de la categoría.
+    let signup;
+    try { signup = parseSignupFields(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
 
     // El americano se puede crear como "borrador" con menos de 8 parejas: recién al
     // llegar al mínimo se habilitan el calendario, los partidos y el cuadro
@@ -272,10 +284,13 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
 
       const { rows: [tournamentRow] } = await client.query(
         `INSERT INTO tournaments
-           (id, group_id, name, mode, format, number_of_courts, club_id, event_date, pending_club_request_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+           (id, group_id, name, mode, format, number_of_courts, club_id, event_date, event_time, pending_club_request_id,
+            signup_open, signup_price, signup_price_unit, signup_contacts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb) RETURNING *`,
         [tId, groupId, name.trim(), mode, format, number_of_courts ?? 1,
-         club_id ?? null, event_date || null, pending_club_request_id ?? null]
+         club_id ?? null, event_date || null, event_time || null, pending_club_request_id ?? null,
+         signup.signup_open ?? null, signup.signup_price ?? null, signup.signup_price_unit ?? null,
+         signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null]
       );
 
       if (players.length) {
@@ -352,14 +367,44 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     });
 
     res.status(201).json({ ...tournament, players, pairs, matches: [] });
+
+    // Después de responder: crear una jornada ya es la petición más pesada.
+    notifyFavorites(groupId, tId, req.user.id).catch((err) =>
+      console.error('No se pudo avisar a quienes la tienen en favoritas:', err)
+    );
   } catch (err) { next(err); }
 });
+
+async function notifyFavorites(groupId, tournamentId, actorId) {
+  const sql = getDb();
+  const targets = await sql`
+    SELECT gf.user_id
+    FROM   group_favorites gf
+    JOIN   groups g ON g.id = gf.group_id AND g.is_public = true
+    WHERE  gf.group_id = ${groupId} AND gf.user_id <> ${actorId}
+  `;
+  if (!targets.length) return;
+
+  await sql`
+    INSERT INTO notifications (id, user_id, type, actor_id, entity_id)
+    SELECT * FROM UNNEST(
+      ${targets.map(() => uid())}::text[],
+      ${targets.map((t) => t.user_id)}::text[],
+      ${targets.map(() => 'new_tournament')}::text[],
+      ${targets.map(() => actorId)}::text[],
+      ${targets.map(() => tournamentId)}::text[]
+    )
+  `;
+}
 
 // PATCH /api/tournaments/:id
 router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
     const { id }           = req.params;
-    const { name, status, mode, number_of_courts, club_id, event_date, pending_club_request_id } = req.body;
+    const { name, status, mode, number_of_courts, club_id, event_date, event_time, pending_club_request_id } = req.body;
+    let signup;
+    try { signup = parseSignupFields(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
     if (name !== undefined && name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
     if (name !== undefined && name.trim().length < 2) return res.status(400).json({ error: 'El nombre la jornada debe superar los 2 caracteres' });
     const sql = getDb();
@@ -377,7 +422,12 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           number_of_courts = COALESCE(${number_of_courts ?? null}, number_of_courts),
           club_id          = CASE WHEN ${club_id !== undefined}::boolean    THEN ${club_id || null}    ELSE club_id    END,
           pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id || null} ELSE pending_club_request_id END,
-          event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END
+          event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END,
+          event_time       = CASE WHEN ${event_time !== undefined}::boolean THEN ${event_time || null}::time ELSE event_time END,
+          signup_open       = CASE WHEN ${'signup_open'       in signup}::boolean THEN ${signup.signup_open       ?? null} ELSE signup_open END,
+          signup_price      = CASE WHEN ${'signup_price'      in signup}::boolean THEN ${signup.signup_price      ?? null} ELSE signup_price END,
+          signup_price_unit = CASE WHEN ${'signup_price_unit' in signup}::boolean THEN ${signup.signup_price_unit ?? null} ELSE signup_price_unit END,
+          signup_contacts   = CASE WHEN ${'signup_contacts'   in signup}::boolean THEN ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb ELSE signup_contacts END
       WHERE id = ${id} RETURNING *
     `;
     if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });

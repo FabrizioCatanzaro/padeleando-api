@@ -28,13 +28,13 @@ router.get('/', requireAuth, async (req, res, next) => {
           EXISTS(SELECT 1 FROM user_follows WHERE follower_id = ${req.user.id} AND following_id = a.id)
         ELSE false END AS is_following_back,
         pi.status  AS invitation_status,
-        COALESCE(g.id, gci.id, got.id, gor.id, gpu.id)     AS group_id,
-        COALESCE(g.name, gci.name, got.name, gor.name, gpu.name) AS group_name,
+        COALESCE(g.id, gci.id, got.id, gor.id, gpu.id, gnt.id)     AS group_id,
+        COALESCE(g.name, gci.name, got.name, gor.name, gpu.name, gnt.name) AS group_name,
         p.name     AS player_name,
         tjr.status        AS request_status,
         rp.name           AS requested_player_name,
-        tour.id           AS tournament_id,
-        tour.name         AS tournament_name,
+        COALESCE(tour.id, tnt.id)     AS tournament_id,
+        COALESCE(tour.name, tnt.name) AS tournament_name,
         ci.status  AS collab_status,
         ot.status  AS transfer_status
       FROM notifications n
@@ -51,6 +51,8 @@ router.get('/', requireAuth, async (req, res, next) => {
       LEFT JOIN groups got ON got.id = ot.group_id
       LEFT JOIN groups gor ON n.type = 'ownership_received' AND gor.id = n.entity_id
       LEFT JOIN groups gpu ON n.type = 'player_unlinked'    AND gpu.id = n.entity_id
+      LEFT JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
+      LEFT JOIN groups gnt ON gnt.id = tnt.group_id
       WHERE n.user_id = ${req.user.id}
       ORDER BY n.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
@@ -59,15 +61,45 @@ router.get('/', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /api/notifications/count — cantidad no leídas
+// GET /api/notifications/count — no leídas + la última, en una sola consulta.
 router.get('/count', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
-    const [{ count }] = await sql`
-      SELECT COUNT(*)::int AS count FROM notifications
-      WHERE user_id = ${req.user.id} AND read = false
+    const [row] = await sql`
+      SELECT c.count,
+             l.id, l.type, l.title, l.body, l.created_at,
+             l.actor_username, l.actor_name, l.group_name, l.tournament_name, l.player_name
+      FROM (
+        SELECT COUNT(*)::int AS count FROM notifications
+        WHERE user_id = ${req.user.id} AND read = false
+      ) c
+      LEFT JOIN LATERAL (
+        SELECT n.id, n.type, n.title, n.body, n.created_at,
+               a.username AS actor_username, a.name AS actor_name,
+               COALESCE(gi.name, gci.name, got.name, gor.name, gnt.name) AS group_name,
+               COALESCE(tj.name, tnt.name) AS tournament_name,
+               p.name AS player_name
+        FROM   notifications n
+        LEFT   JOIN users a ON a.id = n.actor_id
+        LEFT   JOIN player_invitations pi ON n.type = 'invitation' AND pi.id = n.entity_id
+        LEFT   JOIN groups gi  ON gi.id  = pi.group_id
+        LEFT   JOIN players p  ON p.id   = pi.player_id
+        LEFT   JOIN collaborator_invitations ci ON n.type = 'collab_invite' AND ci.id = n.entity_id
+        LEFT   JOIN groups gci ON gci.id = ci.group_id
+        LEFT   JOIN ownership_transfers ot ON n.type = 'ownership_transfer' AND ot.id = n.entity_id
+        LEFT   JOIN groups got ON got.id = ot.group_id
+        LEFT   JOIN groups gor ON n.type = 'ownership_received' AND gor.id = n.entity_id
+        LEFT   JOIN tournament_join_requests tjr ON n.type = 'join_request' AND tjr.id = n.entity_id
+        LEFT   JOIN tournaments tj ON tj.id = tjr.tournament_id
+        LEFT   JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
+        LEFT   JOIN groups gnt ON gnt.id = tnt.group_id
+        WHERE  n.user_id = ${req.user.id} AND n.read = false
+        ORDER  BY n.created_at DESC
+        LIMIT  1
+      ) l ON true
     `;
-    res.json({ count });
+    const { count, ...latest } = row;
+    res.json({ count, latest: latest.id ? latest : null });
   } catch (err) { next(err); }
 });
 

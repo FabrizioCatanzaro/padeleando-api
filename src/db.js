@@ -1,6 +1,10 @@
-import { neon, neonConfig, Pool } from '@neondatabase/serverless';
+import { neon, neonConfig, Pool, types } from '@neondatabase/serverless';
 import ws from 'ws';
 import "dotenv/config";
+
+// Un DATE es un día del calendario: sin esto el driver lo movía según la zona del proceso.
+const DATE_OID = 1082;
+types.setTypeParser(DATE_OID, (v) => v);
 
 let _sql  = null;
 let _pool = null;

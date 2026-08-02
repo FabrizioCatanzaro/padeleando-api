@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { getDb }  from '../db.js';
+import { resolveSignup } from '../lib/signup.js';
  
 const router = Router();
  
@@ -13,6 +14,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       SELECT t.*, u.username AS owner_username,
              u.name          AS owner_name,
              u.avatar_url    AS owner_avatar_url,
+             u.social_links  AS owner_social_links,
              g.name          AS group_name,
              -- La vista de espectador pedía esto en una segunda llamada a
              -- /groups/:id/meta que sólo podía salir cuando ya había respondido
@@ -26,7 +28,12 @@ router.get('/:tournamentId', async (req, res, next) => {
              )) AS group_owner_is_premium,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
-             c.location_name AS club_location_name
+             c.location_name AS club_location_name,
+             -- Inscripción: lo de la jornada pisa lo de la categoría, campo por campo.
+             g.signup_open       AS group_signup_open,
+             g.signup_price      AS group_signup_price,
+             g.signup_price_unit AS group_signup_price_unit,
+             g.signup_contacts   AS group_signup_contacts
       FROM   tournaments t
       JOIN   groups g ON g.id = t.group_id
       JOIN   users  u ON u.id = g.user_id
@@ -97,11 +104,19 @@ router.get('/:tournamentId', async (req, res, next) => {
       owner_avatar_url: tournament.owner_avatar_url ?? null,
       created_at:     tournament.created_at,
       event_date:          tournament.event_date ?? null,
+      event_time:          tournament.event_time ?? null,
       club_id:             tournament.club_id ?? null,
       club_name:           tournament.club_name ?? null,
       club_photo_url:      tournament.club_photo_url ?? null,
       club_location_name:  tournament.club_location_name ?? null,
       bracket:        tournament.bracket ?? null,
+      // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
+      signup: resolveSignup(tournament, {
+        signup_open:       tournament.group_signup_open,
+        signup_price:      tournament.group_signup_price,
+        signup_price_unit: tournament.group_signup_price_unit,
+        signup_contacts:   tournament.group_signup_contacts,
+      }, tournament.owner_social_links),
       players,
       pairs,
       matches,

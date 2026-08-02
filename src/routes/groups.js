@@ -5,6 +5,7 @@ const router = Router();
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
+import { parseSignupFields } from '../lib/signup.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
@@ -110,6 +111,39 @@ router.get('/collaborating', requireAuth, async (req, res, next) => {
         LIMIT  1
       ) lastclub ON g.club_id IS NULL
       ORDER BY g.created_at DESC
+    `;
+    res.json(groups);
+  } catch (err) { next(err); }
+});
+
+// GET /api/groups/favorites — categorías que el usuario marcó como favoritas
+router.get('/favorites', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const groups = await sql`
+      SELECT g.*,
+        u.username   AS owner_username,
+        u.name       AS owner_name,
+        u.avatar_url AS owner_avatar_url,
+        (SELECT COUNT(DISTINCT tp.player_id)::int
+         FROM tournament_players tp
+         JOIN tournaments t ON t.id = tp.tournament_id
+         WHERE t.group_id = g.id) AS player_count,
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name
+      FROM groups g
+      JOIN users u ON u.id = g.user_id
+      JOIN group_favorites gf ON gf.group_id = g.id AND gf.user_id = ${req.user.id}
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
+      ORDER BY gf.created_at DESC
     `;
     res.json(groups);
   } catch (err) { next(err); }
@@ -915,6 +949,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     const [[group], tournaments, collaborators] = await Promise.all([
     sql`
       SELECT g.*, u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
+             u.social_links AS owner_social_links,
              c.name AS club_name, c.location_name AS club_location_name, c.photo_url AS club_photo_url,
              c.courts AS club_courts,
              cr.name AS pending_club_name,
@@ -973,7 +1008,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
     // Tanda 2: los tres agregados derivan de `tournaments`, no unos de otros, y
     // la transferencia pendiente sólo necesitaba saber si mira el dueño.
-    const [wins, allPairs, americanoPairs, transferRows, invitationRows, myPlayerRows] = await Promise.all([
+    const [wins, allPairs, americanoPairs, transferRows, invitationRows, myPlayerRows, favRows] = await Promise.all([
       finishedIds.length ? sql`
         SELECT tournament_id, player_id,
                SUM(won)::int AS wins, SUM(diff)::int AS gdiff
@@ -1055,6 +1090,13 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
         ORDER  BY p.name ASC
         LIMIT  1
       ` : [],
+
+      sql`
+        SELECT COUNT(*)::int AS favorites_count,
+               COALESCE(BOOL_OR(gf.user_id = ${viewerId}), false) AS is_favorite
+        FROM   group_favorites gf
+        WHERE  gf.group_id = ${groupId}
+      `,
     ]);
 
     // Tanda 3: los nombres son lo único que depende de un resultado anterior.
@@ -1121,7 +1163,44 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       collaborators, is_owner, can_manage, pending_transfer,
       my_invitation: invitationRows[0] ?? null,
       my_player: myPlayerRows[0] ?? null,
+      favorites_count: favRows[0]?.favorites_count ?? 0,
+      is_favorite: favRows[0]?.is_favorite ?? false,
     });
+  } catch (err) { next(err); }
+});
+
+// POST /api/groups/:groupId/favorite — marcar una categoría pública como favorita
+router.post('/:groupId/favorite', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const { groupId } = req.params;
+
+    const [group] = await sql`SELECT id, user_id, is_public FROM groups WHERE id = ${groupId}`;
+    if (!group) return res.status(404).json({ error: 'Categoría no encontrada' });
+    if (!group.is_public) return res.status(403).json({ error: 'Esta categoría es privada' });
+    if (group.user_id === req.user.id) return res.status(400).json({ error: 'Ya sos el dueño de esta categoría' });
+
+    const [collab] = await sql`
+      SELECT 1 FROM group_collaborators WHERE group_id = ${groupId} AND user_id = ${req.user.id}
+    `;
+    if (collab) return res.status(400).json({ error: 'Ya co-organizás esta categoría' });
+
+    await sql`
+      INSERT INTO group_favorites (user_id, group_id) VALUES (${req.user.id}, ${groupId})
+      ON CONFLICT DO NOTHING
+    `;
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/groups/:groupId/favorite — sacar de favoritas
+router.delete('/:groupId/favorite', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    await sql`
+      DELETE FROM group_favorites WHERE user_id = ${req.user.id} AND group_id = ${req.params.groupId}
+    `;
+    res.json({ ok: true });
   } catch (err) { next(err); }
 });
 
@@ -1155,6 +1234,9 @@ router.post('/', requireAuth, async (req, res, next) => {
 router.put('/:groupId', requireAuth, async (req, res, next) => {
   try {
     const { name, description, is_public, emojis, location_name, place_id, lat, lon, club_id, pending_club_request_id } = req.body;
+    let signup;
+    try { signup = parseSignupFields(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
     if (name !== undefined && name.trim().length > 30) return res.status(400).json({ error: 'El nombre del torneo no puede superar los 30 caracteres' });
     if (name !== undefined && name.trim().length < 2) return res.status(400).json({ error: 'El nombre del torneo debe tener mas de 2 caracteres' });
     if (description !== undefined && description !== null && description.trim().length > 50) return res.status(400).json({ error: 'La descripción no puede superar los 50 caracteres' });
@@ -1178,7 +1260,11 @@ router.put('/:groupId', requireAuth, async (req, res, next) => {
           lat = COALESCE(${lat ?? null}, lat),
           lon = COALESCE(${lon ?? null}, lon),
           club_id = CASE WHEN ${club_id !== undefined}::boolean THEN ${club_id ?? null} ELSE club_id END,
-          pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id ?? null} ELSE pending_club_request_id END
+          pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id ?? null} ELSE pending_club_request_id END,
+          signup_open       = CASE WHEN ${'signup_open'       in signup}::boolean THEN ${signup.signup_open       ?? null} ELSE signup_open END,
+          signup_price      = CASE WHEN ${'signup_price'      in signup}::boolean THEN ${signup.signup_price      ?? null} ELSE signup_price END,
+          signup_price_unit = CASE WHEN ${'signup_price_unit' in signup}::boolean THEN ${signup.signup_price_unit ?? null} ELSE signup_price_unit END,
+          signup_contacts   = CASE WHEN ${'signup_contacts'   in signup}::boolean THEN ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb ELSE signup_contacts END
       WHERE id = ${req.params.groupId} RETURNING *
     `;
     res.json(updated);
