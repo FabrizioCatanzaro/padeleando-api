@@ -14,6 +14,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       SELECT t.*, u.username AS owner_username,
              u.name          AS owner_name,
              u.avatar_url    AS owner_avatar_url,
+             u.social_links  AS owner_social_links,
              g.name          AS group_name,
              -- La vista de espectador pedía esto en una segunda llamada a
              -- /groups/:id/meta que sólo podía salir cuando ya había respondido
@@ -114,7 +115,7 @@ router.get('/:tournamentId', async (req, res, next) => {
         signup_price:      tournament.group_signup_price,
         signup_price_unit: tournament.group_signup_price_unit,
         signup_contacts:   tournament.group_signup_contacts,
-      }),
+      }, tournament.owner_social_links),
       players,
       pairs,
       matches,

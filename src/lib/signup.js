@@ -69,14 +69,42 @@ export function parseSignupFields(body) {
   return out;
 }
 
-// Valor efectivo de la jornada: lo suyo, o lo de la categoría.
-export function resolveSignup(tournament, group) {
+// Contactos que salen del perfil del organizador. Sólo WhatsApp e Instagram:
+// el resto de las redes no son canales de inscripción. El perfil guarda la url
+// con formatos irregulares (wa.me/54..., el número suelto, la url de Instagram),
+// así que se normaliza acá sin inventar el código de país que falte.
+export function profileContacts(socialLinks) {
+  if (!Array.isArray(socialLinks)) return [];
+  const out = [];
+  for (const link of socialLinks) {
+    const url = String(link?.url ?? '').trim();
+    if (!url) continue;
+    if (link.network === 'whatsapp') {
+      const digits = (url.match(/wa\.me\/(\d+)/)?.[1] ?? url).replace(/\D/g, '');
+      if (digits) out.push({ type: 'whatsapp', value: `+${digits}`, from_profile: true });
+    } else if (link.network === 'instagram') {
+      const handle = url.replace(/^https?:\/\/(www\.)?instagram\.com\//i, '').replace(/[/?#].*$/, '').replace(/^@/, '');
+      if (handle) out.push({ type: 'instagram', value: `@${handle}`, from_profile: true });
+    }
+  }
+  return out;
+}
+
+// Los del perfil primero, y los cargados a mano pisan su canal.
+export function mergeContacts(profile, own) {
+  const ownTypes = new Set((own ?? []).map((c) => c.type));
+  return [...(profile ?? []).filter((c) => !ownTypes.has(c.type)), ...(own ?? [])];
+}
+
+// Valor efectivo de la jornada: lo suyo, o lo de la categoría; los contactos
+// suman además los del perfil del dueño.
+export function resolveSignup(tournament, group, ownerSocialLinks = null) {
   const pick = (k) => (tournament?.[k] ?? group?.[k] ?? null);
   return {
     open:     pick('signup_open') ?? false,
     price:    pick('signup_price'),
     unit:     pick('signup_price_unit') ?? 'player',
-    contacts: pick('signup_contacts') ?? [],
+    contacts: mergeContacts(profileContacts(ownerSocialLinks), pick('signup_contacts') ?? []),
   };
 }
 

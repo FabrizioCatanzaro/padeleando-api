@@ -22,6 +22,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              g.signup_price      AS group_signup_price,
              g.signup_price_unit AS group_signup_price_unit,
              g.signup_contacts   AS group_signup_contacts,
+             ow.social_links     AS owner_social_links,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
@@ -34,6 +35,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              )) AS owner_is_premium
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
+      JOIN users ow ON ow.id = g.user_id
       LEFT JOIN clubs c ON c.id = t.club_id
       LEFT JOIN club_requests cr ON cr.id = t.pending_club_request_id
       WHERE t.id = ${id}
@@ -121,6 +123,11 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     if (name.trim().length < 2) return res.status(400).json({ error: 'El nombre la jornada tiene que tener mas de 2 caracteres' });
     if (name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
     if (!['liga', 'americano'].includes(format)) return res.status(400).json({ error: 'format debe ser "liga" o "americano"' });
+
+    // Lo que no venga queda en NULL: la jornada hereda ese campo de la categoría.
+    let signup;
+    try { signup = parseSignupFields(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
 
     // El americano se puede crear como "borrador" con menos de 8 parejas: recién al
     // llegar al mínimo se habilitan el calendario, los partidos y el cuadro
@@ -277,10 +284,13 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
 
       const { rows: [tournamentRow] } = await client.query(
         `INSERT INTO tournaments
-           (id, group_id, name, mode, format, number_of_courts, club_id, event_date, pending_club_request_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+           (id, group_id, name, mode, format, number_of_courts, club_id, event_date, pending_club_request_id,
+            signup_open, signup_price, signup_price_unit, signup_contacts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb) RETURNING *`,
         [tId, groupId, name.trim(), mode, format, number_of_courts ?? 1,
-         club_id ?? null, event_date || null, pending_club_request_id ?? null]
+         club_id ?? null, event_date || null, pending_club_request_id ?? null,
+         signup.signup_open ?? null, signup.signup_price ?? null, signup.signup_price_unit ?? null,
+         signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null]
       );
 
       if (players.length) {

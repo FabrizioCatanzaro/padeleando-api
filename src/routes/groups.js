@@ -949,6 +949,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     const [[group], tournaments, collaborators] = await Promise.all([
     sql`
       SELECT g.*, u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
+             u.social_links AS owner_social_links,
              c.name AS club_name, c.location_name AS club_location_name, c.photo_url AS club_photo_url,
              c.courts AS club_courts,
              cr.name AS pending_club_name,
