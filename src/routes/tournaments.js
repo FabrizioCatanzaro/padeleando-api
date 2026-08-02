@@ -114,7 +114,7 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     const {
       groupId, name, mode = 'free', format = 'liga',
       playerNames = [], pairs: pairsInput = [],
-      number_of_courts = 1, club_id = null, event_date = null,
+      number_of_courts = 1, club_id = null, event_date = null, event_time = null,
       pending_club_request_id = null,
     } = req.body;
 
@@ -284,11 +284,11 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
 
       const { rows: [tournamentRow] } = await client.query(
         `INSERT INTO tournaments
-           (id, group_id, name, mode, format, number_of_courts, club_id, event_date, pending_club_request_id,
+           (id, group_id, name, mode, format, number_of_courts, club_id, event_date, event_time, pending_club_request_id,
             signup_open, signup_price, signup_price_unit, signup_contacts)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb) RETURNING *`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb) RETURNING *`,
         [tId, groupId, name.trim(), mode, format, number_of_courts ?? 1,
-         club_id ?? null, event_date || null, pending_club_request_id ?? null,
+         club_id ?? null, event_date || null, event_time || null, pending_club_request_id ?? null,
          signup.signup_open ?? null, signup.signup_price ?? null, signup.signup_price_unit ?? null,
          signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null]
       );
@@ -401,7 +401,7 @@ async function notifyFavorites(groupId, tournamentId, actorId) {
 router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
     const { id }           = req.params;
-    const { name, status, mode, number_of_courts, club_id, event_date, pending_club_request_id } = req.body;
+    const { name, status, mode, number_of_courts, club_id, event_date, event_time, pending_club_request_id } = req.body;
     let signup;
     try { signup = parseSignupFields(req.body); }
     catch (e) { return res.status(400).json({ error: e.message }); }
@@ -423,6 +423,7 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           club_id          = CASE WHEN ${club_id !== undefined}::boolean    THEN ${club_id || null}    ELSE club_id    END,
           pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id || null} ELSE pending_club_request_id END,
           event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END,
+          event_time       = CASE WHEN ${event_time !== undefined}::boolean THEN ${event_time || null}::time ELSE event_time END,
           signup_open       = CASE WHEN ${'signup_open'       in signup}::boolean THEN ${signup.signup_open       ?? null} ELSE signup_open END,
           signup_price      = CASE WHEN ${'signup_price'      in signup}::boolean THEN ${signup.signup_price      ?? null} ELSE signup_price END,
           signup_price_unit = CASE WHEN ${'signup_price_unit' in signup}::boolean THEN ${signup.signup_price_unit ?? null} ELSE signup_price_unit END,

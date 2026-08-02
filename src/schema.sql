@@ -198,6 +198,7 @@ ALTER TABLE club_requests ADD COLUMN IF NOT EXISTS previous_data JSONB;
 -- Cada torneo se juega (opcionalmente) en un club, con fecha programada del evento.
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS club_id    TEXT REFERENCES clubs(id) ON DELETE SET NULL;
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS event_date DATE;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS event_time TIME;
 
 -- Club por defecto de la categoría (se hereda a los torneos que se crean dentro).
 ALTER TABLE groups ADD COLUMN IF NOT EXISTS club_id TEXT REFERENCES clubs(id) ON DELETE SET NULL;

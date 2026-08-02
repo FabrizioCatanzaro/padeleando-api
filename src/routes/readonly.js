@@ -104,6 +104,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       owner_avatar_url: tournament.owner_avatar_url ?? null,
       created_at:     tournament.created_at,
       event_date:          tournament.event_date ?? null,
+      event_time:          tournament.event_time ?? null,
       club_id:             tournament.club_id ?? null,
       club_name:           tournament.club_name ?? null,
       club_photo_url:      tournament.club_photo_url ?? null,
