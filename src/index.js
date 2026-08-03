@@ -22,6 +22,7 @@ import subscriptionsRouter  from './routes/subscriptions.js';
 import photosRouter         from './routes/photos.js';
 import adminRouter          from './routes/admin.js';
 import inboundRouter        from './routes/inbound.js';
+import homeRouter           from './routes/home.js';
 import { getDb } from './db.js';
 
 const app  = express();
@@ -82,8 +83,8 @@ app.use((req, _res, next) => { if (req.body === undefined) req.body = {}; next()
 
 // Contenido público de lectura: tolera unos segundos de desfase.
 const PUBLIC_CACHEABLE = [
+  '/api/home',
   '/api/readonly',
-  '/api/groups/featured',
   '/api/groups/search',
   '/api/groups/nearby',
   '/api/clubs',
@@ -112,6 +113,7 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use('/api/home',        homeRouter);
 app.use('/api/auth',        authRouter);
 app.use('/api/groups',      groupsRouter);
 app.use('/api/clubs',       clubsRouter);
