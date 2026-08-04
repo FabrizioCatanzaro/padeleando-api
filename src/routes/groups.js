@@ -6,6 +6,7 @@ import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
 import { parseSignupFields } from '../lib/signup.js';
+import { groupQuotaError } from '../lib/plan.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
@@ -1179,10 +1180,12 @@ router.post('/', requireAuth, async (req, res, next) => {
     if (name.trim().length < 2) return res.status(400).json({ error: 'El nombre del torneo debe tener mas de 2 caracteres' });
     if (description && description.trim().length > 50) return res.status(400).json({ error: 'La descripción no puede superar los 50 caracteres' });
     const sql = getDb();
-    if (club_id) {
-      const [club] = await sql`SELECT id FROM clubs WHERE id = ${club_id}`;
-      if (!club) return res.status(404).json({ error: 'Club no encontrado' });
-    }
+    const [quotaError, clubRows] = await Promise.all([
+      groupQuotaError(sql, req.user.id),
+      club_id ? sql`SELECT id FROM clubs WHERE id = ${club_id}` : Promise.resolve([]),
+    ]);
+    if (quotaError) return res.status(403).json({ error: quotaError, code: 'plan_limit' });
+    if (club_id && clubRows.length === 0) return res.status(404).json({ error: 'Club no encontrado' });
     const [group] = await sql`
       INSERT INTO groups (id, name, description, user_id, is_public, emojis, location_name, place_id, lat, lon,
                           club_id, pending_club_request_id)
