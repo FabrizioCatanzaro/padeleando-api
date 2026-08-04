@@ -6,6 +6,7 @@ import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
 import { parseSignupFields } from '../lib/signup.js';
+import { groupQuotaError } from '../lib/plan.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
@@ -807,41 +808,6 @@ router.get('/nearby', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /api/groups/featured?limit= — categorías públicas con actividad reciente (home de visitantes)
-router.get('/featured', async (req, res, next) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 8, 20);
-    const sql = getDb();
-    const groups = await sql`
-      SELECT g.id, g.name, g.description, g.emojis, g.location_name, g.is_public,
-             u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
-             (SELECT COUNT(DISTINCT tp.player_id)::int
-              FROM tournament_players tp
-              JOIN tournaments t ON t.id = tp.tournament_id
-              WHERE t.group_id = g.id) AS player_count,
-             (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
-             (SELECT MAX(t.created_at) FROM tournaments t WHERE t.group_id = g.id) AS last_activity,
-             COALESCE(gclub.name, lastclub.name) AS club_name
-      FROM groups g
-      JOIN users u ON u.id = g.user_id
-      LEFT JOIN clubs gclub ON gclub.id = g.club_id
-      LEFT JOIN LATERAL (
-        SELECT c2.name
-        FROM   tournaments t2
-        JOIN   clubs c2 ON c2.id = t2.club_id
-        WHERE  t2.group_id = g.id
-        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
-        LIMIT  1
-      ) lastclub ON g.club_id IS NULL
-      WHERE g.is_public = true
-        AND EXISTS (SELECT 1 FROM tournaments t WHERE t.group_id = g.id)
-      ORDER BY last_activity DESC NULLS LAST
-      LIMIT ${limit}
-    `;
-    res.json(groups);
-  } catch (err) { next(err); }
-});
-
 // GET /api/groups/:groupId/meta — metadata mínima de la categoría.
 // GET /:groupId devuelve ~10 consultas (torneos, ganadores, estadísticas,
 // co-organizadores), pero la vista de jornada y la de espectador sólo necesitan
@@ -1214,10 +1180,12 @@ router.post('/', requireAuth, async (req, res, next) => {
     if (name.trim().length < 2) return res.status(400).json({ error: 'El nombre del torneo debe tener mas de 2 caracteres' });
     if (description && description.trim().length > 50) return res.status(400).json({ error: 'La descripción no puede superar los 50 caracteres' });
     const sql = getDb();
-    if (club_id) {
-      const [club] = await sql`SELECT id FROM clubs WHERE id = ${club_id}`;
-      if (!club) return res.status(404).json({ error: 'Club no encontrado' });
-    }
+    const [quotaError, clubRows] = await Promise.all([
+      groupQuotaError(sql, req.user.id),
+      club_id ? sql`SELECT id FROM clubs WHERE id = ${club_id}` : Promise.resolve([]),
+    ]);
+    if (quotaError) return res.status(403).json({ error: quotaError, code: 'plan_limit' });
+    if (club_id && clubRows.length === 0) return res.status(404).json({ error: 'Club no encontrado' });
     const [group] = await sql`
       INSERT INTO groups (id, name, description, user_id, is_public, emojis, location_name, place_id, lat, lon,
                           club_id, pending_club_request_id)

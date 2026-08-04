@@ -39,6 +39,7 @@ export const requireGroupManage = makeManageGuard(
   (req) => req.params.groupId ?? req.body?.groupId ?? null,
   (sql, groupId, userId) => sql`
     SELECT g.id AS group_id,
+           g.user_id AS owner_id,
            (g.user_id = ${userId}) AS is_owner,
            EXISTS (SELECT 1 FROM group_collaborators gc
                    WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab

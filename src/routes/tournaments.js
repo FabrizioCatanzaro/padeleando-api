@@ -5,6 +5,7 @@ import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
 import { canManageGroup } from '../lib/access.js';
 import { parseSignupFields } from '../lib/signup.js';
+import { tournamentQuotaError } from '../lib/plan.js';
 
 const router = Router();
 
@@ -146,13 +147,15 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     const rawNames = playerNames.filter(Boolean).map((n) => n.trim()).filter(Boolean);
     const usernames = rawNames.filter((n) => n.startsWith('@')).map((n) => n.slice(1)).filter(Boolean);
 
-    const [clubRows, userRows] = await Promise.all([
+    const [quotaError, clubRows, userRows] = await Promise.all([
+      tournamentQuotaError(sql, groupId, req.accessCtx.owner_id),
       club_id ? sql`SELECT id FROM clubs WHERE id = ${club_id}` : Promise.resolve([]),
       usernames.length
         ? sql`SELECT id, name, username FROM users WHERE username = ANY(${usernames})`
         : Promise.resolve([]),
     ]);
 
+    if (quotaError) return res.status(403).json({ error: quotaError, code: 'plan_limit' });
     if (club_id && clubRows.length === 0) return res.status(404).json({ error: 'Club no encontrado' });
 
     const userByUsername = new Map(userRows.map((u) => [u.username, u]));
