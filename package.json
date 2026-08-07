@@ -1,6 +1,6 @@
 {
   "name": "padeliando-api",
-  "version": "1.26.0",
+  "version": "1.26.1",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -33,6 +33,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
-  "type": "module"
+  "license": "UNLICENSED",
+  "type": "module",
+  "private": true
 }
