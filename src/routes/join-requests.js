@@ -214,7 +214,8 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
       const [user] = await sql`SELECT name FROM users WHERE id = ${request.user_id}`;
 
       await sql`
-        UPDATE players SET user_id = ${request.user_id}, name = ${user.name}
+        UPDATE players SET user_id = ${request.user_id}, name = ${user.name},
+               original_name = COALESCE(original_name, name)
         WHERE id = ${playerId}
       `;
     }

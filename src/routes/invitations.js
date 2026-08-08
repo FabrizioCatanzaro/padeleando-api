@@ -1,21 +1,36 @@
 import { Router } from 'express';
+import { randomBytes, createHash } from 'crypto';
 import { getDb }  from '../db.js';
 import { uid }    from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
+import { canManageGroup } from '../lib/access.js';
 
 const router = Router();
 
+const genToken  = () => randomBytes(24).toString('hex');
+const hashToken = (token) => createHash('sha256').update(token).digest('hex');
+const linkUrl   = (token) => `${process.env.FRONTEND_URL ?? ''}/invitacion/${token}`;
+
 // POST /api/invitations
-// El dueño del grupo invita a un usuario registrado a reclamar un slot de jugador.
-// Body: { playerId, groupId, identifier }  — identifier es @username o email
+// Invita a alguien a reclamar un slot de jugador de la categoría.
+// Body: { playerId, groupId, identifier } — @username o email
+//    o: { playerId, groupId, link: true } — devuelve una URL para compartir,
+//       pensada para quien todavía no tiene cuenta.
 router.post('/', requireAuth, async (req, res, next) => {
   try {
-    const { playerId, groupId, identifier } = req.body;
+    const { playerId, groupId, identifier, link } = req.body;
     if (!playerId)    return res.status(400).json({ error: 'playerId requerido' });
     if (!groupId)     return res.status(400).json({ error: 'groupId requerido' });
-    if (!identifier?.trim()) return res.status(400).json({ error: 'identifier requerido' });
+    if (!link && !identifier?.trim()) return res.status(400).json({ error: 'identifier requerido' });
 
     const sql = getDb();
+
+    // Este endpoint sólo tenía requireAuth: cualquier usuario logueado podía
+    // invitar a un slot de una categoría ajena. Además, ahora que responde si la
+    // cuenta existe, sin este control sería un buscador de usuarios y mails.
+    if (!(await canManageGroup(sql, req.user.id, groupId))) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
 
     // Verificar que el jugador existe en el grupo
     const [gp] = await sql`
@@ -29,17 +44,46 @@ router.post('/', requireAuth, async (req, res, next) => {
       return res.status(409).json({ error: 'Este jugador ya está vinculado a una cuenta' });
     }
 
-    // Buscar al usuario invitado por @username o email
+    // ── Invitación por link: no hay a quién buscar ──────────────────────────
+    // Es el camino para quien todavía no tiene cuenta. El token plano se
+    // devuelve una sola vez; en la base queda sólo el hash.
+    if (link) {
+      const [existingLink] = await sql`
+        SELECT id FROM player_invitations WHERE player_id = ${playerId} AND status = 'pending'
+      `;
+      if (existingLink) return res.status(409).json({ error: 'Ya hay una invitación pendiente para este jugador' });
+
+      const token = genToken();
+      const [invitation] = await sql`
+        INSERT INTO player_invitations (id, player_id, group_id, invited_by, token_hash)
+        VALUES (${uid()}, ${playerId}, ${groupId}, ${req.user.id}, ${hashToken(token)})
+        RETURNING id
+      `;
+      return res.status(201).json({ invitation, url: linkUrl(token) });
+    }
+
+    // ── Invitación directa por @usuario o email ─────────────────────────────
+    // Se acepta sin arroba porque olvidarla es lo normal: si no parece un mail,
+    // se busca como nombre de usuario.
     const raw = identifier.trim();
-    const isUsername = raw.startsWith('@');
-    const lookup = isUsername ? raw.slice(1) : raw;
+    const lookup = raw.replace(/^@/, '');
+    const pareceEmail = lookup.includes('@');
 
-    let [invitedUser] = isUsername
-      ? await sql`SELECT id, name, username FROM users WHERE username = ${lookup}`
-      : await sql`SELECT id, name, username FROM users WHERE email   = ${lookup}`;
+    let [invitedUser] = pareceEmail
+      ? await sql`SELECT id, name, username FROM users WHERE LOWER(email) = LOWER(${lookup})`
+      : await sql`SELECT id, name, username FROM users WHERE LOWER(username) = LOWER(${lookup})`;
 
-    // No revelar si el usuario existe o no por seguridad — simplemente guardamos la invitación
-    // Si no existe, invited_user_id queda NULL y el usuario podrá reclamarla al registrarse (futuro)
+    // Antes se guardaba igual sin decir si existía, para no filtrar quién tiene
+    // cuenta. La invitación quedaba muerta: nadie la recibía nunca. Ahora se
+    // rechaza, y el filtrado no importa porque sólo llega hasta acá quien puede
+    // gestionar la categoría.
+    if (!invitedUser) {
+      return res.status(404).json({
+        error: pareceEmail
+          ? 'No hay ninguna cuenta con ese mail. Si todavía no se registró, generá un link de invitación.'
+          : `No existe el usuario @${lookup}. Revisá cómo se escribe, o generá un link de invitación.`,
+      });
+    }
 
     // Una cuenta no puede tener dos slots en la misma categoría.
     if (invitedUser?.id) {
@@ -68,21 +112,18 @@ router.post('/', requireAuth, async (req, res, next) => {
 
     // Auto-aceptar: si el usuario ya aceptó antes una invitación en esta misma categoría,
     // significa que ya jugó con este organizador acá → no hace falta que confirme de nuevo.
-    let autoAccept = false;
-    if (invitedUser?.id) {
-      const [prior] = await sql`
-        SELECT 1 FROM player_invitations
-        WHERE group_id = ${groupId} AND invited_user_id = ${invitedUser.id} AND status = 'accepted'
-        LIMIT 1
-      `;
-      autoAccept = !!prior;
-    }
+    const [prior] = await sql`
+      SELECT 1 FROM player_invitations
+      WHERE group_id = ${groupId} AND invited_user_id = ${invitedUser.id} AND status = 'accepted'
+      LIMIT 1
+    `;
+    const autoAccept = !!prior;
 
     const [invitation] = await sql`
       INSERT INTO player_invitations
         (id, player_id, group_id, invited_by, invited_identifier, invited_user_id, status)
       VALUES
-        (${uid()}, ${playerId}, ${groupId}, ${req.user.id}, ${raw}, ${invitedUser?.id ?? null},
+        (${uid()}, ${playerId}, ${groupId}, ${req.user.id}, ${raw}, ${invitedUser.id},
          ${autoAccept ? 'accepted' : 'pending'})
       RETURNING *
     `;
@@ -90,20 +131,23 @@ router.post('/', requireAuth, async (req, res, next) => {
     // Si se auto-acepta, vincular el slot de jugador a la cuenta al instante
     if (autoAccept) {
       await sql`
-        UPDATE players SET user_id = ${invitedUser.id}, name = ${invitedUser.name}
+        UPDATE players SET user_id = ${invitedUser.id}, name = ${invitedUser.name},
+               original_name = COALESCE(original_name, name)
         WHERE id = ${invitation.player_id}
       `;
     }
 
-    // Notificar al usuario invitado si fue encontrado
-    if (invitedUser?.id) {
-      await sql`
-        INSERT INTO notifications (id, user_id, type, actor_id, entity_id)
-        VALUES (${uid()}, ${invitedUser.id}, 'invitation', ${req.user.id}, ${invitation.id})
-      `;
-    }
+    await sql`
+      INSERT INTO notifications (id, user_id, type, actor_id, entity_id)
+      VALUES (${uid()}, ${invitedUser.id}, 'invitation', ${req.user.id}, ${invitation.id})
+    `;
 
-    res.status(201).json({ invitation, found: !!invitedUser, autoAccepted: autoAccept });
+    res.status(201).json({
+      invitation,
+      found: true,
+      autoAccepted: autoAccept,
+      invited: { name: invitedUser.name, username: invitedUser.username },
+    });
   } catch (err) { next(err); }
 });
 
@@ -191,7 +235,8 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
       }
 
       await sql`
-        UPDATE players SET user_id = ${req.user.id}, name = ${req.user.name}
+        UPDATE players SET user_id = ${req.user.id}, name = ${req.user.name},
+               original_name = COALESCE(original_name, name)
         WHERE id = ${invitation.player_id}
       `;
     }
@@ -213,7 +258,10 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
     const sql = getDb();
     const [invitation] = await sql`SELECT * FROM player_invitations WHERE id = ${req.params.id}`;
     if (!invitation) return res.status(404).json({ error: 'Invitación no encontrada' });
-    if (invitation.invited_by !== req.user.id) {
+    // Cualquiera que gestione la categoría puede cancelarla, no sólo quien la
+    // mandó: si no, un co-organizador no podía deshacer el error del dueño.
+    if (invitation.invited_by !== req.user.id
+        && !(await canManageGroup(sql, req.user.id, invitation.group_id))) {
       return res.status(403).json({ error: 'No autorizado' });
     }
     await sql`DELETE FROM player_invitations WHERE id = ${req.params.id}`;
