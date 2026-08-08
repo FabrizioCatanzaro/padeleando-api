@@ -121,8 +121,8 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
 
     if (!groupId)      return res.status(400).json({ error: 'groupId requerido' });
     if (!name?.trim()) return res.status(400).json({ error: 'nombre requerido' });
-    if (name.trim().length < 2) return res.status(400).json({ error: 'El nombre la jornada tiene que tener mas de 2 caracteres' });
-    if (name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
+    if (name.trim().length < 2) return res.status(400).json({ error: 'El nombre del torneo tiene que tener más de 2 caracteres' });
+    if (name.trim().length > 30) return res.status(400).json({ error: 'El nombre del torneo no puede superar los 30 caracteres' });
     if (!['liga', 'americano'].includes(format)) return res.status(400).json({ error: 'format debe ser "liga" o "americano"' });
 
     // Lo que no venga queda en NULL: la jornada hereda ese campo de la categoría.
@@ -408,8 +408,8 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
     let signup;
     try { signup = parseSignupFields(req.body); }
     catch (e) { return res.status(400).json({ error: e.message }); }
-    if (name !== undefined && name.trim().length > 30) return res.status(400).json({ error: 'El nombre la jornada no puede superar los 30 caracteres' });
-    if (name !== undefined && name.trim().length < 2) return res.status(400).json({ error: 'El nombre la jornada debe superar los 2 caracteres' });
+    if (name !== undefined && name.trim().length > 30) return res.status(400).json({ error: 'El nombre del torneo no puede superar los 30 caracteres' });
+    if (name !== undefined && name.trim().length < 2) return res.status(400).json({ error: 'El nombre del torneo debe superar los 2 caracteres' });
     const sql = getDb();
 
     if (club_id) {
