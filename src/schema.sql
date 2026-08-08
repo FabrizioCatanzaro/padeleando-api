@@ -18,6 +18,13 @@ CREATE TABLE IF NOT EXISTS players (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
  
+-- Cómo lo había anotado el organizador antes de que se vinculara una cuenta.
+-- Al vincular, `name` pasa a ser el nombre de la cuenta, y sin esto el apodo con
+-- el que el organizador lo reconoce ("Juancito", "el flaco") se perdía: si la
+-- persona se registró como "J. P.", no había forma de saber quién era.
+-- Se escribe una sola vez, la primera; después queda fijo.
+ALTER TABLE players ADD COLUMN IF NOT EXISTS original_name TEXT;
+
 -- Qué jugadores pertenecen a qué grupo
 CREATE TABLE IF NOT EXISTS group_players (
   group_id   TEXT REFERENCES groups(id)  ON DELETE CASCADE,
@@ -72,6 +79,12 @@ CREATE TABLE IF NOT EXISTS player_invitations (
     CHECK (status IN ('pending', 'accepted', 'rejected')),
   created_at         TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Invitación de jugador por link, para quien todavía no tiene cuenta. Mismo
+-- patrón que collaborator_invitations: se guarda el hash, el token plano sólo
+-- viaja en la URL. `invited_identifier` e `invited_user_id` quedan NULL.
+ALTER TABLE player_invitations ADD COLUMN IF NOT EXISTS token_hash TEXT UNIQUE;
+ALTER TABLE player_invitations ALTER COLUMN invited_identifier DROP NOT NULL;
 
 -- Jugadores por jornada (torneo)
 CREATE TABLE IF NOT EXISTS tournament_players (
@@ -138,6 +151,14 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS advanced_stats_public BOOLEAN NOT NUL
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'
     CHECK (role IN ('user', 'admin'));
+
+-- A qué vino el usuario, preguntado una sola vez después del registro. Decide
+-- qué le muestra la portada: crear su primera categoría, o buscar el torneo en
+-- el que ya juega. NULL = todavía no contestó (las cuentas previas al cambio).
+-- No es un permiso: se puede cambiar de idea y hacer las dos cosas.
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS onboarding_role TEXT
+    CHECK (onboarding_role IN ('organizer', 'player'));
 
 CREATE TABLE IF NOT EXISTS email_verifications (
   id         TEXT        PRIMARY KEY,

@@ -58,7 +58,7 @@ router.post('/', requireAuth, uploadTournamentPhoto, async (req, res, next) => {
     `;
     if (count >= MAX_PHOTOS_PER_TOURNAMENT) {
       return res.status(400).json({
-        error: `Límite de ${MAX_PHOTOS_PER_TOURNAMENT} fotos por jornada alcanzado`,
+        error: `Límite de ${MAX_PHOTOS_PER_TOURNAMENT} fotos por torneo alcanzado`,
       });
     }
 

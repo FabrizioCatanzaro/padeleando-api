@@ -381,7 +381,8 @@ router.get('/me', async (req, res, next) => {
     const { id } = jwt.verify(token, SECRET);
     const sql = getDb();
     const [user] = await sql`
-      SELECT id, email, name, username, avatar_url, role, created_at, social_links FROM users WHERE id = ${id}
+      SELECT id, email, name, username, avatar_url, role, created_at, social_links, bio, onboarding_role
+      FROM users WHERE id = ${id}
     `;
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
     const subscription = await getActiveSubscription(sql, id);
@@ -449,7 +450,7 @@ router.post('/verify-email', async (req, res, next) => {
     await sql`UPDATE email_verifications SET used = true WHERE id = ${verification.id}`;
 
     const [user] = await sql`
-      SELECT id, email, name, username, avatar_url, created_at
+      SELECT id, email, name, username, avatar_url, created_at, onboarding_role
       FROM users WHERE id = ${verification.user_id}
     `;
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -553,7 +554,7 @@ router.post('/reset-password', async (req, res, next) => {
 // ── PATCH /api/auth/me ────────────────────────────────────────────
 router.patch('/me', requireAuth, async (req, res, next) => {
   try {
-    const { name, username, current_password, new_password, social_links, bio, advanced_stats_public } = req.body;
+    const { name, username, current_password, new_password, social_links, bio, advanced_stats_public, onboarding_role } = req.body;
     const sql = getDb();
 
     const [user] = await sql`SELECT * FROM users WHERE id = ${req.user.id}`;
@@ -604,6 +605,14 @@ router.patch('/me', requireAuth, async (req, res, next) => {
       updates.advanced_stats_public = advanced_stats_public;
     }
 
+    // A qué vino: sólo decide qué le muestra la portada, así que no hay nada que
+    // proteger. Se puede cambiar las veces que quiera.
+    if (onboarding_role !== undefined) {
+      if (onboarding_role !== 'organizer' && onboarding_role !== 'player')
+        return res.status(400).json({ error: 'onboarding_role debe ser organizer o player' });
+      updates.onboarding_role = onboarding_role;
+    }
+
     // Redes sociales
     if (social_links !== undefined) {
       if (!Array.isArray(social_links)) return res.status(400).json({ error: 'social_links debe ser un arreglo' });
@@ -632,7 +641,7 @@ router.patch('/me', requireAuth, async (req, res, next) => {
     const values = Object.values(updates);
     const setClauses = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
     const [updated] = await sql.query(
-      `UPDATE users SET ${setClauses} WHERE id = $${keys.length + 1} RETURNING id, name, username, avatar_url, social_links, bio, advanced_stats_public`,
+      `UPDATE users SET ${setClauses} WHERE id = $${keys.length + 1} RETURNING id, name, username, avatar_url, social_links, bio, advanced_stats_public, onboarding_role`,
       [...values, req.user.id]
     );
 

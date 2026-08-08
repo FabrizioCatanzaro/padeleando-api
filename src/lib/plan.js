@@ -37,5 +37,5 @@ export async function tournamentQuotaError(sql, groupId, ownerId) {
     `,
   ]);
   if (premium || count < FREE_TOURNAMENTS_PER_MONTH) return null;
-  return `El plan Básico permite ${FREE_TOURNAMENTS_PER_MONTH} jornadas por mes en cada categoría. Hacete Premium para crear más.`;
+  return `El plan Básico permite ${FREE_TOURNAMENTS_PER_MONTH} torneos por mes en cada categoría. Hacete Premium para crear más.`;
 }

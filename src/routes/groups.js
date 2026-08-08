@@ -23,7 +23,14 @@ router.get('/', requireAuth, async (req, res, next) => {
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
-        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        -- Sólo lo consume el checklist de primeros pasos de la portada, que
+        -- necesita saber si ya cargó algún resultado. Va acá y no en una
+        -- petición aparte para no sumar un round-trip a Neon.
+        (SELECT COUNT(*)::int
+         FROM   matches m
+         JOIN   tournaments t ON t.id = m.tournament_id
+         WHERE  t.group_id = g.id) AS match_count
       FROM groups g
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
@@ -974,7 +981,8 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
     // Tanda 2: los tres agregados derivan de `tournaments`, no unos de otros, y
     // la transferencia pendiente sólo necesitaba saber si mira el dueño.
-    const [wins, allPairs, americanoPairs, transferRows, invitationRows, myPlayerRows, favRows] = await Promise.all([
+    const [wins, allPairs, americanoPairs, transferRows, invitationRows, myPlayerRows, favRows,
+           claimableRows] = await Promise.all([
       finishedIds.length ? sql`
         SELECT tournament_id, player_id,
                SUM(won)::int AS wins, SUM(diff)::int AS gdiff
@@ -1063,6 +1071,38 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
         FROM   group_favorites gf
         WHERE  gf.group_id = ${groupId}
       `,
+
+      // Slots libres que quien mira podría reclamar: jugadores de la categoría
+      // sin cuenta vinculada. Cada uno viaja con una jornada suya porque la
+      // solicitud de unión se pide contra una jornada concreta, aunque el
+      // vínculo que resulta sea de toda la categoría.
+      //
+      // Se omite si ya tiene un slot vinculado acá: una cuenta ocupa uno solo
+      // por categoría, así que no habría nada que reclamar.
+      viewerId ? sql`
+        SELECT p.id, p.name,
+               (SELECT t.id
+                FROM   tournament_players tp
+                JOIN   tournaments t ON t.id = tp.tournament_id AND t.group_id = ${groupId}
+                WHERE  tp.player_id = p.id
+                ORDER  BY COALESCE(t.event_date, t.created_at::date) DESC
+                LIMIT  1) AS tournament_id
+        FROM   players p
+        JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = ${groupId}
+        WHERE  p.user_id IS NULL
+          AND  NOT EXISTS (
+            SELECT 1 FROM players mine
+            JOIN   group_players mgp ON mgp.player_id = mine.id AND mgp.group_id = ${groupId}
+            WHERE  mine.user_id = ${viewerId}
+          )
+          AND  EXISTS (
+            SELECT 1
+            FROM   tournament_players tp
+            JOIN   tournaments t ON t.id = tp.tournament_id AND t.group_id = ${groupId}
+            WHERE  tp.player_id = p.id
+          )
+        ORDER  BY p.name ASC
+      ` : [],
     ]);
 
     // Tanda 3: los nombres son lo único que depende de un resultado anterior.
@@ -1131,6 +1171,8 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       my_player: myPlayerRows[0] ?? null,
       favorites_count: favRows[0]?.favorites_count ?? 0,
       is_favorite: favRows[0]?.is_favorite ?? false,
+      // Quien ya gestiona la categoría no reclama ningún lugar.
+      claimable_players: can_manage ? [] : claimableRows.filter((p) => p.tournament_id),
     });
   } catch (err) { next(err); }
 });
@@ -1179,6 +1221,14 @@ router.post('/', requireAuth, async (req, res, next) => {
     if (name.trim().length > 30) return res.status(400).json({ error: 'El nombre del torneo no puede superar los 30 caracteres' });
     if (name.trim().length < 2) return res.status(400).json({ error: 'El nombre del torneo debe tener mas de 2 caracteres' });
     if (description && description.trim().length > 50) return res.status(400).json({ error: 'La descripción no puede superar los 50 caracteres' });
+
+    // La inscripción ahora se puede cargar en el alta, no sólo al editar. Las
+    // claves ausentes quedan en NULL, que es el valor que ya tenía una categoría
+    // recién creada.
+    let signup;
+    try { signup = parseSignupFields(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
     const sql = getDb();
     const [quotaError, clubRows] = await Promise.all([
       groupQuotaError(sql, req.user.id),
@@ -1188,10 +1238,14 @@ router.post('/', requireAuth, async (req, res, next) => {
     if (club_id && clubRows.length === 0) return res.status(404).json({ error: 'Club no encontrado' });
     const [group] = await sql`
       INSERT INTO groups (id, name, description, user_id, is_public, emojis, location_name, place_id, lat, lon,
-                          club_id, pending_club_request_id)
+                          club_id, pending_club_request_id,
+                          signup_open, signup_price, signup_price_unit, signup_contacts)
       VALUES (${uid()}, ${name.trim()}, ${description ?? null}, ${req.user.id}, ${is_public}, ${emojis},
               ${location_name ?? null}, ${place_id ?? null}, ${lat ?? null}, ${lon ?? null},
-              ${club_id ?? null}, ${pending_club_request_id ?? null})
+              ${club_id ?? null}, ${pending_club_request_id ?? null},
+              ${signup.signup_open ?? null}, ${signup.signup_price ?? null},
+              ${signup.signup_price_unit ?? null},
+              ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb)
       RETURNING *
     `;
     res.status(201).json(group);

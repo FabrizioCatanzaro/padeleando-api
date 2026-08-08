@@ -267,6 +267,52 @@ router.post('/invites/resolve', requireAuth, async (req, res, next) => {
     `;
     if (ot) return res.json({ kind: 'transfer', group: { id: ot.group_id, name: ot.group_name }, from: { name: ot.from_name, username: ot.from_username } });
 
+    // Invitación a jugar (reclamar un slot de jugador), para quien no tenía
+    // cuenta cuando lo invitaron.
+    const [pi] = await sql`
+      SELECT pi.id, g.id AS group_id, g.name AS group_name, p.name AS player_name,
+             u.name AS from_name, u.username AS from_username
+      FROM   player_invitations pi
+      JOIN   groups  g ON g.id = pi.group_id
+      JOIN   players p ON p.id = pi.player_id
+      JOIN   users   u ON u.id = pi.invited_by
+      WHERE  pi.token_hash = ${hashToken(token)} AND pi.status = 'pending'
+    `;
+    if (pi) return res.json({
+      kind: 'player',
+      group: { id: pi.group_id, name: pi.group_name },
+      player: { name: pi.player_name },
+      from: { name: pi.from_name, username: pi.from_username },
+    });
+
+    // Hasta acá el token no coincide con nada pendiente. Puede ser inventado, o
+    // puede ser uno real que alguien ya usó — el caso corriente cuando el link se
+    // comparte en un grupo. Distinguirlo no filtra nada (quien pregunta ya tiene
+    // el token) y evita el callejón sin salida de "invitación inválida".
+    const [usado] = await sql`
+      SELECT g.name AS group_name
+      FROM   player_invitations pi
+      JOIN   groups g ON g.id = pi.group_id
+      WHERE  pi.token_hash = ${hashToken(token)}
+      UNION ALL
+      SELECT g.name
+      FROM   collaborator_invitations ci
+      JOIN   groups g ON g.id = ci.group_id
+      WHERE  ci.token_hash = ${hashToken(token)}
+      UNION ALL
+      SELECT g.name
+      FROM   ownership_transfers ot
+      JOIN   groups g ON g.id = ot.group_id
+      WHERE  ot.token_hash = ${hashToken(token)}
+      LIMIT  1
+    `;
+    if (usado) {
+      return res.status(410).json({
+        error: 'used',
+        group_name: usado.group_name,
+      });
+    }
+
     res.status(404).json({ error: 'Invitación inválida o ya utilizada' });
   } catch (err) { next(err); }
 });
@@ -301,6 +347,49 @@ router.post('/invites/accept', requireAuth, async (req, res, next) => {
       }
       await applyTransfer(sql, { ...ot, to_user_id: req.user.id });
       return res.json({ kind: 'transfer', group_id: ot.group_id });
+    }
+
+    // Invitación a jugar
+    const [pi] = await sql`SELECT * FROM player_invitations WHERE token_hash = ${hashToken(token)} AND status = 'pending'`;
+    if (pi) {
+      const [[player], [linked]] = await Promise.all([
+        sql`SELECT id, user_id, name FROM players WHERE id = ${pi.player_id}`,
+        // Una cuenta ocupa un solo slot por categoría: el trigger lo rechazaría
+        // igual, pero acá el mensaje explica qué pasó.
+        sql`
+          SELECT p.name
+          FROM   players p
+          JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = ${pi.group_id}
+          WHERE  p.user_id = ${req.user.id}
+          LIMIT  1
+        `,
+      ]);
+      if (!player) return res.status(404).json({ error: 'El jugador ya no existe' });
+      if (player.user_id) return res.status(409).json({ error: 'Otra persona ya usó este link.' });
+      if (linked) return res.status(409).json({ error: `Ya jugás en esta categoría como "${linked.name}"` });
+
+      const [me] = await sql`SELECT name FROM users WHERE id = ${req.user.id}`;
+
+      // El `user_id IS NULL` es la compuerta: si dos personas abren el mismo link
+      // y aceptan a la vez, las dos pasan la comprobación de arriba (leen el slot
+      // libre antes de que ninguna escriba) y la segunda pisaba a la primera.
+      // Acá sólo un UPDATE puede encontrar la fila libre; el otro no toca nada.
+      const claimed = await sql`
+        UPDATE players SET user_id = ${req.user.id}, name = ${me.name},
+               original_name = COALESCE(original_name, name)
+        WHERE  id = ${pi.player_id} AND user_id IS NULL
+        RETURNING id
+      `;
+      if (claimed.length === 0) {
+        return res.status(409).json({ error: 'Otra persona ya usó este link.' });
+      }
+
+      await sql`
+        UPDATE player_invitations
+        SET    status = 'accepted', invited_user_id = ${req.user.id}
+        WHERE  id = ${pi.id}
+      `;
+      return res.json({ kind: 'player', group_id: pi.group_id });
     }
 
     res.status(404).json({ error: 'Invitación inválida o ya utilizada' });
