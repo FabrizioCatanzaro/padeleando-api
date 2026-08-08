@@ -53,14 +53,38 @@ router.get('/', optionalAuth, async (req, res, next) => {
 });
 
 // GET /api/players/group/:groupId
+// Plantel de la categoría, para la pestaña Jugadores. Trae lo mismo que la vista
+// de un torneo (cuenta vinculada, invitación pendiente) más en cuántos torneos
+// jugó cada uno — que es el dato que sólo tiene sentido a nivel categoría.
 router.get('/group/:groupId', async (req, res, next) => {
   try {
     const sql = getDb();
+    const { groupId } = req.params;
     const players = await sql`
-      SELECT p.*
+      SELECT
+        p.*,
+        u.username   AS linked_username,
+        u.name       AS linked_name,
+        u.avatar_url AS linked_avatar_url,
+        (s.id IS NOT NULL) AS is_premium,
+        pi.id        AS invitation_id,
+        pi.status    AS invitation_status,
+        pi.invited_identifier,
+        COALESCE(tc.tournament_count, 0) AS tournament_count
       FROM   players p
-      JOIN   group_players gp ON gp.player_id = p.id
-      WHERE  gp.group_id = ${req.params.groupId}
+      JOIN   group_players gp ON gp.player_id = p.id AND gp.group_id = ${groupId}
+      -- Agregado en una pasada en vez de una subconsulta correlacionada por
+      -- jugador: con un plantel grande, la correlacionada se ejecuta N veces.
+      LEFT   JOIN (
+        SELECT tp.player_id, COUNT(*)::int AS tournament_count
+        FROM   tournament_players tp
+        JOIN   tournaments t ON t.id = tp.tournament_id AND t.group_id = ${groupId}
+        GROUP  BY tp.player_id
+      ) tc ON tc.player_id = p.id
+      LEFT   JOIN users u ON u.id = p.user_id
+      LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT   JOIN player_invitations pi
+        ON   pi.player_id = p.id AND pi.group_id = ${groupId} AND pi.status = 'pending'
       ORDER  BY p.name ASC
     `;
     res.json(players);
@@ -182,6 +206,24 @@ router.delete('/:playerId/group/:groupId', requireAuth, requireGroupManage, asyn
   try {
     const { playerId, groupId } = req.params;
     const sql = getDb();
+
+    // Sólo se puede sacar del plantel a quien no jugó nada. Con torneos encima,
+    // borrar la fila de group_players lo saca de los listados pero deja sus
+    // partidos apuntando a un jugador que ya no figura en la categoría: se
+    // rompen los nombres de la tabla y del cuadro. Para ese caso está sacarlo
+    // del torneo, que no toca el historial.
+    const [{ count }] = await sql`
+      SELECT COUNT(*)::int AS count
+      FROM   tournament_players tp
+      JOIN   tournaments t ON t.id = tp.tournament_id AND t.group_id = ${groupId}
+      WHERE  tp.player_id = ${playerId}
+    `;
+    if (count > 0) {
+      return res.status(409).json({
+        error: `Este jugador participó en ${count} ${count === 1 ? 'torneo' : 'torneos'}. Sacalo de cada torneo si querés, pero no se puede quitar de la categoría sin perder el historial.`,
+      });
+    }
+
     await sql`
       DELETE FROM group_players
       WHERE group_id = ${groupId} AND player_id = ${playerId}
@@ -217,7 +259,16 @@ router.delete('/:playerId/group/:groupId/link', requireAuth, async (req, res, ne
 
     const unlinkedUserId = player.user_id;
 
-    await sql`UPDATE players SET user_id = NULL WHERE id = ${playerId}`;
+    // Vuelve al nombre con el que lo había anotado el organizador. Si se queda
+    // el de la cuenta, el slot pasa a estar rotulado con el nombre real de
+    // alguien que ya no está vinculado, que es lo que menos se quiere.
+    await sql`
+      UPDATE players
+      SET    user_id = NULL,
+             name    = COALESCE(original_name, name),
+             original_name = NULL
+      WHERE  id = ${playerId}
+    `;
 
     // Sin esto la desvinculación sería reversible por el organizador solo: una
     // invitación ya aceptada en esta categoría hace que las siguientes se
