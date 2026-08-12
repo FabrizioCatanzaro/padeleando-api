@@ -89,13 +89,23 @@ async function saveRefreshToken(sql, userId, rawToken) {
 }
 
 async function generateUsername(sql, name, excludeId = null) {
-  const base = name.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+  // El nombre admite hasta NAME_MAX pero el username tope 20, así que hay que
+  // recortar la base. Se reservan 4 chars para el sufijo `_2`, `_10`… que se
+  // agrega cuando el candidato ya está tomado.
+  const base = name.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+    .slice(0, 16).replace(/_+$/, '');
   let candidate = base || 'user';
   let i = 2;
   while (true) {
+    // Un @username ocupado por una cuenta fantasma cuenta como libre: el registro
+    // la va a reclamar. Si no, se sugeriría `fabri_2` teniendo `fabri` muerto.
     const [ex] = excludeId
-      ? await sql.query('SELECT id FROM users WHERE username = $1 AND id != $2', [candidate, excludeId])
-      : await sql`SELECT id FROM users WHERE username = ${candidate}`;
+      ? await sql.query(
+          `SELECT u.id FROM users u WHERE u.username = $1 AND u.id != $2 AND ${ACCOUNT_REACHABLE}`,
+          [candidate, excludeId])
+      : await sql.query(
+          `SELECT u.id FROM users u WHERE u.username = $1 AND ${ACCOUNT_REACHABLE}`,
+          [candidate]);
     if (!ex) return candidate;
     candidate = `${base}_${i++}`;
   }
@@ -109,9 +119,26 @@ function validatePassword(password) {
   return null;
 }
 
+// El nombre visible es el nombre real de la persona, no un handle: tiene que
+// entrar "María Fernanda Rodríguez" (24) o "Fernando Belasteguín" (20). El
+// límite del username sigue siendo 20 y es otra cosa.
+//
+// El mínimo es 3 y no 2 aunque existan nombres de dos letras ("Li"): el
+// username se deriva del nombre en generateUsername() y tiene un mínimo propio
+// de 3, así que un nombre más corto haría que el sistema genere un username que
+// él mismo rechazaría si lo escribieras a mano. 3 también es el umbral desde el
+// que AuthView pide la sugerencia de username, con lo cual todo nombre válido
+// recibe una.
+const NAME_MIN = 3;
+const NAME_MAX = 50;
+
 function validateUser(user) {
-  if (!user || user.length < 6)  return 'El nombre debe tener al menos 6 caracteres';
-  if (user.length >= 20) return 'El nombre tiene un límite de 20 caracteres';
+  // Se valida sobre el nombre recortado porque es lo que termina guardado
+  // (el INSERT hace name.trim()): los espacios de los bordes no cuentan ni
+  // para el mínimo ni para el máximo.
+  const name = (user || '').trim();
+  if (name.length < NAME_MIN) return `El nombre debe tener al menos ${NAME_MIN} caracteres`;
+  if (name.length > NAME_MAX) return `El nombre tiene un límite de ${NAME_MAX} caracteres`;
   return null;
 }
 
@@ -122,6 +149,29 @@ function validateUsername(username) {
   if (!/^[a-z0-9_]+$/.test(username))  return 'El nombre de usuario solo puede contener letras, números y guiones bajos';
   return null;
 }
+
+// ── Cuentas fantasma ─────────────────────────────────────────────────────────
+// Una cuenta sin verificar cuyo enlace de verificación ya venció es inalcanzable:
+// el login la rechaza (exige `email_verified_at`) y nadie puede completarla, pero
+// su email y su @username quedan tomados para siempre. El caso típico es un typo
+// en el mail al registrarse: el enlace se fue a una casilla ajena.
+//
+// Esas cuentas no bloquean nada — un registro nuevo las reclama y las borra.
+// Se espera al vencimiento del enlace en vez de reclamarlas apenas se crean
+// porque mientras el enlace sigue vivo el dueño legítimo puede estar por
+// clickearlo, y pisarle la cuenta le rompería el alta. Una vez vencido no se
+// pierde nada: esa fila ya no la puede verificar nadie.
+//
+// Va como texto y no dentro de un tagged template porque las tres queries que
+// preguntan "¿está tomado?" (register, username-available y generateUsername)
+// tienen que compartir exactamente la misma definición; interpolar un fragmento
+// en un tagged template lo mandaría como valor, no como SQL. Requiere que la
+// tabla users esté aliasada `u`.
+const ACCOUNT_REACHABLE = `(
+    u.email_verified_at IS NOT NULL
+    OR EXISTS (SELECT 1 FROM email_verifications ev
+                WHERE ev.user_id = u.id AND ev.used = false AND ev.expires_at > NOW())
+  )`;
 
 // Bloquea si hay 5+ intentos fallidos del mismo email en los últimos 15 min
 async function checkLoginAttempts(sql, email) {
@@ -203,33 +253,60 @@ router.post('/register', async (req, res, next) => {
     if (!email || !password || !name)
       return res.status(400).json({ error: 'Email, Contraseña y Nombre son requeridos' });
 
+    // Todas las validaciones sincrónicas van antes de tocar la base: más abajo el
+    // alta puede borrar una cuenta fantasma, y eso no debe pasar si el registro
+    // iba a fallar igual por un campo inválido.
     const pwError = validatePassword(password);
     if (pwError) return res.status(400).json({ error: pwError });
-    
-    const sql = getDb();
-    const [existing] = await sql`SELECT id FROM users WHERE email = LOWER(${email})`;
-    if (existing) return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Intente recuperar la contraseña si no la recuerda.' });
-    
-    const password_hash = await bcrypt.hash(password, 10);
+
     const userError = validateUser(name);
     if (userError) return res.status(400).json({ error: userError });
 
-    // Username: usar el elegido por el usuario (si lo envió) o generar uno libre
-    let username;
+    // Username: el elegido por el usuario (si lo envió) o uno generado del nombre
+    let wantedUsername = null;
     if (req.body.username !== undefined && req.body.username !== '') {
-      const trimmed = String(req.body.username).trim().toLowerCase();
-      const unameError = validateUsername(trimmed);
+      wantedUsername = String(req.body.username).trim().toLowerCase();
+      const unameError = validateUsername(wantedUsername);
       if (unameError) return res.status(400).json({ error: unameError });
-      const [taken] = await sql`SELECT id FROM users WHERE username = ${trimmed}`;
-      if (taken) return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso' });
-      username = trimmed;
-    } else {
-      username = await generateUsername(sql, name);
     }
+
+    const sql     = getDb();
+    const emailLc = String(email).trim().toLowerCase();
+
+    // Email y @username se consultan juntos: son independientes y cada tagged
+    // template es una ida a São Paulo.
+    const conflicts = await sql.query(
+      `SELECT u.id, u.email, u.username, ${ACCOUNT_REACHABLE} AS reachable
+         FROM users u
+        WHERE u.email = $1 OR u.username = $2`,
+      [emailLc, wantedUsername ?? '']
+    );
+
+    const byEmail = conflicts.find(u => u.email === emailLc);
+    const byName  = wantedUsername ? conflicts.find(u => u.username === wantedUsername) : null;
+
+    if (byEmail?.reachable)
+      return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Intente recuperar la contraseña si no la recuerda.' });
+    if (byName?.reachable)
+      return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso' });
+
+    const password_hash = await bcrypt.hash(password, 10);
+
+    // Lo que sobrevive al chequeo son cuentas fantasma: se borran para liberar el
+    // email y el @username. deleteUserAccount es más de lo que hace falta (una
+    // cuenta sin verificar no puede tener nada colgando, el login la rechaza),
+    // pero es el único lugar que conoce todas las FKs hacia users, así que esto
+    // no se rompe si mañana aparece una nueva.
+    const stale = [...new Set([byEmail, byName].filter(Boolean).map(u => u.id))];
+    if (stale.length) await Promise.all(stale.map(id => deleteUserAccount(id)));
+
+    // Después del borrado: si el fantasma ocupaba el username derivado del nombre,
+    // recién ahora está libre y generateUsername lo puede devolver limpio.
+    const username = wantedUsername ?? await generateUsername(sql, name);
 
     const [user] = await sql`
       INSERT INTO users (id, email, password_hash, name, username)
-      VALUES (${uid()}, LOWER(${email}), ${password_hash}, ${name.trim()}, ${username})
+      VALUES (${uid()}, ${emailLc}, ${password_hash}, ${name.trim()}, ${username})
       RETURNING id, email, name, username, avatar_url, created_at
     `;
 
@@ -425,7 +502,11 @@ router.get('/username-available', usernameLimiter, async (req, res, next) => {
     const error = validateUsername(username);
     if (error) return res.json({ available: false, error });
     const sql = getDb();
-    const [taken] = await sql`SELECT id FROM users WHERE username = ${username}`;
+    // Mismo criterio que el registro: si lo ocupa una cuenta fantasma está libre,
+    // porque el alta la va a reclamar. Si no, el formulario marcaría "ya está en
+    // uso" un username que el registro sí acepta.
+    const [taken] = await sql.query(
+      `SELECT u.id FROM users u WHERE u.username = $1 AND ${ACCOUNT_REACHABLE}`, [username]);
     res.json({ available: !taken, error: taken ? 'Ese nombre de usuario ya está en uso' : null });
   } catch (err) { next(err); }
 });
@@ -578,8 +659,15 @@ router.patch('/me', requireAuth, async (req, res, next) => {
       if (trimmed.length < 3) return res.status(400).json({ error: 'El nombre de usuario debe tener al menos 3 caracteres' });
       if (trimmed.length > 20) return res.status(400).json({ error: 'El nombre de usuario tiene un límite de 20 caracteres' });
       if (!/^[a-z0-9_]+$/.test(trimmed)) return res.status(400).json({ error: 'El nombre de usuario solo puede contener letras, números y guiones bajos' });
-      const [existing] = await sql`SELECT id FROM users WHERE username = ${trimmed} AND id != ${req.user.id}`;
-      if (existing) return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso' });
+      // Mismo criterio que el registro y que /username-available: una cuenta
+      // fantasma no bloquea el @username, se la reclama. Hay que borrarla igual
+      // aunque no bloquee, o el UPDATE choca contra el UNIQUE de username.
+      const [existing] = await sql.query(
+        `SELECT u.id, ${ACCOUNT_REACHABLE} AS reachable
+           FROM users u WHERE u.username = $1 AND u.id != $2`,
+        [trimmed, req.user.id]);
+      if (existing?.reachable) return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso' });
+      if (existing) await deleteUserAccount(existing.id);
       updates.username = trimmed;
     }
 
