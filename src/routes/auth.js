@@ -3,7 +3,7 @@ import bcrypt            from 'bcrypt';
 import jwt               from 'jsonwebtoken';
 import crypto            from 'crypto';
 import { OAuth2Client }  from 'google-auth-library';
-import rateLimit         from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { Resend } from 'resend';
 import { createElement } from 'react';
 import VerifyEmailTemplate  from '../emails/VerifyEmail.jsx';
@@ -33,7 +33,15 @@ const loginLimiter = rateLimit({
   max:             10,
   standardHeaders: true,
   legacyHeaders:   false,
-  message:         { error: 'Demasiados intentos. Esperá 15 minutos.' },
+  // Misma forma de respuesta que el bloqueo por email (con los segundos que
+  // faltan de verdad), así el cliente tiene un solo caso que atender.
+  handler: (req, res) => {
+    const reset = req.rateLimit?.resetTime;
+    const retryAfter = reset
+      ? Math.max(1, Math.ceil((new Date(reset).getTime() - Date.now()) / 1000))
+      : 15 * 60;
+    return sendLocked(res, retryAfter, 'Demasiados intentos desde esta conexión.');
+  },
 });
 
 const resendVerificationLimiter = rateLimit({
@@ -173,20 +181,119 @@ const ACCOUNT_REACHABLE = `(
                 WHERE ev.user_id = u.id AND ev.used = false AND ev.expires_at > NOW())
   )`;
 
-// Bloquea si hay 5+ intentos fallidos del mismo email en los últimos 15 min
-async function checkLoginAttempts(sql, email) {
-  const since = new Date(Date.now() - 15 * 60 * 1000);
-  const [{ count }] = await sql`
-    SELECT COUNT(*)::int AS count FROM login_attempts
-    WHERE identifier = LOWER(${email}) AND created_at > ${since}
+// ── Bloqueo por intentos fallidos ────────────────────────────────────────────
+// Se bloquea a los 5 fallos dentro de una ventana deslizante de 15 min,
+// contados por email + IP de origen.
+//
+// Por qué también la IP: contando sólo por email, cualquiera que supiera tu
+// dirección te dejaba fuera de tu propia cuenta 15 min mandando 5 requests con
+// una contraseña cualquiera. El contador es de quien intenta, no de la víctima.
+// A cambio, un ataque repartido entre muchas IPs contra una misma cuenta ya no
+// choca contra este tope: lo único que lo frena es el loginLimiter por IP de
+// arriba (10 requests / 15 min cada una). Si alguna vez aparece tráfico así, el
+// siguiente paso es un captcha tras el segundo fallo, no volver al tope global
+// por email — eso reabre el bloqueo de cuentas ajenas.
+//
+// La espera que se le informa al usuario es la real, no la ventana entera: como
+// la ventana desliza, el bloqueo cae en cuanto el 5º intento más reciente sale
+// de los 15 min, que casi siempre es bastante antes. Decir "15 minutos" cuando
+// faltan 3 hace que la gente se vaya de la app.
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS    = 15 * 60 * 1000;
+
+// Con IPv6 una sola persona tiene un /64 entero para rotar, así que contar por
+// dirección exacta no cuenta nada: ipKeyGenerator colapsa el prefijo a /56,
+// igual que hacen los rate limiters de este archivo. El fallback 'unknown' evita
+// que un req.ip vacío deje la columna en NULL y desactive el bloqueo sin ruido
+// (en SQL, `ip = NULL` no matchea nunca).
+function clientIpKey(req) {
+  return req.ip ? ipKeyGenerator(req.ip) : 'unknown';
+}
+
+// Segundos que faltan para que ese intento salga de la ventana. 0 = ya no bloquea.
+function retryAfterFrom(blockingAt) {
+  if (!blockingAt) return 0;
+  const ms = new Date(blockingAt).getTime() + LOGIN_WINDOW_MS - Date.now();
+  return ms > 0 ? Math.ceil(ms / 1000) : 0;
+}
+
+// { count, retryAfter } — count = fallos de ese email desde esa IP en la ventana.
+async function checkLoginAttempts(sql, email, ip) {
+  const since = new Date(Date.now() - LOGIN_WINDOW_MS);
+  const [row] = await sql`
+    WITH recent AS (
+      SELECT created_at, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
+      FROM login_attempts
+      WHERE identifier = LOWER(${email}) AND ip = ${ip} AND created_at > ${since}
+    )
+    SELECT (SELECT COUNT(*)::int FROM recent) AS count,
+           (SELECT created_at FROM recent WHERE rn = ${MAX_LOGIN_ATTEMPTS}) AS blocking_at
   `;
-  return count >= 5;
+  return { count: row.count, retryAfter: retryAfterFrom(row.blocking_at) };
 }
 
-async function recordFailedAttempt(sql, email) {
-  await sql`INSERT INTO login_attempts (id, identifier) VALUES (${uid()}, LOWER(${email}))`;
+// Registra el fallo y devuelve { count, retryAfter } ya contando este intento.
+// Va en una sola sentencia para no gastar dos round-trips a Neon en el camino
+// de error. Ojo con la semántica: los CTE que modifican datos no son visibles
+// para los demás CTE del mismo statement, así que `recent` NO ve la fila recién
+// insertada — por eso el count la suma aparte, y por eso la fila que marca el
+// desbloqueo es la rn = MAX-1 de `recent` (la nueva es siempre la más nueva, así
+// que al agregarla todas corren un lugar).
+async function recordFailedAttempt(sql, email, ip) {
+  const since = new Date(Date.now() - LOGIN_WINDOW_MS);
+  const [row] = await sql`
+    WITH ins AS (
+      INSERT INTO login_attempts (id, identifier, ip) VALUES (${uid()}, LOWER(${email}), ${ip})
+      RETURNING 1
+    ), recent AS (
+      SELECT created_at, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
+      FROM login_attempts
+      WHERE identifier = LOWER(${email}) AND ip = ${ip} AND created_at > ${since}
+    )
+    SELECT (SELECT COUNT(*)::int FROM recent) + (SELECT COUNT(*)::int FROM ins) AS count,
+           (SELECT created_at FROM recent WHERE rn = ${MAX_LOGIN_ATTEMPTS - 1}) AS blocking_at
+  `;
+  return { count: row.count, retryAfter: retryAfterFrom(row.blocking_at) };
 }
 
+function waitLabel(seconds) {
+  if (seconds <= 60) return 'un minuto';
+  return `${Math.ceil(seconds / 60)} minutos`;
+}
+
+// 429 de cuenta bloqueada. Lleva los segundos exactos para que el cliente pueda
+// mostrar la cuenta regresiva en vivo en lugar de un texto fijo.
+function sendLocked(res, retryAfter, prefix = 'Demasiados intentos fallidos.') {
+  res.set('Retry-After', String(Math.max(1, retryAfter)));
+  return res.status(429).json({
+    error: `${prefix} Probá de nuevo en ${waitLabel(retryAfter)}, o restablecé tu contraseña.`,
+    code: 'account_locked',
+    retry_after_seconds: Math.max(1, retryAfter),
+  });
+}
+
+// Credenciales incorrectas. Avisa cuántos intentos quedan para que el bloqueo no
+// aparezca de la nada, y bloquea acá mismo cuando este fallo llega al tope, en
+// lugar de dejar que el usuario lo descubra en el intento siguiente.
+//
+// `attempts_left` no filtra si la cuenta existe: el contador también corre para
+// emails que no están registrados, así que la respuesta es idéntica en los dos
+// casos (y el texto sigue siendo el genérico "email o contraseña").
+async function failedLogin(sql, res, email, ip) {
+  const { count, retryAfter } = await recordFailedAttempt(sql, email, ip);
+  if (count >= MAX_LOGIN_ATTEMPTS) return sendLocked(res, retryAfter);
+
+  const left = MAX_LOGIN_ATTEMPTS - count;
+  return res.status(401).json({
+    error: left === 1
+      ? 'Email o contraseña incorrectos. Te queda 1 intento antes de que la cuenta se bloquee temporalmente.'
+      : 'Email o contraseña incorrectos',
+    attempts_left: left,
+  });
+}
+
+// Borra los intentos de todas las IPs, no sólo la de quien acertó: quien demuestra
+// que la cuenta es suya no tiene por qué arrastrar el contador de otro.
 async function clearLoginAttempts(sql, email) {
   await sql`DELETE FROM login_attempts WHERE identifier = LOWER(${email})`;
 }
@@ -320,24 +427,23 @@ router.post('/register', async (req, res, next) => {
 router.post('/login', loginLimiter, async (req, res, next) => {
   try {
     const { email, password } = req.body;
-    const sql = getDb();
+    // Sin email no hay contador que llevar: el identifier de login_attempts es
+    // NOT NULL y el INSERT reventaría en un 500.
+    if (!email || !password)
+      return res.status(400).json({ error: 'Email o contraseña incorrectos' });
 
-    const blocked = await checkLoginAttempts(sql, email);
-    if (blocked)
-      return res.status(429).json({ error: 'Cuenta bloqueada temporalmente. Esperá 15 minutos.' });
+    const sql = getDb();
+    const ip  = clientIpKey(req);
+
+    const { count, retryAfter } = await checkLoginAttempts(sql, email, ip);
+    if (count >= MAX_LOGIN_ATTEMPTS) return sendLocked(res, retryAfter);
 
     const [user] = await sql`SELECT * FROM users WHERE email = LOWER(${email})`;
 
-    if (!user || !user.password_hash) {
-      await recordFailedAttempt(sql, email);
-      return res.status(401).json({ error: 'Email o contraseña incorrectos' });
-    }
+    if (!user || !user.password_hash) return failedLogin(sql, res, email, ip);
 
     const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      await recordFailedAttempt(sql, email);
-      return res.status(401).json({ error: 'Email o contraseña incorrectos' });
-    }
+    if (!valid) return failedLogin(sql, res, email, ip);
 
     if (!user.email_verified_at) {
       await clearLoginAttempts(sql, email);
@@ -620,10 +726,21 @@ router.post('/reset-password', async (req, res, next) => {
 
     const password_hash = await bcrypt.hash(password, 10);
 
-    await sql`UPDATE users SET password_hash = ${password_hash} WHERE id = ${reset.user_id}`;
-    await sql`UPDATE password_resets SET used = true WHERE id = ${reset.id}`;
-    // Invalidar todas las sesiones activas del usuario
-    await sql`DELETE FROM refresh_tokens WHERE user_id = ${reset.user_id}`;
+    // Ninguna de las cuatro depende del resultado de las otras: en serie eran
+    // cuatro viajes a São Paulo sobre el driver HTTP de Neon.
+    await Promise.all([
+      sql`UPDATE users SET password_hash = ${password_hash} WHERE id = ${reset.user_id}`,
+      sql`UPDATE password_resets SET used = true WHERE id = ${reset.id}`,
+      // Invalidar todas las sesiones activas del usuario
+      sql`DELETE FROM refresh_tokens WHERE user_id = ${reset.user_id}`,
+      // Levantar el bloqueo por intentos fallidos. Sin esto el consejo de
+      // "restablecé tu contraseña" era una salida falsa: el reset no deja la
+      // sesión iniciada, así que la persona volvía al login y se comía el
+      // bloqueo igual, ahora con una contraseña nueva. Quien probó que controla
+      // el email ya no es sospechoso.
+      sql`DELETE FROM login_attempts
+          WHERE identifier = (SELECT LOWER(email) FROM users WHERE id = ${reset.user_id})`,
+    ]);
 
     res.clearCookie('access_token',  cookieOpts(0));
     res.clearCookie('refresh_token', cookieOpts(0));

@@ -342,6 +342,21 @@ CREATE INDEX IF NOT EXISTS idx_subscriptions_user    ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_tournament_photos_tournament ON tournament_photos(tournament_id);
 CREATE INDEX IF NOT EXISTS idx_email_verifications_user    ON email_verifications(user_id);
 
+-- Intentos fallidos de login (bloqueo temporal por email en routes/auth.js).
+-- La tabla se había creado a mano en Neon y nunca estuvo acá: en una base nueva
+-- el login rompía. El índice cubre el único acceso que tiene — filtrar por
+-- identifier y ordenar por fecha dentro de la ventana de 15 min.
+CREATE TABLE IF NOT EXISTS login_attempts (
+  id         TEXT PRIMARY KEY,
+  identifier TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- El bloqueo se cuenta por email + IP: contarlo sólo por email dejaba que
+-- cualquiera que supiera tu dirección te dejara afuera 15 min con 5 requests.
+ALTER TABLE login_attempts ADD COLUMN IF NOT EXISTS ip TEXT;
+DROP INDEX IF EXISTS idx_login_attempts_identifier;
+CREATE INDEX IF NOT EXISTS idx_login_attempts_key ON login_attempts(identifier, ip, created_at DESC);
+
 -- Índices de rendimiento (auditoría jul 2026). Detalle y justificación en
 -- migration_perf_indexes.sql.
 CREATE INDEX IF NOT EXISTS idx_players_user          ON players(user_id);
