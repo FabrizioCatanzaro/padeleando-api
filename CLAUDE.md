@@ -78,6 +78,11 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 
 ## Key Conventions
 
+### Code style
+
+- **No multi-line comments.** Comment only when the context is impossible to grasp otherwise, and in a single short line.
+- The long reasoning — why a criterion was chosen, what measurement backs it, what bug motivated the change — goes in the commit message or in this file, never in the source.
+
 ### Database access
 
 - **`getDb()` is the default.** Every `sql\`…\`` tagged template is one independent HTTPS round-trip to São Paulo (sa-east-1). This is the dominant cost of any endpoint.
@@ -159,6 +164,7 @@ When touching an endpoint, **diff the response against the previous code with ke
 
 ## What NOT to Do
 
+- **Don't write multi-line comments** — one short line at most, and only if it's indispensable; the reasoning belongs in the commit message.
 - **Don't chain `await`ed queries that don't depend on each other** — one Neon HTTP round-trip each.
 - **Don't build SQL by interpolating fragments into a tagged template** — it parameterizes them into values. Use `sql.query(text, params)` for dynamic SQL.
 - **Don't compute standings server-side** — the client does it.
