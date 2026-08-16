@@ -29,6 +29,7 @@ router.get('/:tournamentId', async (req, res, next) => {
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
+             c.courts        AS club_courts,
              -- Inscripción: lo de la jornada pisa lo de la categoría, campo por campo.
              g.signup_open       AS group_signup_open,
              g.signup_price      AS group_signup_price,
@@ -109,6 +110,8 @@ router.get('/:tournamentId', async (req, res, next) => {
       club_name:           tournament.club_name ?? null,
       club_photo_url:      tournament.club_photo_url ?? null,
       club_location_name:  tournament.club_location_name ?? null,
+      // Las canchas mandan sobre number_of_courts, que es una copia vieja del club.
+      club_courts:         tournament.club_courts ?? null,
       bracket:        tournament.bracket ?? null,
       // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
       signup: resolveSignup(tournament, {
