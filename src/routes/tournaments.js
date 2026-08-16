@@ -9,6 +9,34 @@ import { tournamentQuotaError } from '../lib/plan.js';
 
 const router = Router();
 
+// GET /api/tournaments/search?q= — busca jornadas de categorías públicas por nombre.
+// Va antes de '/:id' o esa ruta se come la palabra "search".
+router.get('/search', async (req, res, next) => {
+  try {
+    const { q } = req.query;
+    if (!q || q.length < 2) return res.json([]);
+    const sql = getDb();
+    // Los nombres de jornada se repiten entre categorías ("Fecha 3"), así que el
+    // resultado viaja con la categoría y el club: sin eso no se distinguen.
+    const tournaments = await sql`
+      SELECT t.id, t.name, t.status, t.format,
+             COALESCE(t.event_date, t.created_at::date) AS day,
+             g.id AS group_id, g.name AS group_name, g.emojis AS group_emojis,
+             u.username AS owner_username,
+             c.name AS club_name
+      FROM   tournaments t
+      JOIN   groups g ON g.id = t.group_id
+      JOIN   users  u ON u.id = g.user_id
+      LEFT   JOIN clubs c ON c.id = t.club_id
+      WHERE  g.is_public = true
+        AND  t.name ILIKE ${'%' + q + '%'}
+      ORDER  BY COALESCE(t.event_date, t.created_at::date) DESC
+      LIMIT  10
+    `;
+    res.json(tournaments);
+  } catch (err) { next(err); }
+});
+
 // GET /api/tournaments/:id
 router.get('/:id', optionalAuth, async (req, res, next) => {
   try {
