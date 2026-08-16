@@ -65,6 +65,14 @@ export function expandBracketMatches(rows) {
         partner_name:     partnerName ?? null,
         partner_key:      partnerKey ?? null,
         duration_seconds: m.duration_seconds ?? null,
+        // Los sets del cuadro se guardan desde la perspectiva de pair1: acá salen
+        // ya orientados al jugador, por eso is_team1 es siempre true.
+        sets_format:      m.sets_format ?? null,
+        sets:             Array.isArray(m.sets)
+          ? (isMine1 ? m.sets : m.sets.map((s) => ({ s1: s.s2, s2: s.s1 })))
+          : [],
+        is_team1:         true,
+        won:              myScore > oppScore,
         club_id:          row.club_id ?? null,
         opp1_name:        other.names?.[0] ?? null,
         opp2_name:        other.names?.[1] ?? null,

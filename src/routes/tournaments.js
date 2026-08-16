@@ -587,10 +587,14 @@ router.delete('/:id/bracket', requireAuth, requireTournamentManage, async (req, 
 // Body: { score1, score2, duration_seconds, court }
 router.patch('/:id/bracket/:matchId', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
-    const { score1, score2, duration_seconds, court } = req.body;
+    const { score1, score2, duration_seconds, court, sets_format, sets } = req.body;
     if (score1 == null || score2 == null) return res.status(400).json({ error: 'score1 y score2 requeridos' });
     if (typeof score1 !== 'number' || typeof score2 !== 'number') return res.status(400).json({ error: 'Los scores deben ser números' });
     if (score1 === score2) return res.status(400).json({ error: 'No puede haber empate en la fase eliminatoria' });
+    if (sets_format != null && sets_format !== 1 && sets_format !== 3) {
+      return res.status(400).json({ error: 'sets_format debe ser 1 o 3' });
+    }
+    if (sets != null && !Array.isArray(sets)) return res.status(400).json({ error: 'sets debe ser una lista' });
 
     const sql = getDb();
     const [tournament] = await sql`SELECT * FROM tournaments WHERE id = ${req.params.id}`;
@@ -600,7 +604,10 @@ router.patch('/:id/bracket/:matchId', requireAuth, requireTournamentManage, asyn
     const bracket = tournament.bracket;
     const { matchId } = req.params;
 
-    const updated = applyBracketResult(bracket, matchId, score1, score2, duration_seconds ?? null, court ?? null);
+    const updated = applyBracketResult(bracket, matchId, score1, score2, duration_seconds ?? null, court ?? null, {
+      sets_format: sets_format ?? null,
+      sets: Array.isArray(sets) ? sets : [],
+    });
     if (!updated) return res.status(404).json({ error: 'Partido de bracket no encontrado' });
 
     const [saved] = await sql`
@@ -1031,7 +1038,7 @@ function slotForSeed(seed, D, standings, octavos) {
  * y lo propaga a la siguiente ronda.
  * @returns {Object|null} bracket actualizado, o null si no encontró el partido
  */
-function applyBracketResult(bracket, matchId, score1, score2, duration_seconds = null, court = null) {
+function applyBracketResult(bracket, matchId, score1, score2, duration_seconds = null, court = null, setsData = {}) {
   const b = JSON.parse(JSON.stringify(bracket)); // clonar
 
   const match = findBracketMatch(b, matchId);
@@ -1048,6 +1055,8 @@ function applyBracketResult(bracket, matchId, score1, score2, duration_seconds =
   match.score2           = score2;
   match.duration_seconds = duration_seconds;
   match.court            = court;
+  match.sets_format      = setsData.sets_format ?? null;
+  match.sets             = setsData.sets ?? [];
   match.winner_id        = winnerId;
   match.winner_name      = match[`${winner}_name`];
 
@@ -1091,6 +1100,8 @@ function resetMatchResult(match) {
   match.score2           = null;
   match.duration_seconds = null;
   match.court            = null;
+  match.sets_format      = null;
+  match.sets             = [];
   match.winner_id        = null;
   match.winner_name      = null;
 }
