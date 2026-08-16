@@ -10,6 +10,7 @@ import { getActiveSubscription }    from './subscriptions.js';
 const router = Router({ mergeParams: true });
 
 const MAX_PHOTOS_PER_TOURNAMENT = 12;
+const MAX_CAPTION_LEN           = 100;
 
 async function getTournamentOwnership(sql, tournamentId) {
   const [row] = await sql`
@@ -66,7 +67,7 @@ router.post('/', requireAuth, uploadTournamentPhoto, async (req, res, next) => {
       folder: `padeliando/tournaments/${tournamentId}`,
     });
 
-    const caption = req.body?.caption?.trim() || null;
+    const caption = req.body?.caption?.trim().slice(0, MAX_CAPTION_LEN) || null;
 
     const [photo] = await sql`
       INSERT INTO tournament_photos (id, tournament_id, uploaded_by, url, public_id, caption)
@@ -95,7 +96,7 @@ router.patch('/:photoId', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Sin permiso' });
 
     const raw = typeof req.body?.caption === 'string' ? req.body.caption.trim() : '';
-    const newCaption = raw.length > 0 ? raw.slice(0, 200) : null;
+    const newCaption = raw.length > 0 ? raw.slice(0, MAX_CAPTION_LEN) : null;
 
     const [updated] = await sql`
       UPDATE tournament_photos

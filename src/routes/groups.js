@@ -672,9 +672,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const bracketTimed   = bracketMatches.filter((m) => (m.duration_seconds ?? 0) > 0).length;
     const bracketTight   = bracketMatches.filter((m) => Math.abs(m.my_score - m.opp_score) === 1);
 
-    // El cuadro no guarda sets, así que sólo aporta al criterio de 6-0.
     const blowouts = countBlowouts([...matchResults, ...bracketMatches]);
-    const setStats = countSetStats(matchResults);
+    const setStats = countSetStats([...matchResults, ...bracketMatches]);
     const followRanking = buildFollowRanking(followRows, bracketStatsByUser(followBracketRows), owner.id);
 
     const base = playerStats ?? {
