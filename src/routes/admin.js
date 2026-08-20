@@ -137,7 +137,12 @@ router.get('/tournaments', async (req, res, next) => {
     const tournaments = await sql`
       SELECT
         t.id, t.name, t.format, t.mode, t.status, t.created_at,
-        (t.live_match IS NOT NULL) AS has_live,
+        -- No alcanza con IS NOT NULL: live_match queda en un array vacío cuando
+        -- se cierra el último partido, y una jornada terminada conserva el
+        -- payload viejo.
+        (t.status <> 'finished'
+         AND jsonb_typeof(t.live_match) = 'array'
+         AND jsonb_array_length(t.live_match) > 0) AS has_live,
         g.id        AS group_id,
         g.name      AS group_name,
         u.id        AS owner_id,
@@ -154,7 +159,9 @@ router.get('/tournaments', async (req, res, next) => {
              OR g.name      ILIKE ${pat}
              OR u.username  ILIKE ${pat})
         AND (${status} = 'all'
-             OR (${status} = 'live'     AND t.live_match IS NOT NULL)
+             OR (${status} = 'live'     AND t.status <> 'finished'
+                                        AND jsonb_typeof(t.live_match) = 'array'
+                                        AND jsonb_array_length(t.live_match) > 0)
              OR (${status} = 'active'   AND t.status = 'active')
              OR (${status} = 'finished' AND t.status = 'finished'))
       ORDER BY t.created_at DESC
@@ -171,7 +178,9 @@ router.get('/tournaments', async (req, res, next) => {
              OR g.name      ILIKE ${pat}
              OR u.username  ILIKE ${pat})
         AND (${status} = 'all'
-             OR (${status} = 'live'     AND t.live_match IS NOT NULL)
+             OR (${status} = 'live'     AND t.status <> 'finished'
+                                        AND jsonb_typeof(t.live_match) = 'array'
+                                        AND jsonb_array_length(t.live_match) > 0)
              OR (${status} = 'active'   AND t.status = 'active')
              OR (${status} = 'finished' AND t.status = 'finished'))
     `;

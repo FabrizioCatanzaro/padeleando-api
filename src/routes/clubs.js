@@ -323,7 +323,12 @@ router.get('/:id/events', async (req, res, next) => {
     const rows = await sql`
       SELECT
         t.id, t.name, t.format, t.mode, t.status, t.event_date, t.created_at,
-        (t.live_match IS NOT NULL) AS has_live,
+        -- No alcanza con IS NOT NULL: live_match queda en un array vacío cuando
+        -- se cierra el último partido, y una jornada terminada conserva el
+        -- payload viejo. Misma condición que la consulta live de GET /api/home.
+        (t.status <> 'finished'
+         AND jsonb_typeof(t.live_match) = 'array'
+         AND jsonb_array_length(t.live_match) > 0) AS has_live,
         g.id AS group_id, g.name AS group_name, g.emojis AS group_emojis,
         u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
         (SELECT COUNT(*)::int FROM tournament_players tp WHERE tp.tournament_id = t.id) AS players_count,
