@@ -4,6 +4,7 @@ import { uid }    from '../uid.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
 import { uploadClubPhoto }           from '../middleware/upload.js';
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
+import { countBracketPlayed } from '../lib/profileStats.js';
 
 const router = Router();
 
@@ -256,12 +257,58 @@ router.get('/nearby', async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const sql = getDb();
-    const [club] = await sql`
-      SELECT id, name, photo_url, social_links, contact_phone, contact_whatsapp,
-      location_name, lat, lon, courts, schedule, created_at FROM clubs WHERE id = ${req.params.id}
-    `;
+    // Los agregados del riel viajan junto al club: cada await es un viaje propio
+    // a la base, y para un id inexistente las dos consultas extra dan vacío, así
+    // que el 404 se resuelve igual después. Se cuentan sólo las categorías
+    // públicas, igual que la lista de eventos: si no, el riel delataría cuánto
+    // se juega en una categoría privada.
+    const [[club], [agg], brackets] = await Promise.all([
+      sql`
+        SELECT id, name, photo_url, social_links, contact_phone, contact_whatsapp,
+        location_name, lat, lon, courts, schedule, created_at FROM clubs WHERE id = ${req.params.id}
+      `,
+      sql`
+        SELECT
+          COUNT(DISTINCT t.id)::int       AS torneos,
+          COUNT(DISTINCT t.group_id)::int AS categorias,
+          (SELECT COUNT(*)::int
+             FROM matches m
+             JOIN tournaments mt ON mt.id = m.tournament_id
+             JOIN groups mg ON mg.id = mt.group_id AND mg.is_public = true
+            WHERE mt.club_id = ${req.params.id})                AS partidos,
+          (SELECT COUNT(DISTINCT tp.player_id)::int
+             FROM tournament_players tp
+             JOIN tournaments pt ON pt.id = tp.tournament_id
+             JOIN groups pg ON pg.id = pt.group_id AND pg.is_public = true
+            WHERE pt.club_id = ${req.params.id})                AS jugadores
+        FROM tournaments t
+        JOIN groups g ON g.id = t.group_id AND g.is_public = true
+        WHERE t.club_id = ${req.params.id}
+      `,
+      // El cuadro del americano no vive en `matches`: se cuenta aparte.
+      sql`
+        SELECT t.bracket
+        FROM tournaments t
+        JOIN groups g ON g.id = t.group_id AND g.is_public = true
+        WHERE t.club_id = ${req.params.id}
+          AND t.format = 'americano'
+          AND t.bracket IS NOT NULL
+      `,
+    ]);
+
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
-    res.json(club);
+
+    const bracketPlayed = brackets.reduce((n, r) => n + countBracketPlayed(r.bracket), 0);
+
+    res.json({
+      ...club,
+      stats: {
+        torneos:    agg?.torneos    ?? 0,
+        categorias: agg?.categorias ?? 0,
+        jugadores:  agg?.jugadores  ?? 0,
+        partidos:   (agg?.partidos  ?? 0) + bracketPlayed,
+      },
+    });
   } catch (err) { next(err); }
 });
 
@@ -277,7 +324,7 @@ router.get('/:id/events', async (req, res, next) => {
       SELECT
         t.id, t.name, t.format, t.mode, t.status, t.event_date, t.created_at,
         (t.live_match IS NOT NULL) AS has_live,
-        g.id AS group_id, g.name AS group_name,
+        g.id AS group_id, g.name AS group_name, g.emojis AS group_emojis,
         u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
         (SELECT COUNT(*)::int FROM tournament_players tp WHERE tp.tournament_id = t.id) AS players_count,
         (SELECT COUNT(*)::int FROM matches m WHERE m.tournament_id = t.id) AS match_count

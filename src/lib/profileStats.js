@@ -12,6 +12,18 @@ export function dayKey(value) {
 }
 
 /**
+ * Partidos ya jugados de un cuadro, sin importar quién los jugó. La página del
+ * club necesita el total, no la vista de un jugador: sin esto un club que sólo
+ * organiza americanos declara cero partidos, porque el cuadro no está en
+ * `matches` sino en el JSONB de `tournaments.bracket`.
+ */
+export function countBracketPlayed(bracket) {
+  if (!bracket) return 0;
+  return [...ROUNDS.flatMap((r) => bracket[r] ?? []), ...(bracket.final ? [bracket.final] : [])]
+    .filter((m) => m?.winner_id != null).length;
+}
+
+/**
  * Expande los partidos jugados del cuadro en los que participó el usuario, con
  * la misma forma que recent_matches.
  */
