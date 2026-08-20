@@ -929,6 +929,10 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
              c.name AS club_name, c.location_name AS club_location_name, c.photo_url AS club_photo_url,
              c.courts AS club_courts,
              cr.name AS pending_club_name,
+             (SELECT COUNT(DISTINCT tp.player_id)::int
+              FROM tournament_players tp
+              JOIN tournaments t ON t.id = tp.tournament_id
+              WHERE t.group_id = g.id) AS player_count,
              (EXISTS (
                SELECT 1 FROM subscriptions s
                WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
@@ -954,7 +958,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       LEFT JOIN pairs             pr ON pr.tournament_id = t.id
       WHERE  t.group_id = ${groupId}
       GROUP  BY t.id, c.id
-      ORDER  BY t.created_at DESC
+      ORDER  BY COALESCE(t.event_date, t.created_at::date) DESC, t.created_at DESC
     `,
 
     sql`
