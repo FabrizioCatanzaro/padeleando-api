@@ -19,6 +19,7 @@ router.get('/', requireAuth, async (req, res, next) => {
     const groups = await sql`
       SELECT g.*,
         COALESCE(gclub.name, lastclub.name) AS club_name,
+        COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url,
         (SELECT COUNT(DISTINCT tp.player_id)::int
          FROM tournament_players tp
          JOIN tournaments t ON t.id = tp.tournament_id
@@ -34,7 +35,7 @@ router.get('/', requireAuth, async (req, res, next) => {
       FROM groups g
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
-        SELECT c2.name
+        SELECT c2.name, c2.photo_url
         FROM   tournaments t2
         JOIN   clubs c2 ON c2.id = t2.club_id
         WHERE  t2.group_id = g.id
@@ -62,12 +63,13 @@ router.get('/participating', requireAuth, async (req, res, next) => {
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
         (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
-        COALESCE(gclub.name, lastclub.name) AS club_name
+        COALESCE(gclub.name, lastclub.name) AS club_name,
+        COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url
       FROM groups g
       JOIN users u ON u.id = g.user_id
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
-        SELECT c2.name
+        SELECT c2.name, c2.photo_url
         FROM   tournaments t2
         JOIN   clubs c2 ON c2.id = t2.club_id
         WHERE  t2.group_id = g.id
@@ -105,13 +107,14 @@ router.get('/collaborating', requireAuth, async (req, res, next) => {
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
         (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
-        COALESCE(gclub.name, lastclub.name) AS club_name
+        COALESCE(gclub.name, lastclub.name) AS club_name,
+        COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url
       FROM groups g
       JOIN users u ON u.id = g.user_id
       JOIN group_collaborators gc ON gc.group_id = g.id AND gc.user_id = ${req.user.id}
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
-        SELECT c2.name
+        SELECT c2.name, c2.photo_url
         FROM   tournaments t2
         JOIN   clubs c2 ON c2.id = t2.club_id
         WHERE  t2.group_id = g.id
@@ -138,13 +141,14 @@ router.get('/favorites', requireAuth, async (req, res, next) => {
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
         (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
-        COALESCE(gclub.name, lastclub.name) AS club_name
+        COALESCE(gclub.name, lastclub.name) AS club_name,
+        COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url
       FROM groups g
       JOIN users u ON u.id = g.user_id
       JOIN group_favorites gf ON gf.group_id = g.id AND gf.user_id = ${req.user.id}
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
-        SELECT c2.name
+        SELECT c2.name, c2.photo_url
         FROM   tournaments t2
         JOIN   clubs c2 ON c2.id = t2.club_id
         WHERE  t2.group_id = g.id
@@ -195,6 +199,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const [
       [follows],
       groups,
+      playedGroups,
+      coorgGroups,
       [playerStats],
       dailyActivity,
       monthlyStats,
@@ -227,11 +233,12 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
          JOIN tournaments t ON t.id = tp.tournament_id
          WHERE t.group_id = g.id) AS player_count,
         (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
-        COALESCE(gclub.name, lastclub.name) AS club_name
+        COALESCE(gclub.name, lastclub.name) AS club_name,
+        COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url
       FROM groups g
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
-        SELECT c2.name
+        SELECT c2.name, c2.photo_url
         FROM   tournaments t2
         JOIN   clubs c2 ON c2.id = t2.club_id
         WHERE  t2.group_id = g.id
@@ -239,6 +246,68 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         LIMIT  1
       ) lastclub ON g.club_id IS NULL
       WHERE g.user_id = ${owner.id}
+        AND (${isOwner} OR g.is_public = true)
+      ORDER BY g.created_at DESC
+    `,
+
+    // Categorías ajenas donde juega. Misma regla de privacidad que el resto del
+    // perfil: una categoría privada sólo aparece cuando mirás tu propio perfil.
+    sql`
+      SELECT g.id, g.name, g.emojis, g.is_public,
+        u.username AS owner_username,
+        (SELECT COUNT(DISTINCT tp.player_id)::int
+         FROM tournament_players tp
+         JOIN tournaments t ON t.id = tp.tournament_id
+         WHERE t.group_id = g.id) AS player_count,
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name,
+        COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url
+      FROM groups g
+      JOIN users u ON u.id = g.user_id
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name, c2.photo_url
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
+      WHERE g.user_id != ${owner.id}
+        AND (${isOwner} OR g.is_public = true)
+        AND EXISTS (
+          SELECT 1 FROM players p
+          JOIN tournament_players tp ON tp.player_id = p.id
+          JOIN tournaments t ON t.id = tp.tournament_id AND t.group_id = g.id
+          WHERE p.user_id = ${owner.id}
+        )
+      ORDER BY g.created_at DESC
+    `,
+
+    // Categorías ajenas donde es co-organizador.
+    sql`
+      SELECT g.id, g.name, g.emojis, g.is_public,
+        u.username AS owner_username,
+        (SELECT COUNT(DISTINCT tp.player_id)::int
+         FROM tournament_players tp
+         JOIN tournaments t ON t.id = tp.tournament_id
+         WHERE t.group_id = g.id) AS player_count,
+        (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+        COALESCE(gclub.name, lastclub.name) AS club_name,
+        COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url
+      FROM groups g
+      JOIN users u ON u.id = g.user_id
+      JOIN group_collaborators gc ON gc.group_id = g.id AND gc.user_id = ${owner.id}
+      LEFT JOIN clubs gclub ON gclub.id = g.club_id
+      LEFT JOIN LATERAL (
+        SELECT c2.name, c2.photo_url
+        FROM   tournaments t2
+        JOIN   clubs c2 ON c2.id = t2.club_id
+        WHERE  t2.group_id = g.id
+        ORDER  BY COALESCE(t2.event_date, t2.created_at::date) DESC
+        LIMIT  1
+      ) lastclub ON g.club_id IS NULL
+      WHERE g.user_id != ${owner.id}
         AND (${isOwner} OR g.is_public = true)
       ORDER BY g.created_at DESC
     `,
@@ -365,6 +434,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         t.id   AS tournament_id,
         t.group_id,
         t.name AS tournament_name,
+        g.name AS group_name,
         -- Una categoría privada no publica el nombre ni el enlace de sus jornadas.
         COALESCE(
           g.is_public
@@ -455,6 +525,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         t.id        AS tournament_id,
         t.group_id,
         t.name      AS tournament_name,
+        g.name      AS group_name,
         t.club_id,
         COALESCE(t.event_date, t.created_at::date)::text AS day,
         t.bracket,
@@ -642,7 +713,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     // publica de qué jornada salió: sin nombre y sin ids con los que abrirla.
     const publicRecent = allRecent.map(({ visible, ...m }) =>
       visible === false
-        ? { ...m, tournament_id: null, group_id: null, tournament_name: null, private_group: true }
+        ? { ...m, tournament_id: null, group_id: null, tournament_name: null, group_name: null, private_group: true }
         : m,
     );
 
@@ -729,6 +800,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       },
       is_following: follows.is_following,
       groups,
+      played_groups: playedGroups,
+      coorg_groups:  coorgGroups,
       stats: {
         ...basicStats,
         racha,
@@ -925,6 +998,10 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
              c.name AS club_name, c.location_name AS club_location_name, c.photo_url AS club_photo_url,
              c.courts AS club_courts,
              cr.name AS pending_club_name,
+             (SELECT COUNT(DISTINCT tp.player_id)::int
+              FROM tournament_players tp
+              JOIN tournaments t ON t.id = tp.tournament_id
+              WHERE t.group_id = g.id) AS player_count,
              (EXISTS (
                SELECT 1 FROM subscriptions s
                WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
@@ -950,7 +1027,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       LEFT JOIN pairs             pr ON pr.tournament_id = t.id
       WHERE  t.group_id = ${groupId}
       GROUP  BY t.id, c.id
-      ORDER  BY t.created_at DESC
+      ORDER  BY COALESCE(t.event_date, t.created_at::date) DESC, t.created_at DESC
     `,
 
     sql`

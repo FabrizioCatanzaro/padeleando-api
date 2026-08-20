@@ -445,10 +445,16 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
       if (!club) return res.status(404).json({ error: 'Club no encontrado' });
     }
 
+    // live_match se limpia al finalizar: nadie lo hacía y la jornada terminada
+    // conservaba el último payload de partidos en curso, así que seguía
+    // figurando "en vivo" en la portada y en la categoría. La condición usa el
+    // mismo COALESCE que el status —no el status del body— para que también
+    // limpie si el PATCH toca cualquier otra cosa de una jornada ya finalizada.
     const [updated] = await sql`
       UPDATE tournaments
       SET name             = COALESCE(${name   ?? null}, name),
           status           = COALESCE(${status ?? null}, status),
+          live_match       = CASE WHEN COALESCE(${status ?? null}, status) = 'finished' THEN NULL ELSE live_match END,
           mode             = COALESCE(${mode   ?? null}, mode),
           number_of_courts = COALESCE(${number_of_courts ?? null}, number_of_courts),
           club_id          = CASE WHEN ${club_id !== undefined}::boolean    THEN ${club_id || null}    ELSE club_id    END,
