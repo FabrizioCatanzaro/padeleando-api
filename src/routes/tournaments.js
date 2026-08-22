@@ -4,7 +4,7 @@ import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
 import { canManageGroup } from '../lib/access.js';
-import { parseSignupFields } from '../lib/signup.js';
+import { parseSignupFields, resolveSignup } from '../lib/signup.js';
 import { tournamentQuotaError } from '../lib/plan.js';
 
 const router = Router();
@@ -47,6 +47,11 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       SELECT t.*,
              g.user_id       AS group_owner_id,
              g.name          AS group_name,
+             g.emojis        AS group_emojis,
+             g.is_public     AS group_is_public,
+             ow.username     AS owner_username,
+             ow.name         AS owner_name,
+             ow.avatar_url   AS owner_avatar_url,
              g.signup_open       AS group_signup_open,
              g.signup_price      AS group_signup_price,
              g.signup_price_unit AS group_signup_price_unit,
@@ -77,6 +82,14 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       SELECT * FROM matches WHERE tournament_id = ${id} ORDER BY created_at DESC
     `;
 
+    // El fixture: partidos con equipos, cancha y hora, todavía sin resultado.
+    // Van en su propia lista para que nada de lo que ya cuenta partidos jugados
+    // los tome por jugados.
+    const scheduled = await sql`
+      SELECT * FROM scheduled_matches WHERE tournament_id = ${id}
+      ORDER BY scheduled_at NULLS LAST, position, created_at
+    `;
+
     // Incluir info de vinculación: usuario registrado + invitación pendiente si aplica
     // Solo jugadores explícitamente agregados a esta jornada (tournament_players)
     const activePlayers = await sql`
@@ -105,6 +118,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       ...new Set([
         ...pairs.flatMap((p) => [p.p1_id, p.p2_id]),
         ...matches.flatMap((m) => [m.team1_p1, m.team1_p2, m.team2_p1, m.team2_p2]),
+        ...scheduled.flatMap((m) => [m.team1_p1, m.team1_p2, m.team2_p1, m.team2_p2]),
       ]),
     ].filter((pid) => pid && !activeIds.has(pid));
 
@@ -131,7 +145,22 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       ? true
       : (viewerId ? (await canManageGroup(sql, viewerId, tournament.group_id)) === true : false);
 
-    res.json({ ...tournament, players, pairs, matches, is_owner, can_manage });
+    // La inscripción, ya resuelta entre jornada, categoría y perfil: es la misma
+    // cuenta que hacía la vista de sólo lectura, y ahora la página es una sola.
+    const signup = resolveSignup(tournament, {
+      signup_open:       tournament.group_signup_open,
+      signup_price:      tournament.group_signup_price,
+      signup_price_unit: tournament.group_signup_price_unit,
+      signup_contacts:   tournament.group_signup_contacts,
+    }, tournament.owner_social_links);
+
+    res.json({
+      ...tournament,
+      // Mismo nombre que en /api/readonly/:id: el frontend lee uno solo.
+      group_owner_is_premium: tournament.owner_is_premium,
+      signup,
+      players, pairs, matches, scheduled_matches: scheduled, is_owner, can_manage,
+    });
   } catch (err) { next(err); }
 });
 
@@ -515,7 +544,7 @@ router.patch('/:id/live', requireAuth, requireTournamentManage, async (req, res,
 router.post('/:id/schedule', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
     const sql = getDb();
-    const [[tournament], pairsRaw, matches] = await Promise.all([
+    const [[tournament], pairsRaw, matches, scheduledPrevia] = await Promise.all([
       sql`SELECT * FROM tournaments WHERE id = ${req.params.id}`,
       sql`
         SELECT pr.id, pr.p1_id, pr.p2_id, p1.name AS p1_name, p2.name AS p2_name
@@ -529,6 +558,11 @@ router.post('/:id/schedule', requireAuth, requireTournamentManage, async (req, r
         FROM matches WHERE tournament_id = ${req.params.id}
         ORDER BY created_at
       `,
+      sql`
+        SELECT team1_p1, team1_p2, team2_p1, team2_p2, created_at
+        FROM scheduled_matches WHERE tournament_id = ${req.params.id}
+        ORDER BY created_at
+      `,
     ]);
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
     if (tournament.format !== 'americano') return res.status(400).json({ error: 'Solo disponible en formato Americano' });
@@ -537,7 +571,7 @@ router.post('/:id/schedule', requireAuth, requireTournamentManage, async (req, r
       return res.status(400).json({ error: 'Se necesitan entre 8 y 16 parejas para generar el calendario' });
     }
 
-    const schedule = generatePreviaSchedule(pairsRaw, matches);
+    const schedule = generatePreviaSchedule(pairsRaw, [...matches, ...scheduledPrevia]);
     res.json({ schedule });
   } catch (err) { next(err); }
 });
@@ -691,7 +725,9 @@ const SCHEDULE_ATTEMPTS  = 200;
  * al que todavía no enfrentó.
  *
  * @param {Array} pairs   - [{ id, p1_id, p2_id, p1_name, p2_name }]
- * @param {Array} matches - registros de matches (fase previa) del torneo
+ * @param {Array} matches - partidos de la fase previa del torneo, jugados Y
+ *                          programados: los dos consumen cupo de la pareja y
+ *                          bloquean la revancha.
  * @returns {Array} - [{ round, team1: { id, name }, team2: { id, name } }]
  */
 function generatePreviaSchedule(pairs, matches = []) {

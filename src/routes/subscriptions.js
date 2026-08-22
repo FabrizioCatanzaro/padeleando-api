@@ -183,11 +183,36 @@ export async function linkPreapprovalToUser(sql, userId, preapprovalId) {
 }
 
 // ── GET /api/subscriptions/me ─────────────────────────────────────────────────
+// `usage` viaja acá para que la página del plan no necesite una segunda vuelta:
+// categorías creadas, torneos del mes y el pico de torneos en una sola categoría,
+// que es contra lo que se compara el cupo (2 por mes EN CADA categoría).
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
-    const subscription = await getActiveSubscription(sql, req.user.id);
-    res.json(subscription);
+    const [subscription, [groups], [months]] = await Promise.all([
+      getActiveSubscription(sql, req.user.id),
+      sql`SELECT COUNT(*)::int AS count FROM groups WHERE user_id = ${req.user.id}`,
+      sql`
+        SELECT COALESCE(MAX(c), 0)::int AS peak, COALESCE(SUM(c), 0)::int AS total
+        FROM (
+          SELECT COUNT(*) AS c
+          FROM   tournaments t
+          JOIN   groups g ON g.id = t.group_id
+          WHERE  g.user_id = ${req.user.id}
+            AND  t.created_at >= date_trunc('month', now())
+          GROUP BY t.group_id
+        ) x
+      `,
+    ]);
+
+    res.json({
+      ...subscription,
+      usage: {
+        groups:            groups.count,
+        tournaments_month: months.total,
+        tournaments_peak:  months.peak,
+      },
+    });
   } catch (err) { next(err); }
 });
 

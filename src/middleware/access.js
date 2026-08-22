@@ -79,6 +79,21 @@ export const requireMatchManage = makeManageGuard(
   `
 );
 
+// Resuelve la categoría desde un partido programado (:id).
+export const requireScheduledManage = makeManageGuard(
+  (req) => req.params.id ?? null,
+  (sql, scheduledId, userId) => sql`
+    SELECT sm.id AS scheduled_id, t.id AS tournament_id, t.group_id, t.format, t.status,
+           (g.user_id = ${userId}) AS is_owner,
+           EXISTS (SELECT 1 FROM group_collaborators gc
+                   WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab
+    FROM scheduled_matches sm
+    JOIN tournaments t ON t.id = sm.tournament_id
+    JOIN groups g ON g.id = t.group_id
+    WHERE sm.id = ${scheduledId}
+  `
+);
+
 // Resuelve la categoría desde una pareja (:id).
 export const requirePairManage = makeManageGuard(
   (req) => req.params.id ?? null,

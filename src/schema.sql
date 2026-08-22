@@ -66,6 +66,25 @@ CREATE TABLE IF NOT EXISTS matches (
   played_at     DATE    NOT NULL,
   created_at    TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Fixture: partidos con equipos, cancha y hora, todavia sin resultado.
+-- Tabla aparte y no filas de `matches` sin score: nada de lo que cuenta
+-- partidos jugados debe tomarlos por jugados. Ver migration_scheduled_matches.sql.
+CREATE TABLE IF NOT EXISTS scheduled_matches (
+  id            TEXT PRIMARY KEY,
+  tournament_id TEXT    NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  team1_p1      TEXT    NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  team1_p2      TEXT    NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  team2_p1      TEXT    NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  team2_p2      TEXT    NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  court         INTEGER,
+  scheduled_at  TIME,
+  position      INTEGER NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_matches_tournament
+  ON scheduled_matches(tournament_id);
  
 -- Invitaciones: el dueño del grupo invita a un usuario registrado a reclamar un slot de jugador
 CREATE TABLE IF NOT EXISTS player_invitations (
