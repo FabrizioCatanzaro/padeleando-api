@@ -24,7 +24,7 @@ function validateScore(score1, score2) {
 // POST /api/matches
 router.post('/', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
-    const { tournamentId, team1, team2, score1, score2, playedAt, duration_seconds, sets, sets_format, court } = req.body;
+    const { tournamentId, team1, team2, score1, score2, playedAt, duration_seconds, sets, sets_format, court, scheduledId } = req.body;
 
     if (!tournamentId || !team1?.[0] || !team1?.[1] || !team2?.[0] || !team2?.[1]) {
       return res.status(400).json({ error: 'Datos incompletos' });
@@ -61,6 +61,14 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
          ${sets_format ?? null}, ${setsJson}, ${court ?? null})
       RETURNING *
     `;
+
+    // Venía del fixture: ya se jugó, así que deja de estar programado.
+    if (scheduledId) {
+      await sql`
+        DELETE FROM scheduled_matches
+        WHERE id = ${scheduledId} AND tournament_id = ${tournamentId}
+      `;
+    }
     res.status(201).json(match);
   } catch (err) { next(err); }
 });

@@ -50,6 +50,14 @@ router.get('/:tournamentId', async (req, res, next) => {
       WHERE tournament_id = ${tournamentId}
       ORDER BY created_at DESC
     `;
+
+    // El fixture es lo que el espectador viene a mirar antes de que empiece:
+    // contra quién juega y en qué cancha.
+    const scheduled = await sql`
+      SELECT * FROM scheduled_matches
+      WHERE tournament_id = ${tournamentId}
+      ORDER BY scheduled_at NULLS LAST, position, created_at
+    `;
  
     // Canonical player list from tournament_players table
     const tpPlayers = await sql`
@@ -67,6 +75,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       ...new Set([
         ...pairs.flatMap((p) => [p.p1_id, p.p2_id]),
         ...matches.flatMap((m) => [m.team1_p1, m.team1_p2, m.team2_p1, m.team2_p2]),
+        ...scheduled.flatMap((m) => [m.team1_p1, m.team1_p2, m.team2_p1, m.team2_p2]),
       ]),
     ].filter((id) => id && !tpIds.has(id));
 
@@ -123,6 +132,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       players,
       pairs,
       matches,
+      scheduled_matches: scheduled,
     });
   } catch (err) { next(err); }
 });
