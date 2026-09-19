@@ -108,3 +108,65 @@ export const requirePairManage = makeManageGuard(
     WHERE p.id = ${pairId}
   `
 );
+
+// Clubes: el dueño verificado o cualquier admin puede gestionar. No hay
+// co-organizadores todavía (un solo dueño por club, ver Fase 0 del plan de
+// reservas), así que no hace falta el patrón is_owner/is_collab de arriba --
+// acá es is_owner/is_admin.
+export const requireClubManage = async (req, res, next) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: 'No autenticado' });
+
+    const clubId = req.params.id ?? null;
+    if (!clubId) return res.status(404).json({ error: 'Club no encontrado' });
+
+    const sql = getDb();
+    const [ctx] = await sql`
+      SELECT c.id AS club_id, c.owner_id,
+             (c.owner_id = ${userId}) AS is_owner,
+             (u.role = 'admin')       AS is_admin
+      FROM clubs c
+      JOIN users u ON u.id = ${userId}
+      WHERE c.id = ${clubId}
+    `;
+    if (!ctx) return res.status(404).json({ error: 'Club no encontrado' });
+    if (!ctx.is_owner && !ctx.is_admin) return res.status(403).json({ error: 'Sin permiso' });
+
+    req.accessCtx = ctx;
+    next();
+  } catch (err) { next(err); }
+};
+
+// Reservas: más estricto que requireClubManage a propósito (decisión de
+// Fabri, 2026-09-05). Editar los datos de un club sin dueño es una cosa
+// (cualquier admin puede completarlos), pero un admin "haciéndose pasar" por
+// el dueño de un club que SÍ tiene dueño verificado -- viendo quién reservó,
+// marcando turnos como reservados en su nombre -- es otra: eso no tiene que
+// pasar nunca. Así que acá el admin sólo entra si el club sigue sin dueño
+// (fallback razonable: alguien tiene que poder gestionar las reservas de un
+// club todavía no reclamado).
+export const requireClubBookingManage = async (req, res, next) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: 'No autenticado' });
+
+    const clubId = req.params.id ?? null;
+    if (!clubId) return res.status(404).json({ error: 'Club no encontrado' });
+
+    const sql = getDb();
+    const [ctx] = await sql`
+      SELECT c.id AS club_id, c.owner_id, c.name,
+             (c.owner_id = ${userId})                        AS is_owner,
+             (u.role = 'admin' AND c.owner_id IS NULL)        AS is_admin_fallback
+      FROM clubs c
+      JOIN users u ON u.id = ${userId}
+      WHERE c.id = ${clubId}
+    `;
+    if (!ctx) return res.status(404).json({ error: 'Club no encontrado' });
+    if (!ctx.is_owner && !ctx.is_admin_fallback) return res.status(403).json({ error: 'Sin permiso' });
+
+    req.accessCtx = ctx;
+    next();
+  } catch (err) { next(err); }
+};

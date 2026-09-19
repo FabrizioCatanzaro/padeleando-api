@@ -235,6 +235,93 @@ ALTER TABLE club_requests ADD COLUMN IF NOT EXISTS club_id TEXT REFERENCES clubs
 -- Snapshot de los datos del club al momento de crear la solicitud (para el diff "antes → después").
 ALTER TABLE club_requests ADD COLUMN IF NOT EXISTS previous_data JSONB;
 
+-- Reclamo de propiedad de un club: alguien dice ser el dueño y pide que un
+-- admin lo verifique. No es lo mismo que club_requests (que compara "antes"
+-- contra "después" de un dato) -- acá lo que se evalúa es una identidad, con
+-- fotos de respaldo obligatorias, no un cambio de campo.
+CREATE TABLE IF NOT EXISTS club_claims (
+  id                TEXT PRIMARY KEY,
+  club_id           TEXT NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  requested_by      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  full_name         TEXT NOT NULL,
+  phone             TEXT NOT NULL,
+  relationship      TEXT NOT NULL,
+  note              TEXT,
+  photo_front_url   TEXT NOT NULL,
+  photo_proof_url   TEXT NOT NULL,
+  photo_social_url  TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'rejected')),
+  rejection_reason  TEXT,
+  reviewed_by       TEXT REFERENCES users(id) ON DELETE SET NULL,
+  reviewed_at       TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- La 3a foto pasó de "las canchas" a una captura de una red social del club
+-- (paso de más peso para probar que el reclamante administra esa cuenta).
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'club_claims' AND column_name = 'photo_courts_url'
+  ) THEN
+    ALTER TABLE club_claims RENAME COLUMN photo_courts_url TO photo_social_url;
+  END IF;
+END $$;
+
+-- Dueño verificado del club (NULL hasta que se aprueba un club_claims) y si
+-- ese nombre se muestra públicamente en la ficha del club.
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS owner_id      TEXT REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS owner_visible BOOLEAN NOT NULL DEFAULT false;
+
+-- Imagen de cabecera propia del club (antes todas las fichas usaban la misma
+-- foto de cancha genérica). Mismo patrón que photo_url/photo_public_id.
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS header_url       TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS header_public_id TEXT;
+
+-- ─── Fase 2 de "reservas de cancha": canchas como entidades reales ───────────
+-- La disponibilidad semanal sigue siendo la de `clubs.schedule` (un solo
+-- horario para todo el club, no por cancha -- decisión explícita de Fabri) y
+-- la duración del turno es fija por club (`slot_minutes`), no por cancha ni
+-- por franja. Lo único que ahora es una entidad real es la cancha en sí:
+-- antes `clubs.courts` era sólo un número ("cuántas canchas tiene"), lo que
+-- alcanzaba para mostrarlo en la ficha pero no para reservar UNA cancha en
+-- particular. Se deja `clubs.courts` como está (fallback de visualización
+-- para un club que todavía no cargó sus canchas una por una) -- pero apenas
+-- carga la primera, `syncLegacyCourtsCount()` en routes/clubs.js lo recalcula
+-- solo (cuenta de `club_courts` activas) en cada alta/edición/baja, así que
+-- deja de ser un número editable a mano (ver ClubFormFields.jsx).
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS slot_minutes INTEGER NOT NULL DEFAULT 90;
+
+CREATE TABLE IF NOT EXISTS club_courts (
+  id          TEXT PRIMARY KEY,
+  club_id     TEXT NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  -- Piso, paredes, techo, iluminación y juego exterior son atributos
+  -- independientes entre sí (por ejemplo una cancha de cemento puede estar
+  -- techada o no), por eso van en columnas separadas.
+  floor_type       TEXT CHECK (floor_type IS NULL OR floor_type IN ('cesped_sintetico', 'cesped_natural', 'cemento')),
+  wall_type        TEXT CHECK (wall_type IS NULL OR wall_type IN ('cemento', 'cristal')),
+  covered          BOOLEAN,
+  lit              BOOLEAN,
+  -- "Juego exterior": hay espacio habilitado para seguir jugando la pelota
+  -- que sale por la puerta (no es lo habitual en clubes de Argentina).
+  external_play    BOOLEAN,
+  price       NUMERIC(10,2),
+  active      BOOLEAN NOT NULL DEFAULT true,
+  sort_order  INTEGER NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_club_courts_club ON club_courts(club_id);
+-- Reemplaza la columna "surface" (Fase 2 original) por floor_type/wall_type,
+-- separados a pedido de Fabri. No había canchas reales cargadas todavía.
+ALTER TABLE club_courts DROP COLUMN IF EXISTS surface;
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS floor_type    TEXT CHECK (floor_type IS NULL OR floor_type IN ('cesped_sintetico', 'cesped_natural', 'cemento'));
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS wall_type     TEXT CHECK (wall_type IS NULL OR wall_type IN ('cemento', 'cristal'));
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS lit           BOOLEAN;
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS external_play BOOLEAN;
+
 -- Cada torneo se juega (opcionalmente) en un club, con fecha programada del evento.
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS club_id    TEXT REFERENCES clubs(id) ON DELETE SET NULL;
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS event_date DATE;
@@ -321,11 +408,15 @@ CREATE TABLE IF NOT EXISTS group_favorites (
 
 -- Ampliar el CHECK de notifications.type con los tipos nuevos (la tabla vive en
 -- migration_notifications.sql; el IF EXISTS evita fallar si aún no se creó).
+-- booking_cancelled (2026-09-13): el jugador cancela su propia reserva
+-- (PATCH /api/bookings/mine/:groupId) y se le avisa al dueño/admins -- es la
+-- dirección inversa de booking_decided (que va del dueño hacia el jugador).
 ALTER TABLE IF EXISTS notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
 ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
   CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
                   'collab_invite','ownership_transfer','ownership_received','premium_claim',
-                  'player_unlinked','new_tournament'));
+                  'player_unlinked','new_tournament','club_claim','booking_decided','booking_requested',
+                  'booking_cancelled'));
 
 -- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
 -- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
@@ -348,6 +439,13 @@ CREATE INDEX IF NOT EXISTS idx_clubs_name            ON clubs(name);
 CREATE INDEX IF NOT EXISTS idx_tournaments_club      ON tournaments(club_id);
 CREATE INDEX IF NOT EXISTS idx_club_requests_status  ON club_requests(status);
 CREATE INDEX IF NOT EXISTS idx_club_requests_club    ON club_requests(club_id);
+CREATE INDEX IF NOT EXISTS idx_club_claims_status    ON club_claims(status);
+CREATE INDEX IF NOT EXISTS idx_club_claims_club      ON club_claims(club_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_club_claims_one_pending ON club_claims(club_id) WHERE status = 'pending';
+-- Como con club_claims: una sola solicitud de EDICIÓN pendiente por club a la vez
+-- (club_id NULL = alta nueva, esas no colisionan entre sí -- NULL no choca con NULL en un índice único).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_club_requests_one_pending_edit ON club_requests(club_id) WHERE status = 'pending' AND club_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_clubs_owner           ON clubs(owner_id);
 CREATE INDEX IF NOT EXISTS idx_groups_club           ON groups(club_id);
 CREATE INDEX IF NOT EXISTS idx_groups_pending_club       ON groups(pending_club_request_id);
 CREATE INDEX IF NOT EXISTS idx_tournaments_pending_club  ON tournaments(pending_club_request_id);
@@ -443,3 +541,98 @@ CREATE TRIGGER trg_group_players_one_link_per_group
   BEFORE INSERT ON group_players
   FOR EACH ROW
   EXECUTE FUNCTION assert_one_linked_player_per_group();
+
+-- ─── Fase 3 de "reservas de cancha": reserva pública de un turno ────────────
+-- Horizonte fijo de 7 días. Un turno "pending" NO bloquea el horario --
+-- varias personas pueden pedir el mismo turno a la vez, decisión cerrada con
+-- Fabri, 2026-09-06: bloquear al instante le hacía perder clientes al dueño
+-- si alguien spameaba pedidos sin confirmar nunca. Sólo "confirmed" bloquea
+-- (ver los índices únicos más abajo). Cuando el dueño confirma una reserva,
+-- cualquier otra "pending" que compartía ese mismo horario se rechaza sola
+-- (routes/clubs.js, cancelOverlappingPending) y se le avisa a quien la hizo.
+-- Si el club no cargó canchas reales todavía,
+-- `court_id` queda NULL -- se reserva sólo día/horario, sin elegir cancha en
+-- particular. Quién reservó nunca es público (decisión cerrada): las rutas
+-- de lectura pública de reservas (routes/clubs.js) nunca devuelven
+-- guest_name/guest_contact, sólo lo necesario para pintar la grilla.
+CREATE TABLE IF NOT EXISTS bookings (
+  id                TEXT PRIMARY KEY,
+  -- Varios turnos consecutivos reservados juntos (ej. 08:00 y 09:00 para
+  -- completar 2 horas con turnos de 60 min) se guardan como una fila por
+  -- turno base, todas con el mismo group_id -- así el índice único de abajo
+  -- (que sigue siendo por turno individual) no necesita saber nada de rangos,
+  -- y Fase 4 puede agruparlas para aprobar/rechazar el conjunto de una vez.
+  group_id          TEXT NOT NULL,
+  club_id           TEXT NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  court_id          TEXT REFERENCES club_courts(id) ON DELETE SET NULL,
+  user_id           TEXT REFERENCES users(id) ON DELETE SET NULL,
+  guest_name        TEXT NOT NULL,
+  guest_contact     TEXT NOT NULL,
+  date              DATE NOT NULL,
+  start_time        TIME NOT NULL,
+  duration_minutes  INTEGER NOT NULL,
+  price             NUMERIC(10,2),
+  status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'rejected')),
+  decision_reason   TEXT,
+  decided_at        TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- Si `bookings` ya existía de una corrida anterior de este mismo schema.sql
+-- (creada antes de sumar `group_id`), el CREATE TABLE de arriba no la tocó --
+-- hay que agregarle la columna a mano. Las filas viejas (todas de un solo
+-- turno, de antes de que existiera la reserva de varios turnos seguidos) se
+-- backfillean con su propio `id` como `group_id` -- son, cada una, un grupo
+-- de un solo turno.
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS group_id TEXT;
+UPDATE bookings SET group_id = id WHERE group_id IS NULL;
+ALTER TABLE bookings ALTER COLUMN group_id SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_bookings_club_date ON bookings(club_id, date);
+CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_bookings_group ON bookings(group_id);
+
+-- Dos índices únicos parciales en vez de uno solo: un UNIQUE normal no evita
+-- dos filas con el mismo (club_id, date, start_time) si court_id es NULL en
+-- ambas, porque Postgres trata cada NULL como distinto entre sí. Sólo
+-- "confirmed" entra en el índice (antes también "pending" -- decisión
+-- revertida el 2026-09-06, ver comentario de la tabla arriba): hay que
+-- borrar y recrear los índices porque un CREATE ... IF NOT EXISTS no
+-- actualiza el WHERE de uno que ya existe con la definición vieja.
+DROP INDEX IF EXISTS uq_bookings_slot_with_court;
+DROP INDEX IF EXISTS uq_bookings_slot_no_court;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bookings_slot_with_court
+  ON bookings(club_id, court_id, date, start_time)
+  WHERE status = 'confirmed' AND court_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bookings_slot_no_court
+  ON bookings(club_id, date, start_time)
+  WHERE status = 'confirmed' AND court_id IS NULL;
+
+-- ─── Fase 4: turnos de 30 min, precio por 30/60 min ──────────────────────────
+-- Decisión de Fabri (2026-09-13): antes el dueño elegía UNA duración de turno
+-- para todo el club (60/90/120 min) y eso limitaba lo que un usuario podía
+-- reservar (con turnos de 90 no se podía armar una reserva de 60, por ej.).
+-- Ahora `slot_minutes` deja de ser editable por el dueño y queda fijo en 30
+-- para TODOS los clubes (el mínimo posible) -- así el usuario arma la
+-- duración que quiera sumando turnos de a uno (30, 60, 90, 120...) con el
+-- selector +/- de siempre. Se deja la columna (y su lectura en el resto del
+-- código) para no tener que tocar cada lugar que la lee, simplemente ahora
+-- SIEMPRE vale 30.
+ALTER TABLE clubs ALTER COLUMN slot_minutes SET DEFAULT 30;
+UPDATE clubs SET slot_minutes = 30 WHERE slot_minutes <> 30;
+
+-- El dueño pasa a cargar DOS precios por cancha -- uno para un turno de 30
+-- min y otro para uno de 60 -- porque en la práctica el de 60 no siempre es
+-- el doble del de 30 (puede haber un combo). Para una reserva más larga se
+-- arma de a bloques de 60 y, si sobra un turno de 30 suelto, se suma aparte
+-- (ver computeTotalPrice() acá abajo y en el frontend). Se agregan columnas
+-- nuevas sin tocar `price` (queda deprecada, no se borra por si tiene datos
+-- reales -- mismo criterio que el resto de este archivo).
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS price_30 NUMERIC(10,2);
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS price_60 NUMERIC(10,2);
+-- Backfill único e idempotente: a partir del precio viejo (un solo precio,
+-- para el turno de la duración que tuviera el club en ese momento) se estima
+-- un precio de 60 min IGUAL al viejo y uno de 30 min como la mitad -- son
+-- sólo un punto de partida, el dueño tiene que revisarlos/corregirlos a mano
+-- desde "Gestionar canchas" (sobre todo si su turno viejo no era de 60 min).
+UPDATE club_courts SET price_60 = price, price_30 = ROUND(price / 2, 2)
+WHERE price_60 IS NULL AND price IS NOT NULL;

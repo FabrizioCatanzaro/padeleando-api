@@ -24,6 +24,7 @@ import photosRouter         from './routes/photos.js';
 import adminRouter          from './routes/admin.js';
 import inboundRouter        from './routes/inbound.js';
 import homeRouter           from './routes/home.js';
+import bookingsRouter       from './routes/bookings.js';
 import { getDb } from './db.js';
 
 const app  = express();
@@ -99,13 +100,55 @@ const NEVER_STORE = [
   '/api/notifications',
   '/api/invitations',
   '/api/emails',
+  // "Mis reservas" del jugador: cruza todos los clubes en los que reservó,
+  // dato tan privado como /api/auth -- nunca debe quedar en una caché
+  // compartida (a diferencia de /api/clubs, que es mayormente lectura pública).
+  '/api/bookings',
+  // Sub-rutas sólo-admin de /api/clubs (solicitudes y reclamos pendientes):
+  // van ANTES que '/api/clubs' en PUBLIC_CACHEABLE se evalúe, así que sin
+  // esto quedaban agarradas por el "public, max-age=10, swr=60" de ahí abajo
+  // (pensado para /api/clubs en general, que sí es lectura pública). Eso
+  // hacía que el navegador sirviera la lista de "pendientes" desde caché
+  // hasta 70s después de aprobar/rechazar una -- Fabri lo veía como "la
+  // solicitud queda en pendiente hasta que refresco la página".
+  '/api/clubs/requests',
+  '/api/clubs/claims',
+];
+
+// Igual que arriba, pero para una sub-ruta que no empieza con un prefijo fijo
+// (el id del club va en el medio): GET /api/clubs/:id/bookings/manage es la
+// pantalla de gestión de reservas del dueño -- trae nombre/contacto de quien
+// reservó, no es apta para el caché público de 10s de '/api/clubs' en
+// general (mismo bug que requests/claims: los cambios tardaban en reflejarse
+// al volver a la solapa).
+const NEVER_STORE_PATTERNS = [/\/bookings\/manage$/];
+
+// GET /api/clubs/:id y GET /api/clubs/:id/courts devuelven campos que
+// dependen de QUIÉN mira (is_owner, can_manage_bookings, pending_bookings_count,
+// y en /courts las canchas inactivas sólo para el dueño/admin) -- no pueden
+// caer en la caché pública de PUBLIC_CACHEABLE de más abajo, que es
+// "public" (compartida, sin Vary por cookie) y no distingue una respuesta
+// calculada para el dueño de una calculada para cualquier otro. Bug real que
+// reportó Fabri: iniciaba sesión con otra cuenta (no dueña del club) y
+// seguía viendo la solapa RESERVAS del dueño hasta que expiraba la caché
+// (hasta 60s de stale-while-revalidate) -- el navegador ni siquiera volvía
+// a preguntarle al server. Van con la política default de acá abajo
+// (private, no-cache): revalida siempre, y el ETag ya se ocupa de ahorrar
+// ancho de banda cuando la respuesta no cambió. El negative lookahead deja
+// afuera a /api/clubs/nearby, que tiene la misma forma de URL (un solo
+// segmento tras /clubs/) pero sí es público y sin estado por usuario.
+const VIEWER_DEPENDENT_PATTERNS = [
+  /^\/api\/clubs\/(?!nearby$)[^/]+$/,
+  /^\/api\/clubs\/[^/]+\/courts$/,
 ];
 
 app.use((req, res, next) => {
   if (req.method !== 'GET') {
     res.set('Cache-Control', 'no-store');
-  } else if (NEVER_STORE.some((p) => req.path.startsWith(p))) {
+  } else if (NEVER_STORE.some((p) => req.path.startsWith(p)) || NEVER_STORE_PATTERNS.some((r) => r.test(req.path))) {
     res.set('Cache-Control', 'no-store');
+  } else if (VIEWER_DEPENDENT_PATTERNS.some((r) => r.test(req.path))) {
+    res.set('Cache-Control', 'private, no-cache');
   } else if (PUBLIC_CACHEABLE.some((p) => req.path.startsWith(p))) {
     res.set('Cache-Control', 'public, max-age=10, stale-while-revalidate=60');
   } else {
@@ -132,6 +175,7 @@ app.use('/api/notifications',  notificationsRouter);
 app.use('/api/subscriptions', subscriptionsRouter);
 app.use('/api/admin',         adminRouter);
 app.use('/api/emails',        inboundRouter);
+app.use('/api/bookings',      bookingsRouter);
 // Rutas de co-organizadores y transferencia (paths absolutos: /groups/:id/..., /invites/...)
 app.use('/api',               collaboratorsRouter);
 
