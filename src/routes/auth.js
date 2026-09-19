@@ -23,6 +23,14 @@ const SECRET       = process.env.JWT_SECRET;
 const IS_PROD      = process.env.NODE_ENV === 'production';
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
+// Clubes de los que este usuario es dueño verificado -- casi siempre 0 o 1,
+// pero nada impide que un admin apruebe reclamos de más de uno. Va colgado
+// del user payload (login/google/me) para que "Mis clubes" en el menú no
+// necesite un viaje aparte a la API en cada apertura del dropdown.
+async function getOwnedClubs(sql, userId) {
+  return sql`SELECT id, name, photo_url FROM clubs WHERE owner_id = ${userId} ORDER BY name ASC`;
+}
+
 // ── Mailer ────────────────────────────────────────────────────────────────────
 const resend     = new Resend(process.env.RESEND_API_KEY);
 const MAIL_FROM  = process.env.MAIL_FROM || 'Padeleando <onboarding@resend.dev>';
@@ -459,8 +467,11 @@ router.post('/login', loginLimiter, async (req, res, next) => {
     const refreshToken = setAuthCookies(res, safeUser);
     await saveRefreshToken(sql, user.id, refreshToken);
 
-    const subscription = await getActiveSubscription(sql, user.id);
-    res.json({ user: { ...safeUser, subscription } });
+    const [subscription, ownedClubs] = await Promise.all([
+      getActiveSubscription(sql, user.id),
+      getOwnedClubs(sql, user.id),
+    ]);
+    res.json({ user: { ...safeUser, subscription, owned_clubs: ownedClubs } });
   } catch (err) { next(err); }
 });
 
@@ -505,8 +516,11 @@ router.post('/google', async (req, res, next) => {
 
     if (isNewUser) await sendWelcomeEmail(user);
 
-    const subscription = await getActiveSubscription(sql, user.id);
-    res.json({ user: { ...safeUser, subscription } });
+    const [subscription, ownedClubs] = await Promise.all([
+      getActiveSubscription(sql, user.id),
+      getOwnedClubs(sql, user.id),
+    ]);
+    res.json({ user: { ...safeUser, subscription, owned_clubs: ownedClubs } });
   } catch (err) { next(err); }
 });
 
@@ -536,8 +550,11 @@ router.post('/refresh', async (req, res, next) => {
     const newRefreshToken = setAuthCookies(res, user);
     await saveRefreshToken(sql, user.id, newRefreshToken);
 
-    const subscription = await getActiveSubscription(sql, user.id);
-    res.json({ user: { ...user, subscription } });
+    const [subscription, ownedClubs] = await Promise.all([
+      getActiveSubscription(sql, user.id),
+      getOwnedClubs(sql, user.id),
+    ]);
+    res.json({ user: { ...user, subscription, owned_clubs: ownedClubs } });
   } catch (err) { next(err); }
 });
 
@@ -563,13 +580,16 @@ router.get('/me', async (req, res, next) => {
     if (!token) return res.status(401).json({ error: 'No autenticado' });
     const { id } = jwt.verify(token, SECRET);
     const sql = getDb();
-    const [user] = await sql`
-      SELECT id, email, name, username, avatar_url, role, created_at, social_links, bio, onboarding_role
-      FROM users WHERE id = ${id}
-    `;
+    const [[user], subscription, ownedClubs] = await Promise.all([
+      sql`
+        SELECT id, email, name, username, avatar_url, role, created_at, social_links, bio, onboarding_role
+        FROM users WHERE id = ${id}
+      `,
+      getActiveSubscription(sql, id),
+      getOwnedClubs(sql, id),
+    ]);
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
-    const subscription = await getActiveSubscription(sql, id);
-    res.json({ ...user, subscription });
+    res.json({ ...user, subscription, owned_clubs: ownedClubs });
   } catch { res.status(401).json({ error: 'Token inválido' }); }
 });
 

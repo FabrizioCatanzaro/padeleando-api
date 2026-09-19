@@ -215,6 +215,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       followRows,
       followBracketRows,
       sub,
+      ownedClubs,
     ] = await Promise.all([
     sql`
       SELECT
@@ -685,6 +686,16 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     ` : [],
 
     getActiveSubscription(sql, owner.id),
+
+    // Clubes que este usuario tiene reclamados y verificados, y eligió
+    // mostrar públicamente (`clubs.owner_visible`) -- si lo dejó en privado,
+    // ni siquiera acá aparece (mismo criterio que la ficha del club).
+    sql`
+      SELECT id, name, photo_url
+      FROM clubs
+      WHERE owner_id = ${owner.id} AND owner_visible = true
+      ORDER BY created_at ASC
+    `,
     ]);
 
     // Los partidos del cuadro se suman a todo lo calculado en SQL.
@@ -797,6 +808,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         is_premium:      isPremium,
         followers_count: follows.followers_count,
         following_count: follows.following_count,
+        owned_clubs:     ownedClubs,
       },
       is_following: follows.is_following,
       groups,
