@@ -5,13 +5,9 @@ import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
-// "Mis reservas" del jugador logueado. A diferencia de todo lo demás en
-// routes/clubs.js (que vive scopeado a UN club, /:id/bookings/...), esta
-// pantalla cruza todos los clubes en los que reservó -- por eso vive en su
-// propio router, montado en /api/bookings (no anidado bajo /api/clubs/:id).
+// "Mis reservas" cruza todos los clubes: router propio en /api/bookings
 
-// Duplicados a propósito de routes/clubs.js (son helpers de 2 líneas, no
-// vale la pena exportarlos sólo para esto).
+// Duplicados de routes/clubs.js: son helpers de 2 líneas
 function timeToMinutes(hhmm) {
   const [h, m] = hhmm.split(':').map(Number);
   return h * 60 + m;
@@ -22,10 +18,7 @@ function minutesToTime(mins) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
-// GET /api/bookings/mine -- todas las reservas de req.user.id, en cualquier
-// club, sin límite de fecha (el jugador ve todo su historial; el front las
-// agrupa por group_id y las filtra por estado -- mismo criterio que ya usa
-// la pantalla de gestión del dueño, ver utils/bookings.js#groupBookings).
+// GET /api/bookings/mine: todas las reservas del usuario, sin límite de fecha
 router.get('/mine', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
@@ -44,13 +37,7 @@ router.get('/mine', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// PATCH /api/bookings/mine/:groupId -- el jugador cancela su propia reserva
-// (pendiente o confirmada). El único permiso que importa acá es ser el
-// dueño de la reserva (b.user_id === req.user.id) -- a diferencia de
-// PATCH /api/clubs/:id/bookings/:groupId, que es lo simétrico pero para
-// quien GESTIONA el club (requireClubBookingManage). Motivo opcional: no
-// tiene sentido exigirle al jugador que justifique por qué cancela, a
-// diferencia del dueño rechazando/liberando el turno de un tercero.
+// PATCH /api/bookings/mine/:groupId: el jugador cancela la suya; el motivo es opcional
 router.patch('/mine/:groupId', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
@@ -75,10 +62,7 @@ router.patch('/mine/:groupId', requireAuth, async (req, res, next) => {
       WHERE group_id = ${req.params.groupId}
     `;
 
-    // Avisarle a quien tiene que saber que el horario se liberó: el dueño
-    // verificado, o -- si el club todavía no tiene uno -- todos los admins
-    // (mismo fan-out que booking_requested en routes/clubs.js). Best-effort:
-    // la cancelación ya se aplicó, esto no debe poder tirarla abajo.
+    // Avisar al dueño, o a los admins si no hay dueño; best-effort
     try {
       const lastRow = rows[rows.length - 1];
       const endTime = minutesToTime(timeToMinutes(lastRow.start_time.slice(0, 5)) + lastRow.duration_minutes);

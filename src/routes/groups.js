@@ -687,9 +687,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
 
     getActiveSubscription(sql, owner.id),
 
-    // Clubes que este usuario tiene reclamados y verificados, y eligió
-    // mostrar públicamente (`clubs.owner_visible`) -- si lo dejó en privado,
-    // ni siquiera acá aparece (mismo criterio que la ficha del club).
+    // Clubes reclamados que el dueño eligió mostrar (owner_visible)
     sql`
       SELECT id, name, photo_url
       FROM clubs

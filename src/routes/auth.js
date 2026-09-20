@@ -23,10 +23,7 @@ const SECRET       = process.env.JWT_SECRET;
 const IS_PROD      = process.env.NODE_ENV === 'production';
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// Clubes de los que este usuario es dueño verificado -- casi siempre 0 o 1,
-// pero nada impide que un admin apruebe reclamos de más de uno. Va colgado
-// del user payload (login/google/me) para que "Mis clubes" en el menú no
-// necesite un viaje aparte a la API en cada apertura del dropdown.
+// Clubes del usuario como dueño verificado, para no pedirlos aparte al abrir el menú
 async function getOwnedClubs(sql, userId) {
   return sql`SELECT id, name, photo_url FROM clubs WHERE owner_id = ${userId} ORDER BY name ASC`;
 }

@@ -16,10 +16,7 @@ function clubFields(body = {}) {
   const courts = body.courts == null || body.courts === ''
     ? null
     : Math.max(0, parseInt(body.courts, 10) || 0);
-  // Duración del turno (Fase 4): fija en 30 min para TODOS los clubes, ya no
-  // la elige el dueño (decisión de Fabri, 2026-09-13) -- lo que mande el body
-  // en `slot_minutes` se ignora a propósito, para que nadie pueda cambiarla
-  // pegándole directo a la API.
+  // Duración del turno fija en 30 min: se ignora slot_minutes del body
   const slotMinutes = 30;
   return {
     social_links:     social,
@@ -253,8 +250,7 @@ router.patch('/requests/:id', requireAuth, requireAdmin, async (req, res, next) 
   } catch (err) { next(err); }
 });
 
-// ── GET /api/clubs/claims ────────────────────────────────────────────────────
-// Reclamos de propiedad de club (solo admin). Query param: status (default 'pending')
+// GET /api/clubs/claims: reclamos de club (solo admin), ?status=pending por defecto
 router.get('/claims', requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const sql    = getDb();
@@ -277,9 +273,7 @@ router.get('/claims', requireAuth, requireAdmin, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── PATCH /api/clubs/claims/:id ──────────────────────────────────────────────
-// Admin aprueba (setea clubs.owner_id) o rechaza -- con motivo obligatorio -- un reclamo.
-// Body: { action: 'approve' | 'reject', rejection_reason?: string }
+// PATCH /api/clubs/claims/:id: admin aprueba o rechaza (el rechazo lleva motivo)
 router.patch('/claims/:id', requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const sql    = getDb();
@@ -314,10 +308,7 @@ router.patch('/claims/:id', requireAuth, requireAdmin, async (req, res, next) =>
       return res.json(updated);
     }
 
-    // approve → este usuario pasa a ser el dueño verificado del club. El WHERE
-    // owner_id IS NULL evita pisar un dueño si dos reclamos del mismo club se
-    // aprobaran en carrera (el índice único ya bloquea el segundo pendiente,
-    // esto es la segunda red de seguridad).
+    // approve: WHERE owner_id IS NULL evita pisar un dueño si dos reclamos se aprueban a la vez
     const [club] = await sql`
       UPDATE clubs SET owner_id = ${claim.requested_by}
       WHERE id = ${claim.club_id} AND owner_id IS NULL
@@ -438,13 +429,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         FROM club_courts WHERE club_id = ${req.params.id}
         ORDER BY sort_order ASC, created_at ASC
       `,
-      // Para el badge de la solapa RESERVAS -- se calcula siempre (es barato,
-      // hay índice por club_id+status) y se expone en la respuesta sólo si
-      // el que mira puede gestionar reservas de este club (ver más abajo).
-      // OJO: cuenta GRUPOS (reservas lógicas), no filas -- una reserva de
-      // varios turnos seguidos son varias filas con el mismo group_id, y
-      // contar filas hacía que el badge mostrara de más (ej. "3" cuando en
-      // realidad había 1 sola reserva pendiente de 3 turnos).
+      // Cuenta grupos de reservas, no filas: un grupo de varios turnos son varias filas
       sql`SELECT COUNT(DISTINCT group_id)::int AS n FROM bookings WHERE club_id = ${req.params.id} AND status = 'pending'`,
     ]);
 
@@ -453,9 +438,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     const bracketPlayed = brackets.reduce((n, r) => n + countBracketPlayed(r.bracket), 0);
     const isManager = req.user?.role === 'admin' || club.is_owner === true;
     const courts_list = isManager ? courtsList : courtsList.filter((c) => c.active);
-    // Más estricto que `isManager` a propósito (ver requireClubBookingManage
-    // en access.js): un admin sólo gestiona reservas de un club que TODAVÍA
-    // no tiene dueño verificado -- si ya lo tiene, esto es sólo para él.
+    // Más estricto que isManager: el admin solo gestiona reservas de clubes sin dueño
     const canManageBookings = club.is_owner === true || (req.user?.role === 'admin' && !club.has_owner);
 
     res.json({
@@ -515,10 +498,7 @@ router.get('/:id/events', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── POST /api/clubs/:id/claim ────────────────────────────────────────────────
-// Un usuario logueado reclama ser el dueño de un club sin dueño verificado.
-// No es una solicitud de cambio de dato (eso es club_requests): es un reclamo
-// de identidad, con 3 fotos obligatorias, que sólo un admin puede resolver.
+// POST /api/clubs/:id/claim: reclamo de identidad con 3 fotos, lo resuelve un admin
 router.post('/:id/claim', requireAuth, uploadClubClaimPhotos, async (req, res, next) => {
   try {
     const sql = getDb();
@@ -580,8 +560,7 @@ router.post('/:id/claim', requireAuth, uploadClubClaimPhotos, async (req, res, n
 
     res.status(201).json(claim);
   } catch (err) {
-    // La unicidad "un solo pendiente por club" puede perderse en carrera con el
-    // chequeo de arriba; el índice único la corta igual, sólo hay que traducirla.
+    // El índice único corta la carrera; solo hay que traducir el error
     if (err?.code === '23505') return res.status(400).json({ error: 'Ya hay un reclamo pendiente de revisión para este club' });
     next(err);
   }
@@ -669,11 +648,7 @@ router.put('/:id', requireAuth, requireClubManage, async (req, res, next) => {
 
     let pendingIdentityRequestId = null;
     if (wantsIdentityChange) {
-      // proposed_data es un snapshot COMPLETO, no sólo nombre/ubicación: si
-      // sólo mandara los dos campos que cambian, aprobar la solicitud (que
-      // aplica proposed_data entero, ver PATCH /requests/:id) borraría el
-      // resto de los datos del club. El resto sale del club recién
-      // actualizado (`club`, ya con contacto/horario/canchas/redes al día).
+      // proposed_data es snapshot completo: aprobar aplica todo y borraría lo que falte
       const proposed = {
         social_links:     club.social_links,
         schedule:         club.schedule,
@@ -697,17 +672,7 @@ router.put('/:id', requireAuth, requireClubManage, async (req, res, next) => {
       };
       const requestedName = name !== undefined ? name : club.name;
 
-      // Si ya había una solicitud de identidad pendiente para este club, se
-      // actualiza en vez de crear otra -- si no, cada guardado del dueño
-      // (mientras la anterior seguía sin revisar) dejaba una fila "pendiente"
-      // nueva; el admin sólo veía/aprobaba una y las demás quedaban
-      // huérfanas, pendientes para siempre (esto es lo que reportó Fabri: la
-      // solicitud "seguía pendiente" después de aprobar/rechazar -- en
-      // realidad había otra fila pendiente distinta para el mismo club). El
-      // índice único uq_club_requests_one_pending_edit en schema.sql blinda
-      // lo mismo a nivel DB por si dos guardados pisan esto en simultáneo.
-      // previous_data NO se toca en el update: sigue siendo el estado de
-      // ANTES de la primera solicitud de esta tanda, no de la última edición.
+      // Con solicitud pendiente del club se actualiza en vez de crear otra; previous_data no cambia
       const [existing] = await sql`
         SELECT id FROM club_requests WHERE club_id = ${club.id} AND status = 'pending'
       `;
@@ -748,9 +713,7 @@ router.put('/:id', requireAuth, requireClubManage, async (req, res, next) => {
       }
       pendingIdentityRequestId = requestId;
 
-      // Sólo se notifica a los admins cuando es una solicitud nueva -- si el
-      // dueño guarda varias veces mientras sigue pendiente, no hace falta
-      // mandarles una notificación por cada guardado.
+      // Solo se notifica a los admins en solicitudes nuevas
       if (isNewRequest && requestId) {
         try {
           const admins = await sql`SELECT id FROM users WHERE role = 'admin'`;
@@ -811,9 +774,7 @@ router.delete('/:id/photo', requireAuth, requireClubManage, async (req, res, nex
   } catch (err) { next(err); }
 });
 
-// ── POST /api/clubs/:id/header ───────────────────────────────────────────────
-// Imagen de cabecera propia del club (antes la ficha pública usaba siempre la
-// misma foto de cancha genérica). Mismo dueño/admin que la foto de perfil.
+// POST /api/clubs/:id/header: imagen de cabecera, mismo permiso que la foto de perfil
 router.post('/:id/header', requireAuth, requireClubManage, uploadClubHeader, async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No se envió imagen' });
@@ -852,20 +813,11 @@ router.delete('/:id/header', requireAuth, requireClubManage, async (req, res, ne
   } catch (err) { next(err); }
 });
 
-// ── Canchas del club (Fase 2 de "reservas de cancha") ────────────────────────
-// Entidades reales, una por cancha física -- antes `clubs.courts` era sólo un
-// número. La disponibilidad semanal sigue siendo la del club entero
-// (`clubs.schedule`) y la duración del turno (`clubs.slot_minutes`) también
-// es una sola para todo el club, no por cancha (decisiones cerradas con
-// Fabri): estas rutas sólo gestionan el ABM de las canchas en sí.
+// Canchas del club: una fila por cancha física; horario y duración son del club entero
 const COURT_FLOOR_TYPES = ['cesped_sintetico', 'cesped_natural', 'cemento'];
 const COURT_WALL_TYPES  = ['cemento', 'cristal'];
 
-// Precio de una cancha: ya no es un solo número por turno (Fase 4) sino dos --
-// uno para un turno de 30 min y otro para uno de 60 -- porque el de 60 no
-// necesariamente es el doble del de 30 (el dueño puede tener un combo). Cada
-// uno se valida y se guarda por separado; cualquiera de los dos puede quedar
-// en null ("a consultar" para esa duración puntual).
+// Dos precios por cancha (30 y 60 min); cada uno puede ser null
 function parsePrice(v) {
   return v === '' || v == null || Number.isNaN(Number(v)) ? null : Math.max(0, Number(v));
 }
@@ -881,15 +833,7 @@ function courtFields(body = {}) {
   return { floor_type, wall_type, covered, lit, external_play, price_30, price_60 };
 }
 
-// Precio total de `slotCount` turnos de 30 min SEGUIDOS, a partir de los dos
-// precios de la cancha (30 y 60 min, ver courtFields() arriba). Se arma de a
-// bloques de 60 min y, si sobra un turno de 30 suelto (cantidad impar), se
-// suma aparte con el precio de 30 -- así una reserva de 90 min cobra
-// (1 × precio_60) + (1 × precio_30), no un precio_30 × 3 que ignoraría el
-// combo de 60 que haya cargado el dueño. Si al dueño le falta uno de los dos
-// precios, se lo estima a partir del otro (mitad/doble) para no dejar turnos
-// sin precio de la nada; si no cargó ninguno, sigue siendo null ("a
-// consultar"), igual que antes.
+// Total de turnos seguidos: bloques de 60 más un 30 suelto; si falta un precio se estima del otro
 function computeTotalPrice(price30, price60, slotCount) {
   const p30 = price30 != null ? Number(price30) : null;
   const p60 = price60 != null ? Number(price60) : null;
@@ -901,13 +845,7 @@ function computeTotalPrice(price30, price60, slotCount) {
   return blocks60 * unit60 + extra30 * unit30;
 }
 
-// Una vez que el club tiene al menos una cancha real cargada, el viejo
-// "cantidad de canchas" (`clubs.courts`, ver clubFields() más arriba) deja de
-// ser un número suelto que carga el dueño a mano y pasa a reflejar las
-// canchas reales activas -- así las tarjetas de club en Discover/HomeView
-// (que siguen mostrando ese número suelto, no `courts_list`) no quedan
-// desactualizadas apenas alguien empieza a usar la gestión de canchas. Se
-// cuentan sólo las activas porque es lo que ve un visitante público.
+// Con canchas reales cargadas, clubs.courts refleja las activas
 async function syncLegacyCourtsCount(sql, clubId) {
   await sql`
     UPDATE clubs SET courts = (
@@ -917,8 +855,7 @@ async function syncLegacyCourtsCount(sql, clubId) {
   `;
 }
 
-// GET /api/clubs/:id/courts -- público, pero sólo activas para quien no
-// gestiona el club (el dueño/admin también ve las deshabilitadas).
+// GET /api/clubs/:id/courts: público; las inactivas solo las ve quien gestiona
 router.get('/:id/courts', optionalAuth, async (req, res, next) => {
   try {
     const sql = getDb();
@@ -994,9 +931,7 @@ router.delete('/:id/courts/:courtId', requireAuth, requireClubManage, async (req
   } catch (err) { next(err); }
 });
 
-// PATCH /api/clubs/:id/courts/:courtId/move -- reordena moviendo una cancha
-// un lugar arriba o abajo (swap de sort_order con la vecina). Devuelve la
-// lista completa ya reordenada para no tener que recalcular nada en el front.
+// PATCH .../courts/:courtId/move: intercambia sort_order con la vecina y devuelve la lista
 router.patch('/:id/courts/:courtId/move', requireAuth, requireClubManage, async (req, res, next) => {
   try {
     const direction = req.body?.direction;
@@ -1025,18 +960,7 @@ router.patch('/:id/courts/:courtId/move', requireAuth, requireClubManage, async 
   } catch (err) { next(err); }
 });
 
-// ── Reservas (Fase 3 de "reservas de cancha") ────────────────────────────────
-// Horizonte fijo de 7 días. Una reserva "pending" NO bloquea el turno --
-// decisión revertida el 2026-09-06 (Fabri): bloquear apenas alguien pide un
-// turno le hacía perder clientes al dueño si alguien spameaba pedidos sin
-// confirmar nunca y el dueño tardaba en decidir. Ahora sólo "confirmed"
-// bloquea (ver los índices únicos en schema.sql); pueden convivir varias
-// "pending" para el mismo horario, y cuando el dueño confirma una, las demás
-// se rechazan solas (ver cancelOverlappingPending más abajo) y se les avisa
-// a quienes reservaron. La duración de cada reserva SIEMPRE se toma de
-// `clubs.slot_minutes` en el momento de crearla (nunca de lo que mande el
-// body) para que nadie pueda mandar una duración distinta y romper el
-// cálculo de choques con otras reservas.
+// Reservas: pending no bloquea, solo confirmed; la duración sale de clubs.slot_minutes, no del body
 const BOOKING_HORIZON_DAYS = 7;
 
 function isValidDateStr(s) {
@@ -1051,19 +975,13 @@ function addDaysStr(dateStr, days) {
   return d.toISOString().slice(0, 10);
 }
 
-// GET /api/clubs/:id/bookings?from=YYYY-MM-DD&to=YYYY-MM-DD -- público. Sólo
-// lo mínimo para pintar la grilla de turnos tomados -- nunca el nombre ni el
-// contacto de quien reservó (decisión cerrada: "quién reservó nunca es
-// público"). Sin ?from/?to, devuelve el horizonte completo de 7 días.
+// GET /api/clubs/:id/bookings: público, nunca devuelve quién reservó
 router.get('/:id/bookings', optionalAuth, async (req, res, next) => {
   try {
     const from = isValidDateStr(req.query.from) ? req.query.from : todayStr();
     const to   = isValidDateStr(req.query.to)   ? req.query.to   : addDaysStr(todayStr(), BOOKING_HORIZON_DAYS - 1);
     const sql = getDb();
-    // `status` viaja para que el front pueda pintar "confirmed" como tomado
-    // (bloquea) y "pending" como "muy solicitado" (no bloquea, es sólo un
-    // aviso de demanda -- ver ClubBooking.jsx). Sigue sin viajar nunca quién
-    // reservó.
+    // status distingue "confirmed" (bloquea) de "pending" (aviso de demanda)
     const bookings = await sql`
       SELECT group_id, court_id, date, start_time, duration_minutes, status
       FROM bookings
@@ -1074,13 +992,7 @@ router.get('/:id/bookings', optionalAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /api/clubs/:id/bookings/manage?from=&to= -- sólo el dueño (o admin). A
-// diferencia de la pública, acá SÍ viaja todo lo que el dueño necesita para
-// decidir: nombre/contacto de quien reservó, motivo y fecha de decisión, y
-// las tres reservas (pendiente/confirmada/rechazada), no sólo las que
-// bloquean turnos. El horizonte por default es más amplio que los 7 días de
-// la reserva pública (incluye una semana hacia atrás, por si quedó algo sin
-// decidir) porque esta pantalla es de gestión, no de disponibilidad.
+// GET .../bookings/manage: solo dueño, con datos de quien reservó y horizonte más amplio
 router.get('/:id/bookings/manage', requireAuth, requireClubBookingManage, async (req, res, next) => {
   try {
     const from = isValidDateStr(req.query.from) ? req.query.from : addDaysStr(todayStr(), -7);
@@ -1097,11 +1009,7 @@ router.get('/:id/bookings/manage', requireAuth, requireClubBookingManage, async 
       WHERE b.club_id = ${req.params.id} AND b.date >= ${from} AND b.date <= ${to}
       ORDER BY b.date, b.start_time
     `;
-    // Para cada reserva pendiente, cuántas OTRAS reservas pendientes (de
-    // otros group_id) comparten exactamente el mismo turno -- así el dueño
-    // ve, antes de decidir, que confirmar ésta va a rechazar automáticamente
-    // las demás (ver cancelOverlappingPending). No hace falta para
-    // confirmed/rejected: una vez decidida, no hay nada más que avisar.
+    // Otras pendientes en el mismo turno: confirmar esta las rechaza
     const overlaps = await sql`
       SELECT b.group_id AS group_id, COUNT(DISTINCT b2.group_id)::int AS other_pending_count
       FROM bookings b
@@ -1133,13 +1041,7 @@ function minutesToTime(mins) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
-// Inserta un grupo de N filas de bookings (una por turno consecutivo,
-// compartiendo el mismo group_id) de forma atomica -- lo usan tanto la
-// reserva publica (POST /:id/bookings) como el bloqueo manual del dueño
-// (POST /:id/bookings/manual). Lo unico que cambia entre una y otra es quien
-// puede llamarla, que campos son obligatorios antes de llegar aca, y en que
-// `status` arranca la reserva (pending para la publica, confirmed para el
-// bloqueo del dueño, que no tiene sentido que se autoapruebe).
+// Inserta N filas con el mismo group_id de forma atómica; el status depende de quien llama
 async function insertBookingGroup({ clubId, slotMinutes, date, sorted, court_id, price, userId, guestName, guestContact, status }) {
   const groupId = uid();
   return withTransaction(async (client) => {
@@ -1158,16 +1060,7 @@ async function insertBookingGroup({ clubId, slotMinutes, date, sorted, court_id,
   });
 }
 
-// Cuando un turno pasa a "confirmed" (aprobación del dueño o bloqueo manual),
-// cualquier OTRA reserva "pending" que compartía exactamente ese mismo
-// horario (mismo club/cancha/fecha/hora) ya no tiene sentido -- el cupo se lo
-// llevó la que se confirmó. Se rechazan automáticamente, con un motivo fijo
-// (no el que haya tipeado el dueño, que es sobre SU decisión, no sobre este
-// efecto colateral), y si tenían cuenta se les avisa in-app. Devuelve los
-// group_id rechazados, para que quien llamó pueda avisarle también al dueño
-// cuántas se vieron afectadas. Nunca rompe la operación principal: todo el
-// bloque es best-effort (igual que el resto de las notificaciones de esta
-// pantalla).
+// Al confirmar, rechaza las otras pending del mismo horario y avisa; best-effort
 async function cancelOverlappingPending({ sql, clubId, confirmedRows, excludeGroupId, actorId, clubName }) {
   try {
     const affected = new Map(); // group_id -> { user_id, date, start_time }
@@ -1211,21 +1104,7 @@ async function cancelOverlappingPending({ sql, clubId, confirmedRows, excludeGro
   }
 }
 
-// POST /api/clubs/:id/bookings -- invitado (nombre + contacto) o logueado
-// (queda linkeado con user_id además, para una futura pantalla de "mis
-// reservas"); en los dos casos se piden nombre y contacto igual, porque el
-// perfil de usuario no guarda teléfono.
-//
-// `slots` es un array de uno o más horarios de inicio ("HH:MM") CONSECUTIVOS
-// -- ej. ["08:00", "09:00"] para reservar dos turnos seguidos de 60 min y
-// juntar 2 horas -- porque un usuario puede querer más de un turno seguido y
-// un solo `start_time` no alcanzaba para eso. Se guarda una fila por turno
-// base (mismo `group_id` en todas), nunca una fila con una duración más
-// larga: así el índice único de un solo turno (uq_bookings_slot_*) sigue
-// alcanzando para evitar choques, sin necesitar lógica de rangos/overlap.
-// El insert de todas las filas es atómico (withTransaction, ver db.js) --
-// si CUALQUIER turno de la lista ya está tomado, se cae toda la reserva
-// junta, nunca queda la mitad reservada.
+// POST /api/clubs/:id/bookings: slots consecutivos, una fila por turno, en una transacción
 router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
   try {
     const guest_name    = req.body?.guest_name?.trim();
@@ -1249,9 +1128,7 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
     const [club] = await sql`SELECT id, name, owner_id, slot_minutes FROM clubs WHERE id = ${req.params.id}`;
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
-    // Los turnos tienen que venir consecutivos y sin repetir -- si no, no
-    // representan una única reserva continua sino horarios sueltos, que ya
-    // tienen su propio endpoint (mandar `slots` con un solo elemento).
+    // Los turnos deben ser consecutivos y sin repetir
     const sorted = [...slots].sort();
     for (let i = 1; i < sorted.length; i++) {
       if (timeToMinutes(sorted[i]) - timeToMinutes(sorted[i - 1]) !== club.slot_minutes) {
@@ -1269,11 +1146,7 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
       if (!court) return res.status(400).json({ error: 'Cancha no válida' });
       court_id = court.id;
       court_name = court.name;
-      // El precio total (Fase 4: turnos de 30 min, no necesariamente lineal
-      // con el de 60) se reparte en partes iguales entre las filas del grupo
-      // -- no hay una forma "correcta" de asignarlo turno por turno cuando el
-      // precio viene combinado en bloques de 60 min, y esto es sólo
-      // informativo (todavía no hay cobro real acá).
+      // Precio total repartido en partes iguales entre las filas; es solo informativo
       const totalPrice = computeTotalPrice(court.price_30, court.price_60, sorted.length);
       price = totalPrice != null ? Math.round((totalPrice / sorted.length) * 100) / 100 : null;
     }
@@ -1291,18 +1164,13 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
         guestContact: guest_contact,
         status: 'pending',
       });
-      // Avisar de la solicitud nueva a quien la tiene que decidir: el dueño
-      // verificado, o -- si el club todavía no tiene uno -- a todos los
-      // admins (mismo fan-out que ya usa POST /:id/claim para avisar de un
-      // reclamo nuevo). Best-effort: no romper la reserva ya creada si falla.
+      // Avisar al dueño, o a los admins si no hay dueño; best-effort
       try {
         const endTime = minutesToTime(timeToMinutes(sorted[sorted.length - 1]) + club.slot_minutes);
         const courtLabel = court_name ? ` en ${court_name}` : '';
         const body = `${guest_name} pidió un turno${courtLabel} para el ${req.body.date} de ${sorted[0]} a ${endTime} hs.`;
         const actorId = req.user?.id ?? null;
-        // entity_id = el club (no el group_id de la reserva): el front sólo
-        // necesita poder llevar a quien la lee directo a la ficha del club
-        // (Fabri, 2026-09-06) -- no hay pantalla de "ver esta reserva puntual".
+        // entity_id es el club: el front lleva a su ficha
         if (club.owner_id) {
           await sql`
             INSERT INTO notifications (id, user_id, type, actor_id, entity_id, body)
@@ -1330,14 +1198,7 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// POST /api/clubs/:id/bookings/manual -- el dueño (o un admin) marca un turno
-// (o varios seguidos) como reservado por fuera de la app: alguien lo llamó,
-// le escribió o vino en persona a preguntar. A diferencia de la reserva
-// pública: nombre y contacto son OPCIONALES (el dueño puede no saber o no
-// querer cargar quién fue), no hay límite de 7 días (el dueño puede bloquear
-// una cancha por mantenimiento más adelante en el calendario), y la fila
-// queda `confirmed` directamente -- no tiene sentido pedirle al dueño que se
-// autoapruebe algo que él mismo está cargando.
+// POST .../bookings/manual: bloqueo del dueño, nombre y contacto opcionales, queda confirmed
 router.post('/:id/bookings/manual', requireAuth, requireClubBookingManage, async (req, res, next) => {
   try {
     const guest_name    = req.body?.guest_name?.trim() || 'Reservado por el club';
@@ -1386,10 +1247,7 @@ router.post('/:id/bookings/manual', requireAuth, requireClubBookingManage, async
         guestContact: guest_contact,
         status: 'confirmed',
       });
-      // El bloqueo manual también "gana" el horario -- si había pedidos
-      // públicos pendientes para el mismo turno, se rechazan solos y se les
-      // avisa (mismo mecanismo que al confirmar desde la pantalla de
-      // gestión, ver cancelOverlappingPending).
+      // El bloqueo manual rechaza las pending del mismo turno
       await cancelOverlappingPending({
         sql, clubId: req.params.id, confirmedRows: bookings,
         excludeGroupId: bookings[0].group_id, actorId: req.user.id,
@@ -1403,19 +1261,7 @@ router.post('/:id/bookings/manual', requireAuth, requireClubBookingManage, async
   } catch (err) { next(err); }
 });
 
-// PATCH /api/clubs/:id/bookings/:groupId -- el dueño (o admin) aprueba o
-// rechaza una reserva pendiente, O libera una reserva ya confirmada (mismo
-// endpoint para las dos cosas: "liberar" es, ni más ni menos, marcarla
-// `rejected` con un motivo -- el índice único sólo bloquea turnos
-// `confirmed`, así que rechazar/liberar deja el horario libre de nuevo
-// automáticamente, sin lógica extra). El motivo es obligatorio para
-// rechazar/liberar (mismo criterio que el rechazo de un club_claim/
-// club_request), opcional para confirmar. Una vez `rejected` la reserva
-// queda cerrada -- no se puede volver a mover de ahí. Confirmar puede además
-// rechazar en cascada otras reservas pendientes que compartían el mismo
-// horario (ver cancelOverlappingPending) -- `bumped_group_ids` en la
-// respuesta le dice al front cuáles, para actualizar su estado local sin
-// tener que refetchear toda la pantalla.
+// PATCH .../bookings/:groupId: confirmar, rechazar o liberar (rejected); el rechazo lleva motivo
 router.patch('/:id/bookings/:groupId', requireAuth, requireClubBookingManage, async (req, res, next) => {
   try {
     const status = req.body?.status;
@@ -1455,17 +1301,12 @@ router.patch('/:id/bookings/:groupId', requireAuth, requireClubBookingManage, as
         WHERE club_id = ${req.params.id} AND group_id = ${req.params.groupId}
       `;
     } catch (e) {
-      // Carrera rarísima: otra reserva confirmada se coló para este mismo
-      // horario entre el GET de la pantalla y este click.
+      // Carrera: otra reserva confirmada tomó el horario
       if (e.code === '23505') return res.status(409).json({ error: 'Ese horario ya quedó confirmado con otra reserva.' });
       throw e;
     }
 
-    // Si se confirmó, cualquier otra reserva pendiente para el mismo
-    // horario deja de tener sentido -- se rechaza sola y se le avisa a quien
-    // la hizo (ver cancelOverlappingPending). El dueño ya vio, antes de
-    // decidir, cuántas reservas se iban a ver afectadas (other_pending_count
-    // en GET /bookings/manage).
+    // Si se confirmó, rechaza en cascada las pending del mismo horario
     const bumpedGroupIds = status === 'confirmed'
       ? await cancelOverlappingPending({
           sql, clubId: req.params.id, confirmedRows: rows,
@@ -1474,9 +1315,7 @@ router.patch('/:id/bookings/:groupId', requireAuth, requireClubBookingManage, as
         })
       : [];
 
-    // Avisarle a quien reservó, sólo si tenía cuenta (un invitado no tiene a
-    // dónde mandarle una notificación in-app -- el dueño ya tiene su
-    // guest_contact a mano para escribirle directo si hace falta). Best-effort.
+    // Avisar a quien reservó solo si tenía cuenta
     const userId = rows[0].user_id;
     if (userId) {
       try {

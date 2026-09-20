@@ -43,10 +43,7 @@ export const uploadClubPhoto = wrap(
   }).single('image')
 );
 
-// Cabecera del club: a diferencia del logo (que sólo se ve como miniatura),
-// esta imagen carga a ancho completo en cada visita a la ficha pública, así
-// que el techo es más chico -- no hace falta un banner de 10MB para que se
-// vea bien, y uno grande sólo suma tiempo de carga.
+// Cabecera del club: carga a ancho completo, por eso el techo es de 4MB
 export const uploadClubHeader = wrap(
   multer({
     storage:    multer.memoryStorage(),
@@ -55,9 +52,7 @@ export const uploadClubHeader = wrap(
   }).single('image')
 );
 
-// Reclamo de club: 3 fotos obligatorias, cada una con un propósito propio
-// (frente/cartel, algo que vincule al reclamante con el lugar, y una captura
-// de una red social del club que demuestre que la administra).
+// Reclamo de club: 3 fotos obligatorias (frente, vínculo con el lugar, red social)
 export const uploadClubClaimPhotos = wrap(
   multer({
     storage:    multer.memoryStorage(),

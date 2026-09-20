@@ -109,10 +109,7 @@ export const requirePairManage = makeManageGuard(
   `
 );
 
-// Clubes: el dueño verificado o cualquier admin puede gestionar. No hay
-// co-organizadores todavía (un solo dueño por club, ver Fase 0 del plan de
-// reservas), así que no hace falta el patrón is_owner/is_collab de arriba --
-// acá es is_owner/is_admin.
+// Clubes: gestiona el dueño verificado o cualquier admin (sin co-organizadores)
 export const requireClubManage = async (req, res, next) => {
   try {
     const userId = req.user?.id;
@@ -138,14 +135,7 @@ export const requireClubManage = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// Reservas: más estricto que requireClubManage a propósito (decisión de
-// Fabri, 2026-09-05). Editar los datos de un club sin dueño es una cosa
-// (cualquier admin puede completarlos), pero un admin "haciéndose pasar" por
-// el dueño de un club que SÍ tiene dueño verificado -- viendo quién reservó,
-// marcando turnos como reservados en su nombre -- es otra: eso no tiene que
-// pasar nunca. Así que acá el admin sólo entra si el club sigue sin dueño
-// (fallback razonable: alguien tiene que poder gestionar las reservas de un
-// club todavía no reclamado).
+// Reservas: el admin solo entra si el club no tiene dueño verificado
 export const requireClubBookingManage = async (req, res, next) => {
   try {
     const userId = req.user?.id;

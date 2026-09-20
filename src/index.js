@@ -100,43 +100,17 @@ const NEVER_STORE = [
   '/api/notifications',
   '/api/invitations',
   '/api/emails',
-  // "Mis reservas" del jugador: cruza todos los clubes en los que reservó,
-  // dato tan privado como /api/auth -- nunca debe quedar en una caché
-  // compartida (a diferencia de /api/clubs, que es mayormente lectura pública).
+  // "Mis reservas" es privado por jugador: nunca en caché compartida
   '/api/bookings',
-  // Sub-rutas sólo-admin de /api/clubs (solicitudes y reclamos pendientes):
-  // van ANTES que '/api/clubs' en PUBLIC_CACHEABLE se evalúe, así que sin
-  // esto quedaban agarradas por el "public, max-age=10, swr=60" de ahí abajo
-  // (pensado para /api/clubs en general, que sí es lectura pública). Eso
-  // hacía que el navegador sirviera la lista de "pendientes" desde caché
-  // hasta 70s después de aprobar/rechazar una -- Fabri lo veía como "la
-  // solicitud queda en pendiente hasta que refresco la página".
+  // Sub-rutas solo-admin de /api/clubs: sin esto las tomaba el caché público de /api/clubs
   '/api/clubs/requests',
   '/api/clubs/claims',
 ];
 
-// Igual que arriba, pero para una sub-ruta que no empieza con un prefijo fijo
-// (el id del club va en el medio): GET /api/clubs/:id/bookings/manage es la
-// pantalla de gestión de reservas del dueño -- trae nombre/contacto de quien
-// reservó, no es apta para el caché público de 10s de '/api/clubs' en
-// general (mismo bug que requests/claims: los cambios tardaban en reflejarse
-// al volver a la solapa).
+// Gestión de reservas del dueño: trae datos de quien reservó, nunca en caché
 const NEVER_STORE_PATTERNS = [/\/bookings\/manage$/];
 
-// GET /api/clubs/:id y GET /api/clubs/:id/courts devuelven campos que
-// dependen de QUIÉN mira (is_owner, can_manage_bookings, pending_bookings_count,
-// y en /courts las canchas inactivas sólo para el dueño/admin) -- no pueden
-// caer en la caché pública de PUBLIC_CACHEABLE de más abajo, que es
-// "public" (compartida, sin Vary por cookie) y no distingue una respuesta
-// calculada para el dueño de una calculada para cualquier otro. Bug real que
-// reportó Fabri: iniciaba sesión con otra cuenta (no dueña del club) y
-// seguía viendo la solapa RESERVAS del dueño hasta que expiraba la caché
-// (hasta 60s de stale-while-revalidate) -- el navegador ni siquiera volvía
-// a preguntarle al server. Van con la política default de acá abajo
-// (private, no-cache): revalida siempre, y el ETag ya se ocupa de ahorrar
-// ancho de banda cuando la respuesta no cambió. El negative lookahead deja
-// afuera a /api/clubs/nearby, que tiene la misma forma de URL (un solo
-// segmento tras /clubs/) pero sí es público y sin estado por usuario.
+// Respuestas que dependen de quién mira: private, no-cache (nearby queda público)
 const VIEWER_DEPENDENT_PATTERNS = [
   /^\/api\/clubs\/(?!nearby$)[^/]+$/,
   /^\/api\/clubs\/[^/]+\/courts$/,

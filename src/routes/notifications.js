@@ -19,10 +19,7 @@ router.get('/', requireAuth, async (req, res, next) => {
         a.name       AS actor_name,
         a.username   AS actor_username,
         a.avatar_url AS actor_avatar_url,
-        -- Sólo importa para 'club_claim': si quien disparó la notificación es
-        -- admin (el que revisó), la UI no muestra su avatar ni su nombre. Si
-        -- es el reclamante (alta), sí -- eso es justamente lo que el admin
-        -- necesita ver.
+        -- Para club_claim: si el actor es admin, la UI oculta su avatar y nombre
         COALESCE(a.role = 'admin', false) AS actor_is_admin,
         CASE WHEN a.id IS NOT NULL THEN EXISTS(
           SELECT 1 FROM subscriptions s
