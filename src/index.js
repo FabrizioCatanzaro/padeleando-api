@@ -24,6 +24,7 @@ import photosRouter         from './routes/photos.js';
 import adminRouter          from './routes/admin.js';
 import inboundRouter        from './routes/inbound.js';
 import homeRouter           from './routes/home.js';
+import bookingsRouter       from './routes/bookings.js';
 import { getDb } from './db.js';
 
 const app  = express();
@@ -99,13 +100,29 @@ const NEVER_STORE = [
   '/api/notifications',
   '/api/invitations',
   '/api/emails',
+  // "Mis reservas" es privado por jugador: nunca en caché compartida
+  '/api/bookings',
+  // Sub-rutas solo-admin de /api/clubs: sin esto las tomaba el caché público de /api/clubs
+  '/api/clubs/requests',
+  '/api/clubs/claims',
+];
+
+// Gestión de reservas del dueño: trae datos de quien reservó, nunca en caché
+const NEVER_STORE_PATTERNS = [/\/bookings\/manage$/];
+
+// Respuestas que dependen de quién mira: private, no-cache (nearby queda público)
+const VIEWER_DEPENDENT_PATTERNS = [
+  /^\/api\/clubs\/(?!nearby$)[^/]+$/,
+  /^\/api\/clubs\/[^/]+\/courts$/,
 ];
 
 app.use((req, res, next) => {
   if (req.method !== 'GET') {
     res.set('Cache-Control', 'no-store');
-  } else if (NEVER_STORE.some((p) => req.path.startsWith(p))) {
+  } else if (NEVER_STORE.some((p) => req.path.startsWith(p)) || NEVER_STORE_PATTERNS.some((r) => r.test(req.path))) {
     res.set('Cache-Control', 'no-store');
+  } else if (VIEWER_DEPENDENT_PATTERNS.some((r) => r.test(req.path))) {
+    res.set('Cache-Control', 'private, no-cache');
   } else if (PUBLIC_CACHEABLE.some((p) => req.path.startsWith(p))) {
     res.set('Cache-Control', 'public, max-age=10, stale-while-revalidate=60');
   } else {
@@ -132,6 +149,7 @@ app.use('/api/notifications',  notificationsRouter);
 app.use('/api/subscriptions', subscriptionsRouter);
 app.use('/api/admin',         adminRouter);
 app.use('/api/emails',        inboundRouter);
+app.use('/api/bookings',      bookingsRouter);
 // Rutas de co-organizadores y transferencia (paths absolutos: /groups/:id/..., /invites/...)
 app.use('/api',               collaboratorsRouter);
 

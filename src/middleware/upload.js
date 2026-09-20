@@ -42,3 +42,25 @@ export const uploadClubPhoto = wrap(
     fileFilter,
   }).single('image')
 );
+
+// Cabecera del club: carga a ancho completo, por eso el techo es de 4MB
+export const uploadClubHeader = wrap(
+  multer({
+    storage:    multer.memoryStorage(),
+    limits:     { fileSize: 4 * 1024 * 1024 },
+    fileFilter,
+  }).single('image')
+);
+
+// Reclamo de club: 3 fotos obligatorias (frente, vínculo con el lugar, red social)
+export const uploadClubClaimPhotos = wrap(
+  multer({
+    storage:    multer.memoryStorage(),
+    limits:     { fileSize: 10 * 1024 * 1024 },
+    fileFilter,
+  }).fields([
+    { name: 'photo_front',  maxCount: 1 },
+    { name: 'photo_proof',  maxCount: 1 },
+    { name: 'photo_social', maxCount: 1 },
+  ])
+);

@@ -108,3 +108,55 @@ export const requirePairManage = makeManageGuard(
     WHERE p.id = ${pairId}
   `
 );
+
+// Clubes: gestiona el dueño verificado o cualquier admin (sin co-organizadores)
+export const requireClubManage = async (req, res, next) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: 'No autenticado' });
+
+    const clubId = req.params.id ?? null;
+    if (!clubId) return res.status(404).json({ error: 'Club no encontrado' });
+
+    const sql = getDb();
+    const [ctx] = await sql`
+      SELECT c.id AS club_id, c.owner_id,
+             (c.owner_id = ${userId}) AS is_owner,
+             (u.role = 'admin')       AS is_admin
+      FROM clubs c
+      JOIN users u ON u.id = ${userId}
+      WHERE c.id = ${clubId}
+    `;
+    if (!ctx) return res.status(404).json({ error: 'Club no encontrado' });
+    if (!ctx.is_owner && !ctx.is_admin) return res.status(403).json({ error: 'Sin permiso' });
+
+    req.accessCtx = ctx;
+    next();
+  } catch (err) { next(err); }
+};
+
+// Reservas: el admin solo entra si el club no tiene dueño verificado
+export const requireClubBookingManage = async (req, res, next) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: 'No autenticado' });
+
+    const clubId = req.params.id ?? null;
+    if (!clubId) return res.status(404).json({ error: 'Club no encontrado' });
+
+    const sql = getDb();
+    const [ctx] = await sql`
+      SELECT c.id AS club_id, c.owner_id, c.name,
+             (c.owner_id = ${userId})                        AS is_owner,
+             (u.role = 'admin' AND c.owner_id IS NULL)        AS is_admin_fallback
+      FROM clubs c
+      JOIN users u ON u.id = ${userId}
+      WHERE c.id = ${clubId}
+    `;
+    if (!ctx) return res.status(404).json({ error: 'Club no encontrado' });
+    if (!ctx.is_owner && !ctx.is_admin_fallback) return res.status(403).json({ error: 'Sin permiso' });
+
+    req.accessCtx = ctx;
+    next();
+  } catch (err) { next(err); }
+};

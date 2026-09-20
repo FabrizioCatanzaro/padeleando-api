@@ -40,7 +40,10 @@ router.get('/stats', async (_req, res, next) => {
         (SELECT COUNT(*) FROM subscriptions
            WHERE plan = 'premium' AND status = 'active'
              AND (ends_at IS NULL OR ends_at > NOW()))::int                                              AS premium_users,
-        (SELECT COUNT(*) FROM tournament_photos)::int                                                    AS total_photos
+        (SELECT COUNT(*) FROM tournament_photos)::int                                                    AS total_photos,
+        (SELECT COUNT(*) FROM clubs)::int                                                                AS total_clubs,
+        (SELECT COUNT(*) FROM club_requests WHERE status = 'pending')::int                               AS pending_club_requests,
+        (SELECT COUNT(*) FROM club_claims WHERE status = 'pending')::int                                 AS pending_club_claims
     `;
     res.json(row);
   } catch (err) { next(err); }

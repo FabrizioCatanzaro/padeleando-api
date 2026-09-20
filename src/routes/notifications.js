@@ -19,6 +19,8 @@ router.get('/', requireAuth, async (req, res, next) => {
         a.name       AS actor_name,
         a.username   AS actor_username,
         a.avatar_url AS actor_avatar_url,
+        -- Para club_claim: si el actor es admin, la UI oculta su avatar y nombre
+        COALESCE(a.role = 'admin', false) AS actor_is_admin,
         CASE WHEN a.id IS NOT NULL THEN EXISTS(
           SELECT 1 FROM subscriptions s
           WHERE s.user_id = a.id AND s.plan = 'premium' AND s.status = 'active'
