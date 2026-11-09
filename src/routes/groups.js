@@ -7,6 +7,8 @@ import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
 import { parseSignupFields } from '../lib/signup.js';
 import { groupQuotaError } from '../lib/plan.js';
+import { comparePairRows } from '../lib/tournamentLogic.js';
+import { hasStarted } from '../lib/registrations.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
@@ -167,7 +169,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const sql = getDb();
     const [owner] = await sql`
       SELECT u.id, u.name, u.username, u.avatar_url, u.created_at, u.social_links, u.bio,
-             u.advanced_stats_public,
+             u.advanced_stats_public, u.category,
              EXISTS (
                SELECT 1 FROM subscriptions s
                WHERE s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
@@ -281,6 +283,14 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           JOIN tournament_players tp ON tp.player_id = p.id
           JOIN tournaments t ON t.id = tp.tournament_id AND t.group_id = g.id
           WHERE p.user_id = ${owner.id}
+            -- Otro que mira el perfil no se entera de un plantel que todavía
+            -- no se publicó (Fabri 2026-11-09).
+            AND (${isOwner}::boolean
+                 OR t.status = 'finished' OR t.bracket IS NOT NULL
+                 OR (jsonb_typeof(t.live_match) = 'array' AND jsonb_array_length(t.live_match) > 0)
+                 OR EXISTS (SELECT 1 FROM matches m WHERE m.tournament_id = t.id)
+                 OR (t.event_date IS NOT NULL
+                     AND (t.event_date + COALESCE(t.event_time, TIME '00:00')) AT TIME ZONE 'America/Argentina/Buenos_Aires' <= NOW()))
         )
       ORDER BY g.created_at DESC
     `,
@@ -345,7 +355,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       JOIN tournament_players tp ON tp.player_id = p.id
       JOIN tournaments t ON t.id = tp.tournament_id
       LEFT JOIN matches m ON m.tournament_id = tp.tournament_id
-        AND m.score1 <> m.score2
+        AND m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
@@ -357,7 +367,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         m.played_at::date::text AS day,
         COUNT(m.id)::int        AS partidos
       FROM players p
-      JOIN matches m ON m.score1 <> m.score2
+      JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
@@ -377,7 +387,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
           ELSE 0 END), 0)::int AS victorias
       FROM players p
-      JOIN matches m ON m.score1 <> m.score2
+      JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
@@ -400,7 +410,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           ELSE false
         END AS won
       FROM players p
-      JOIN matches m ON m.score1 <> m.score2
+      JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
@@ -477,7 +487,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           ELSE COALESCE(u1b.name, pb.name)
         END AS opp2_name
       FROM players p
-      JOIN matches m ON m.score1 <> m.score2
+      JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       JOIN tournaments t ON t.id = m.tournament_id
@@ -500,7 +510,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         (s.id IS NOT NULL)                 AS is_premium,
         COUNT(*)::int                      AS partidos_juntos
       FROM players p
-      JOIN matches m ON m.score1 <> m.score2
+      JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       JOIN players partner ON partner.id = (
@@ -577,7 +587,10 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           ELSE 0 END), 0)::int       AS pg,
         COALESCE(SUM(CASE
           WHEN (m.team1_p1 = pl.id OR m.team1_p2 = pl.id) THEN m.score1 - m.score2
-          ELSE m.score2 - m.score1 END), 0)::int AS diff
+          ELSE m.score2 - m.score1 END), 0)::int AS diff,
+        COALESCE(SUM(CASE
+          WHEN (m.team1_p1 = pl.id OR m.team1_p2 = pl.id) THEN m.score1
+          ELSE m.score2 END), 0)::int AS gf
       FROM tournaments t
       JOIN tournament_players tp ON tp.tournament_id = t.id
       JOIN players pl            ON pl.id = tp.player_id
@@ -605,7 +618,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
           ELSE 0 END), 0)::int AS victorias
       FROM players p
-      JOIN matches m ON m.score1 <> m.score2
+      JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       WHERE p.user_id = ${owner.id}
@@ -624,7 +637,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           ELSE 0 END), 0)::int AS victorias,
         COUNT(DISTINCT t.id)::int AS torneos
       FROM players p
-      JOIN matches m ON m.score1 <> m.score2
+      JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       JOIN tournaments t ON t.id = m.tournament_id
@@ -653,7 +666,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       JOIN users u ON u.id = circle.uid
       LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
       LEFT JOIN players p ON p.user_id = u.id
-      LEFT JOIN matches m ON m.score1 <> m.score2
+      LEFT JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
           OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
       GROUP BY u.id, u.name, u.username, u.avatar_url, s.id
@@ -942,7 +955,8 @@ router.get('/:groupId/history', async (req, res, next) => {
 
     const tournaments = await sql`
       SELECT t.id, t.name, t.created_at, t.status, t.mode, t.format, t.bracket,
-             t.event_date, t.club_id, c.name AS club_name, c.photo_url AS club_photo_url
+             t.event_date, t.event_time, t.live_match,
+             t.club_id, c.name AS club_name, c.photo_url AS club_photo_url
       FROM   tournaments t
       LEFT   JOIN clubs c ON c.id = t.club_id
       WHERE  t.group_id = ${groupId}
@@ -981,12 +995,18 @@ router.get('/:groupId/history', async (req, res, next) => {
 
     // tournament_id se agregó sólo para agrupar: no formaba parte del payload
     // que devolvía la versión anterior.
-    const result = tournaments.map((t) => ({
-      ...t,
-      players: (playersBy.get(t.id) ?? []).map(({ tournament_id, ...p }) => p),
-      matches: matchesBy.get(t.id) ?? [],
-      pairs:   pairsBy.get(t.id)   ?? [],
-    }));
+    // Historial público: el plantel de una jornada que todavía no empezó
+    // queda oculto (Fabri, 2026-11-09). Sin partidos, no suma a ninguna estadística.
+    const result = tournaments.map((t) => {
+      const matches = matchesBy.get(t.id) ?? [];
+      const hidden = !hasStarted(t, matches.length);
+      return {
+        ...t,
+        players: hidden ? [] : (playersBy.get(t.id) ?? []).map(({ tournament_id, ...p }) => p),
+        matches,
+        pairs:   hidden ? [] : pairsBy.get(t.id) ?? [],
+      };
+    });
 
     res.json(result);
   } catch (err) { next(err); }
@@ -1071,23 +1091,25 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
            claimableRows] = await Promise.all([
       finishedIds.length ? sql`
         SELECT tournament_id, player_id,
-               SUM(won)::int AS wins, SUM(diff)::int AS gdiff
+               SUM(won)::int AS wins, SUM(diff)::int AS gdiff,
+               SUM(gf)::int AS gf, COUNT(*)::int AS played
         FROM (
+          -- Un marcador igualado no es un partido válido: el front tampoco lo cuenta.
           SELECT tournament_id, team1_p1 AS player_id,
-                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END) AS won, score1 - score2 AS diff
-          FROM matches WHERE tournament_id = ANY(${finishedIds})
+                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END) AS won, score1 - score2 AS diff, score1 AS gf
+          FROM matches WHERE tournament_id = ANY(${finishedIds}) AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team1_p2,
-                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END), score1 - score2
-          FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team1_p2 IS NOT NULL
+                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END), score1 - score2, score1
+          FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team1_p2 IS NOT NULL AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team2_p1,
-                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1
-          FROM matches WHERE tournament_id = ANY(${finishedIds})
+                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2
+          FROM matches WHERE tournament_id = ANY(${finishedIds}) AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team2_p2,
-                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1
-          FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team2_p2 IS NOT NULL
+                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2
+          FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team2_p2 IS NOT NULL AND score1 <> score2
         ) sub WHERE player_id IS NOT NULL
         GROUP BY tournament_id, player_id
       ` : [],
@@ -1220,14 +1242,16 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
         const tWins = winsByT[t.id] ?? [];
         if (!tWins.length) continue;
-        const maxW    = Math.max(...tWins.map((w) => w.wins));
-        const topByW  = tWins.filter((w) => w.wins === maxW);
-        const maxD    = Math.max(...topByW.map((w) => w.gdiff));
-        const topList = topByW.filter((w) => w.gdiff === maxD);
+        // Mismo desempate que la tabla: victorias, diferencia, % de victorias,
+        // games a favor (comparePairRows / compareStandingRows del front).
+        const asRow   = (w) => ({ wins: w.wins, diff: w.gdiff, played: w.played, gf: w.gf, pair_id: '' });
+        const sorted  = [...tWins].sort((a, b) => comparePairRows(asRow(a), asRow(b)));
+        const topList = sorted.filter((w) => comparePairRows(asRow(w), asRow(sorted[0])) === 0);
         const topIds  = new Set(topList.map((w) => w.player_id));
 
         if (t.mode === 'pairs') {
-          const tPairs      = allPairs.filter((p) => p.tournament_id === t.id);
+          // Una pareja retirada no puede salir campeona.
+          const tPairs      = allPairs.filter((p) => p.tournament_id === t.id && p.status !== 'withdrawn');
           const winnerPairs = tPairs.filter((p) => topIds.has(p.p1_id) && topIds.has(p.p2_id));
           t.winner_label = winnerPairs.length
             ? winnerPairs.map((p) => `${nameById[p.p1_id] ?? '?'} & ${nameById[p.p2_id] ?? '?'}`).join(' / ')
@@ -1249,6 +1273,20 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
 
     const can_manage = is_owner || (!!viewerId && collaborators.some((c) => c.user_id === viewerId));
     const pending_transfer = transferRows[0] ?? null;
+
+    // Quien no organiza no ve el cupo ni, antes de que empiece la jornada,
+    // cuántos jugadores o parejas tiene (Fabri 2026-11-09).
+    if (!can_manage) {
+      for (const t of tournaments) {
+        delete t.signup_capacity;
+        delete t.signup_capacity_unit;
+        if (!hasStarted(t, t.match_count)) {
+          t.player_count = null;
+          t.pair_count = null;
+          t.roster_hidden = true;
+        }
+      }
+    }
 
     res.json({
       ...group, tournaments,
@@ -1325,13 +1363,16 @@ router.post('/', requireAuth, async (req, res, next) => {
     const [group] = await sql`
       INSERT INTO groups (id, name, description, user_id, is_public, emojis, location_name, place_id, lat, lon,
                           club_id, pending_club_request_id,
-                          signup_open, signup_price, signup_price_unit, signup_contacts)
+                          signup_open, signup_price, signup_price_unit, signup_contacts, level,
+                          signup_capacity, signup_capacity_unit, signup_closes_at)
       VALUES (${uid()}, ${name.trim()}, ${description ?? null}, ${req.user.id}, ${is_public}, ${emojis},
               ${location_name ?? null}, ${place_id ?? null}, ${lat ?? null}, ${lon ?? null},
               ${club_id ?? null}, ${pending_club_request_id ?? null},
               ${signup.signup_open ?? null}, ${signup.signup_price ?? null},
               ${signup.signup_price_unit ?? null},
-              ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb)
+              ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb,
+              ${signup.level ?? null},
+              ${signup.signup_capacity ?? null}, ${signup.signup_capacity_unit ?? null}, ${signup.signup_closes_at ?? null})
       RETURNING *
     `;
     res.status(201).json(group);
@@ -1372,7 +1413,11 @@ router.put('/:groupId', requireAuth, async (req, res, next) => {
           signup_open       = CASE WHEN ${'signup_open'       in signup}::boolean THEN ${signup.signup_open       ?? null} ELSE signup_open END,
           signup_price      = CASE WHEN ${'signup_price'      in signup}::boolean THEN ${signup.signup_price      ?? null} ELSE signup_price END,
           signup_price_unit = CASE WHEN ${'signup_price_unit' in signup}::boolean THEN ${signup.signup_price_unit ?? null} ELSE signup_price_unit END,
-          signup_contacts   = CASE WHEN ${'signup_contacts'   in signup}::boolean THEN ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb ELSE signup_contacts END
+          signup_contacts   = CASE WHEN ${'signup_contacts'   in signup}::boolean THEN ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb ELSE signup_contacts END,
+          level             = CASE WHEN ${'level'             in signup}::boolean THEN ${signup.level             ?? null} ELSE level END,
+          signup_capacity      = CASE WHEN ${'signup_capacity'      in signup}::boolean THEN ${signup.signup_capacity      ?? null}::int ELSE signup_capacity END,
+          signup_capacity_unit = CASE WHEN ${'signup_capacity_unit' in signup}::boolean THEN ${signup.signup_capacity_unit ?? null} ELSE signup_capacity_unit END,
+          signup_closes_at     = CASE WHEN ${'signup_closes_at'     in signup}::boolean THEN ${signup.signup_closes_at     ?? null}::timestamptz ELSE signup_closes_at END
       WHERE id = ${req.params.groupId} RETURNING *
     `;
     res.json(updated);

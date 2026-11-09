@@ -51,3 +51,20 @@ export function buildFacedMap(rows = []) {
   }
   return out;
 }
+
+/**
+ * Error si alguno de los dos equipos es una pareja retirada: ya no juega, ni
+ * partidos nuevos ni programados.
+ * @returns {Promise<string|null>}
+ */
+export async function withdrawnTeamError(sql, tournamentId, team1, team2) {
+  const rows = await sql`
+    SELECT p1_id, p2_id FROM pairs
+    WHERE tournament_id = ${tournamentId} AND status = 'withdrawn'
+  `;
+  const retiradas = new Set(rows.map((r) => pairKey([r.p1_id, r.p2_id])));
+  if (retiradas.has(pairKey(team1)) || retiradas.has(pairKey(team2))) {
+    return 'Esa pareja se retiró del torneo';
+  }
+  return null;
+}

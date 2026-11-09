@@ -18,6 +18,7 @@ import readonlyRouter    from './routes/readonly.js';
 import authRouter        from './routes/auth.js';
 import invitationsRouter    from './routes/invitations.js';
 import joinRequestsRouter   from './routes/join-requests.js';
+import registrationsRouter from './routes/registrations.js';
 import collaboratorsRouter  from './routes/collaborators.js';
 import subscriptionsRouter  from './routes/subscriptions.js';
 import photosRouter         from './routes/photos.js';
@@ -100,6 +101,8 @@ const NEVER_STORE = [
   '/api/notifications',
   '/api/invitations',
   '/api/emails',
+  // Inscripciones: llevan teléfonos y datos por usuario
+  '/api/registrations',
   // "Mis reservas" es privado por jugador: nunca en caché compartida
   '/api/bookings',
   // Sub-rutas solo-admin de /api/clubs: sin esto las tomaba el caché público de /api/clubs
@@ -144,6 +147,7 @@ app.use('/api/pairs',       pairsRouter);
 app.use('/api/readonly',    readonlyRouter);
 app.use('/api/invitations',    invitationsRouter);
 app.use('/api/join-requests',  joinRequestsRouter);
+app.use('/api/registrations',  registrationsRouter);
 app.use('/api/follows',        followsRouter);
 app.use('/api/notifications',  notificationsRouter);
 app.use('/api/subscriptions', subscriptionsRouter);

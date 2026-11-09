@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { getDb }  from '../db.js';
 import { resolveSignup } from '../lib/signup.js';
+import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations.js';
  
 const router = Router();
  
@@ -34,7 +35,11 @@ router.get('/:tournamentId', async (req, res, next) => {
              g.signup_open       AS group_signup_open,
              g.signup_price      AS group_signup_price,
              g.signup_price_unit AS group_signup_price_unit,
-             g.signup_contacts   AS group_signup_contacts
+             g.signup_contacts   AS group_signup_contacts,
+             g.level             AS group_level,
+             g.signup_capacity      AS group_signup_capacity,
+             g.signup_capacity_unit AS group_signup_capacity_unit,
+             g.signup_closes_at     AS group_signup_closes_at
       FROM   tournaments t
       JOIN   groups g ON g.id = t.group_id
       JOIN   users  u ON u.id = g.user_id
@@ -56,7 +61,7 @@ router.get('/:tournamentId', async (req, res, next) => {
     const scheduled = await sql`
       SELECT * FROM scheduled_matches
       WHERE tournament_id = ${tournamentId}
-      ORDER BY scheduled_at NULLS LAST, position, created_at
+      ORDER BY scheduled_at NULLS LAST, round NULLS LAST, position, created_at
     `;
  
     // Canonical player list from tournament_players table
@@ -95,6 +100,8 @@ router.get('/:tournamentId', async (req, res, next) => {
       ...extraPlayers.map((p) => ({ ...p, removed: true })),
     ];
  
+    const rosterHidden = !hasStarted(tournament, matches.length);
+
     res.json({
       id:             tournament.id,
       name:           tournament.name,
@@ -123,16 +130,22 @@ router.get('/:tournamentId', async (req, res, next) => {
       club_courts:         tournament.club_courts ?? null,
       bracket:        tournament.bracket ?? null,
       // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
-      signup: resolveSignup(tournament, {
+      signup: publicSignup(resolveSignup(tournament, {
         signup_open:       tournament.group_signup_open,
         signup_price:      tournament.group_signup_price,
         signup_price_unit: tournament.group_signup_price_unit,
         signup_contacts:   tournament.group_signup_contacts,
-      }, tournament.owner_social_links),
-      players,
-      pairs,
+        level:             tournament.group_level,
+        signup_capacity:      tournament.group_signup_capacity,
+        signup_capacity_unit: tournament.group_signup_capacity_unit,
+        signup_closes_at:     tournament.group_signup_closes_at,
+      }, tournament.owner_social_links), { format: tournament.format, used: await countUsedPlayers(sql, tournamentId) }),
+      // El plantel queda oculto hasta que empieza el torneo (Fabri, 2026-11-09).
+      players:           rosterHidden ? [] : players,
+      pairs:             rosterHidden ? [] : pairs,
       matches,
-      scheduled_matches: scheduled,
+      scheduled_matches: rosterHidden ? [] : scheduled,
+      roster_hidden:     rosterHidden,
     });
   } catch (err) { next(err); }
 });

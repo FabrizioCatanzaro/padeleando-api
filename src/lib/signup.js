@@ -1,4 +1,7 @@
-// Los mismos cuatro campos viven en groups y en tournaments; NULL = heredar.
+// Los mismos campos viven en groups y en tournaments; NULL = heredar.
+// `level` (categoría del torneo, ver lib/category.js) viaja con la inscripción
+// porque se configura en el mismo lugar y se hereda igual.
+import { parseLevel } from './category.js';
 
 export const CONTACT_TYPES = ['whatsapp', 'phone', 'email', 'instagram'];
 
@@ -64,6 +67,38 @@ export function parseSignupFields(body) {
     }
   }
 
+  if ('level' in body) {
+    try { out.level = parseLevel(body.level); }
+    catch (e) { throw new SignupError(e.message); }
+  }
+
+  // Cupo de la inscripción: cantidad + si cuenta parejas o jugadores.
+  if ('signup_capacity' in body) {
+    const v = body.signup_capacity;
+    if (v === null || v === '') out.signup_capacity = null;
+    else {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1 || n > 512) throw new SignupError('El cupo debe ser un número entero entre 1 y 512');
+      out.signup_capacity = n;
+    }
+  }
+  if ('signup_capacity_unit' in body) {
+    const v = body.signup_capacity_unit;
+    if (v === null || v === '') out.signup_capacity_unit = null;
+    else if (v !== 'pair' && v !== 'player') throw new SignupError('signup_capacity_unit debe ser "pair" o "player"');
+    else out.signup_capacity_unit = v;
+  }
+  // Cierre automático de la inscripción: fecha y hora ISO, o null.
+  if ('signup_closes_at' in body) {
+    const v = body.signup_closes_at;
+    if (v === null || v === '') out.signup_closes_at = null;
+    else {
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) throw new SignupError('La fecha de cierre no es válida');
+      out.signup_closes_at = d.toISOString();
+    }
+  }
+
   return out;
 }
 
@@ -99,6 +134,10 @@ export function resolveSignup(tournament, group, ownerSocialLinks = null) {
     price:    pick('signup_price'),
     unit:     pick('signup_price_unit') ?? 'player',
     contacts: mergeContacts(profileContacts(ownerSocialLinks), pick('signup_contacts') ?? []),
+    level:    pick('level'),
+    capacity:      pick('signup_capacity'),
+    capacity_unit: pick('signup_capacity_unit') ?? 'pair',
+    closes_at:     pick('signup_closes_at'),
   };
 }
 

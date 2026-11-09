@@ -1,6 +1,7 @@
 // Helpers del perfil público (GET /groups/user/:username). Los partidos de la
 // fase eliminatoria viven en tournaments.bracket (JSONB), no en la tabla
 // matches: acá se expanden para que el perfil mida lo mismo que el torneo.
+import { comparePairRows } from './tournamentLogic.js';
 
 const ROUNDS = ['octavos', 'cuartos', 'semis'];
 
@@ -44,6 +45,8 @@ export function expandBracketMatches(rows) {
     for (const m of matches) {
       if (m.winner_id == null || m.pair1_id == null || m.pair2_id == null) continue;
       if (m.score1 == null || m.score2 == null) continue;
+      // Un W.O. no se jugó: no cuenta en las estadísticas del jugador.
+      if (m.walkover) continue;
 
       const p1 = pairById[String(m.pair1_id)];
       const p2 = pairById[String(m.pair2_id)];
@@ -109,12 +112,14 @@ export function countLeagueTitles(rows) {
     (byTournament[r.tournament_id] ??= []).push(r);
   }
 
+  // Mismo desempate que la tabla de la jornada (comparePairRows): victorias,
+  // diferencia, % de victorias, games a favor. Empatados en todo, comparten título.
+  const asRow = (p) => ({ wins: p.pg, diff: p.diff, played: p.pj, gf: p.gf ?? 0, pair_id: '' });
   let titles = 0;
   for (const players of Object.values(byTournament)) {
-    const topPg   = Math.max(...players.map((p) => p.pg));
-    if (topPg <= 0) continue;
-    const topDiff = Math.max(...players.filter((p) => p.pg === topPg).map((p) => p.diff));
-    const won = players.some((p) => p.mine && p.pg === topPg && p.diff === topDiff);
+    const sorted = [...players].sort((a, b) => comparePairRows(asRow(a), asRow(b)));
+    if (sorted[0].pg <= 0) continue;
+    const won = sorted.some((p) => p.mine && comparePairRows(asRow(p), asRow(sorted[0])) === 0);
     if (won) titles++;
   }
   return titles;
@@ -271,6 +276,7 @@ export function bracketStatsByUser(rows) {
     ];
     for (const m of matches) {
       if (m.winner_id == null || m.pair1_id == null || m.pair2_id == null) continue;
+      if (m.walkover) continue;
       for (const pairId of [m.pair1_id, m.pair2_id]) {
         const pair = pairById[String(pairId)];
         if (!pair) continue;

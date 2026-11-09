@@ -1,7 +1,22 @@
 import { Router } from 'express';
-import { getDb } from '../db.js';
+import { getDb, withTransaction } from '../db.js';
 import { uid } from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
+import { canManageGroup } from '../lib/access.js';
+
+// Las solicitudes las resuelve cualquiera que gestione la categoría: el dueño o
+// un co-organizador. Antes sólo el dueño, y si no estaba en el club el
+// ayudante no podía aceptar a nadie.
+
+/** Dueño y co-organizadores de una categoría: los que reciben el aviso. */
+async function groupManagers(sql, groupId) {
+  const rows = await sql`
+    SELECT user_id FROM groups WHERE id = ${groupId}
+    UNION
+    SELECT user_id FROM group_collaborators WHERE group_id = ${groupId}
+  `;
+  return rows.map((r) => r.user_id);
+}
 
 const router = Router();
 
@@ -14,14 +29,17 @@ router.post('/', requireAuth, async (req, res, next) => {
     const sql = getDb();
 
     const [tournament] = await sql`
-      SELECT t.id, t.name, t.status, g.user_id AS owner_id
+      SELECT t.id, t.name, t.status, t.group_id, g.user_id AS owner_id
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
       WHERE t.id = ${tournamentId}
     `;
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
-    if (tournament.owner_id === req.user.id) {
-      return res.status(409).json({ error: 'Sos el organizador de este torneo' });
+    if (await canManageGroup(sql, req.user.id, tournament.group_id)) {
+      return res.status(409).json({ error: 'Sos organizador de este torneo' });
+    }
+    if (tournament.status === 'finished') {
+      return res.status(400).json({ error: 'El torneo ya terminó' });
     }
 
     const [alreadyPlayer] = await sql`
@@ -64,9 +82,17 @@ router.post('/', requireAuth, async (req, res, next) => {
       RETURNING *
     `;
 
+    // El aviso le llega a cada uno de los que pueden resolverla.
+    const managers = await groupManagers(sql, tournament.group_id);
     await sql`
       INSERT INTO notifications (id, user_id, type, actor_id, entity_id)
-      VALUES (${uid()}, ${tournament.owner_id}, 'join_request', ${req.user.id}, ${joinRequest.id})
+      SELECT * FROM UNNEST(
+        ${managers.map(() => uid())}::text[],
+        ${managers}::text[],
+        ${managers.map(() => 'join_request')}::text[],
+        ${managers.map(() => req.user.id)}::text[],
+        ${managers.map(() => joinRequest.id)}::text[]
+      )
     `;
 
     res.status(201).json(joinRequest);
@@ -83,7 +109,10 @@ router.get('/my-status/:tournamentId', requireAuth, async (req, res, next) => {
     // Ninguna de las cuatro depende del resultado de otra: un solo round-trip.
     const [[tournament], [alreadyPlayer], [request], [invitation]] = await Promise.all([
       sql`
-        SELECT g.user_id AS owner_id FROM tournaments t
+        SELECT g.user_id AS owner_id,
+               EXISTS (SELECT 1 FROM group_collaborators gc
+                       WHERE gc.group_id = g.id AND gc.user_id = ${req.user.id}) AS is_collab
+        FROM tournaments t
         JOIN groups g ON g.id = t.group_id
         WHERE t.id = ${tournamentId}
       `,
@@ -121,6 +150,8 @@ router.get('/my-status/:tournamentId', requireAuth, async (req, res, next) => {
     res.json({
       is_player: !!alreadyPlayer,
       is_owner: tournament?.owner_id === req.user.id,
+      // Dueño o co-organizador: a ninguno de los dos se le ofrece "unirse".
+      can_manage: tournament?.owner_id === req.user.id || !!tournament?.is_collab,
       request: request ?? null,
       invitation: invitation ?? null
     });
@@ -136,7 +167,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       SELECT tjr.*,
         u.name AS requester_name, u.username AS requester_username,
         rp.name AS requested_player_name,
-        t.name AS tournament_name, t.id AS tournament_id, g.user_id AS owner_id
+        t.name AS tournament_name, t.id AS tournament_id, t.group_id, g.user_id AS owner_id
       FROM tournament_join_requests tjr
       JOIN users u ON u.id = tjr.user_id
       LEFT JOIN players rp ON rp.id = tjr.requested_player_id
@@ -145,7 +176,9 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       WHERE tjr.id = ${req.params.id}
     `;
     if (!request) return res.status(404).json({ error: 'Solicitud no encontrada' });
-    if (request.owner_id !== req.user.id) return res.status(403).json({ error: 'No autorizado' });
+    if (!(await canManageGroup(sql, req.user.id, request.group_id))) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
 
     const unlinkedPlayers = await sql`
       SELECT p.id, p.name
@@ -159,8 +192,10 @@ router.get('/:id', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// PATCH /api/join-requests/:id — organizador acepta o rechaza
+// PATCH /api/join-requests/:id — el dueño o un co-organizador acepta o rechaza
 // Body: { action: 'accept' | 'reject', playerId? }
+// Va en una transacción que toma la solicitud con un UPDATE condicional: con
+// varios organizadores, dos que la resuelven a la vez no la procesan dos veces.
 router.patch('/:id', requireAuth, async (req, res, next) => {
   try {
     const { action } = req.body;
@@ -169,17 +204,16 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
     }
 
     const sql = getDb();
-
     const [request] = await sql`
-      SELECT tjr.*, g.user_id AS owner_id
+      SELECT tjr.*, t.group_id
       FROM tournament_join_requests tjr
       JOIN tournaments t ON t.id = tjr.tournament_id
-      JOIN groups g ON g.id = t.group_id
       WHERE tjr.id = ${req.params.id}
     `;
     if (!request) return res.status(404).json({ error: 'Solicitud no encontrada' });
-    if (request.status !== 'pending') return res.status(409).json({ error: 'La solicitud ya fue procesada' });
-    if (request.owner_id !== req.user.id) return res.status(403).json({ error: 'No autorizado' });
+    if (!(await canManageGroup(sql, req.user.id, request.group_id))) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
 
     // El jugador a vincular: el que el organizador elija, o el que pidió el solicitante.
     const playerId = req.body.playerId ?? request.requested_player_id;
@@ -187,49 +221,59 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
       return res.status(400).json({ error: 'playerId requerido para aceptar' });
     }
 
-    if (action === 'accept') {
-      const [player] = await sql`
-        SELECT p.id, p.user_id FROM players p
-        INNER JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${request.tournament_id}
-        WHERE p.id = ${playerId}
-      `;
-      if (!player) return res.status(404).json({ error: 'Jugador no encontrado en el torneo' });
-      if (player.user_id) return res.status(409).json({ error: 'El jugador ya está vinculado a una cuenta' });
+    const result = await withTransaction(async (client) => {
+      const { rows: [claimed] } = await client.query(
+        `UPDATE tournament_join_requests
+         SET status = $2, player_id = $3
+         WHERE id = $1 AND status = 'pending'
+         RETURNING *`,
+        [req.params.id, action === 'accept' ? 'accepted' : 'rejected', action === 'accept' ? playerId : null]
+      );
+      if (!claimed) return { status: 409, error: 'La solicitud ya fue procesada' };
+      if (action === 'reject') return { updated: claimed };
+
+      const { rows: [player] } = await client.query(
+        `SELECT p.id, p.user_id FROM players p
+         JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = $1
+         WHERE p.id = $2 FOR UPDATE OF p`,
+        [request.tournament_id, playerId]
+      );
+      if (!player) throw httpError(404, 'Jugador no encontrado en el torneo');
+      if (player.user_id) throw httpError(409, 'El jugador ya está vinculado a una cuenta');
 
       // Una cuenta no puede tener dos slots en la misma categoría.
-      const [linked] = await sql`
-        SELECT p.name
-        FROM   players p
-        JOIN   group_players gp ON gp.player_id = p.id
-        JOIN   tournaments t ON t.group_id = gp.group_id AND t.id = ${request.tournament_id}
-        WHERE  p.user_id = ${request.user_id} AND p.id != ${playerId}
-        LIMIT  1
-      `;
-      if (linked) {
-        return res.status(409).json({
-          error: `Este usuario ya juega en la categoría como "${linked.name}"`,
-        });
-      }
+      const { rows: [linked] } = await client.query(
+        `SELECT p.name FROM players p
+         JOIN group_players gp ON gp.player_id = p.id AND gp.group_id = $1
+         WHERE p.user_id = $2 AND p.id <> $3
+         LIMIT 1`,
+        [request.group_id, request.user_id, playerId]
+      );
+      if (linked) throw httpError(409, `Este usuario ya juega en la categoría como "${linked.name}"`);
 
-      const [user] = await sql`SELECT name FROM users WHERE id = ${request.user_id}`;
+      await client.query(
+        `UPDATE players SET user_id = $1,
+                name = (SELECT name FROM users WHERE id = $1),
+                original_name = COALESCE(original_name, name)
+         WHERE id = $2`,
+        [request.user_id, playerId]
+      );
+      return { updated: claimed };
+    });
 
-      await sql`
-        UPDATE players SET user_id = ${request.user_id}, name = ${user.name},
-               original_name = COALESCE(original_name, name)
-        WHERE id = ${playerId}
-      `;
-    }
-
-    const [updated] = await sql`
-      UPDATE tournament_join_requests
-      SET status   = ${action === 'accept' ? 'accepted' : 'rejected'},
-          player_id = ${action === 'accept' ? playerId : null}
-      WHERE id = ${req.params.id}
-      RETURNING *
-    `;
-
-    res.json(updated);
-  } catch (err) { next(err); }
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    res.json(result.updated);
+  } catch (err) {
+    // Los rechazos dentro de la transacción la deshacen: la solicitud vuelve a pendiente.
+    if (err.httpStatus) return res.status(err.httpStatus).json({ error: err.message });
+    next(err);
+  }
 });
+
+function httpError(status, message) {
+  const err = new Error(message);
+  err.httpStatus = status;
+  return err;
+}
 
 export default router;
