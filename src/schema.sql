@@ -663,3 +663,18 @@ CREATE INDEX IF NOT EXISTS idx_registrations_p2         ON tournament_registrati
 CREATE UNIQUE INDEX IF NOT EXISTS uq_registrations_active_p1
   ON tournament_registrations(tournament_id, p1_user_id)
   WHERE status IN ('pending', 'approved', 'waitlist');
+
+-- Posts de Instagram en la galería del torneo (2026-11-09). El organizador
+-- pega el link de un post público y la app lo muestra embebido. Premium del
+-- dueño de la categoría, como las fotos. Ver lib/instagram.js.
+CREATE TABLE IF NOT EXISTS tournament_instagram_posts (
+  id            TEXT PRIMARY KEY,
+  tournament_id TEXT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL CHECK (kind IN ('p', 'reel', 'tv')),
+  shortcode     TEXT NOT NULL,
+  url           TEXT NOT NULL,
+  created_by    TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tournament_id, shortcode)
+);
+CREATE INDEX IF NOT EXISTS idx_instagram_posts_tournament ON tournament_instagram_posts(tournament_id, created_at);
