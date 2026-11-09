@@ -16,7 +16,7 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 - **Google OAuth** (`google-auth-library`) as an alternative login
 - **Cloudinary** for avatars, tournament photos and club photos (`multer` memory storage)
 - **Resend** for transactional email, with **React Email** templates in `src/emails/`
-- **Mercado Pago** preapprovals for the Premium subscription
+- **Mercado Pago** preapprovals for the Premium subscription, plus an OAuth Connect flow so a club can link its own MP account and collect booking payments
 - `express-rate-limit`, `compression`, `morgan`, `cors`, `cookie-parser`
 
 ---
@@ -26,12 +26,13 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 ```bash
 npm run dev                              # tsx watch src/index.js → http://localhost:3001
 npm start                                # same, no watch (what Render runs)
-npm run db:init                          # apply src/schema.sql (idempotent) — runs on every deploy
+npm run db:init                          # apply src/schema_base.sql + src/schema.sql (idempotent) — runs on every deploy
+node scripts/dump-schema.mjs             # regenerate src/schema_base.sql from the live DB (read-only)
 npm run db:migrate -- src/migration_x.sql  # apply a single loose .sql file
 npm run email                            # React Email preview server (also port 3001 — stop the API first)
 ```
 
-There is **no test suite and no linter** in this repo. Verify changes by running the API and driving the real frontend (the `run-app` skill in the frontend repo boots both).
+There is **no linter** in this repo. `npm test` runs the unit tests in `test/` (`node:test`, no dependencies); today they cover `src/lib/tournamentLogic.js` — the previa schedule, the pair standings and the americano bracket. Everything else is verified by running the API and driving the real frontend (the `run-app` skill in the frontend repo boots both).
 
 ---
 
@@ -50,7 +51,10 @@ There is **no test suite and no linter** in this repo. Verify changes by running
 | `RESEND_WEBHOOK_SECRET` / `INBOUND_FORWARD_TO` / `INBOUND_FORWARD_FROM` | Inbound email webhook (`/api/emails/webhook`) |
 | `SURVEY_URL` | Link in the account-deletion goodbye email (falls back to `FRONTEND_URL`) |
 | `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Image uploads |
-| `MP_ACCESS_TOKEN` | Mercado Pago |
+| `MP_ACCESS_TOKEN` | Mercado Pago — platform's own token (subscriptions, and reading payments made through connected clubs) |
+| `MP_CLIENT_ID` / `MP_CLIENT_SECRET` | Mercado Pago Application (OAuth Connect), for clubs linking their own MP account |
+| `MP_CONNECT_REDIRECT_URI` | Must exactly match a redirect URI registered on that MP Application; MP calls back here with `?code&state` |
+| `API_PUBLIC_URL` | This API's own public base URL, used as the `notification_url` MP calls for booking payments |
 | `NODE_ENV` | `production` toggles secure cookies, `sameSite: 'none'` and the `combined` log format |
 
 ---
@@ -62,11 +66,13 @@ src/
   index.js          app wiring: CORS, compression, cache policy, router mounts, error handler
   db.js             getDb() HTTP driver · getPool() WebSocket · withTransaction()
   uid.js            uid() — 7-char base36 id used as PK everywhere (ids are TEXT, not serial)
-  schema.sql        full idempotent schema, applied on every deploy
+  schema_base.sql   full schema generated from production (scripts/dump-schema.mjs); creates a fresh DB
+  schema.sql        incremental idempotent changes; db:init applies schema_base.sql then schema.sql on every deploy
   migration_*.sql   loose migrations (historical; most are already folded into schema.sql)
   routes/           one router per resource, mounted under /api/<name>
   middleware/       auth.js · access.js · requirePremium.js · upload.js
   lib/              access.js · plan.js · profileStats.js · signup.js · richText.js
+                    tournamentLogic.js (previa, tabla de parejas, cuadro — pura, con tests)
                     cloudinary.js · deleteUser.js
   emails/           React Email templates (Layout, Welcome, VerifyEmail, ResetPassword,
                     Goodbye, AdminBroadcast)
@@ -127,6 +133,11 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - **Signup info (`signup_*`) is inherited field by field** from category to jornada: `NULL` means inherit, a value overrides. `lib/signup.js#parseSignupFields` only touches keys present in the body, so `undefined` leaves the field alone while `null` restores inheritance.
 - **Deleting a user reassigns, it doesn't cascade.** `lib/deleteUser.js` moves their groups to the `deleted-account` ghost user so tournaments, matches and photos survive and the `INNER JOIN users` in group queries keeps working.
 - **Advanced profile stats are gated server-side.** `GET /groups/user/:username` returns them only to the owner, or to anyone when a premium user set `users.advanced_stats_public`. The queries that feed only that block are skipped entirely when it won't render — don't put those fields back into the public payload.
+- **Booking payments (Mercado Pago Connect) are gated on the club OWNER's premium**, same rule as everywhere else — `GET/DELETE /clubs/:id/mercadopago/*` check `subscriptions` for `clubs.owner_id`, never `req.user.id`. Booking *management* (approve/reject/manual block) stays free for every owner; only *linking MP to collect payment automatically* is Premium.
+- **Two separate Mercado Pago identities.** `MP_ACCESS_TOKEN` is the platform's own account (subscriptions). `clubs.mp_access_token`/`mp_refresh_token` are each club's OWN account, obtained via OAuth Connect (`MP_CLIENT_ID`/`MP_CLIENT_SECRET`) and used only to create that club's booking `Preference`. Never mix the two up.
+- **The booking-payment webhook reads with the platform's token, not the club's.** `POST /clubs/mercadopago/webhook` doesn't know which club a payment belongs to until it fetches it, so it fetches with `platformMp` (the OAuth application can read payments made through the accounts it connected) and only afterward looks up the booking by `payment.external_reference` (= the booking's `group_id`).
+- **`auto_return` on the booking `Preference` needs a real https `FRONTEND_URL`.** Mercado Pago rejects the whole preference (`auto_return invalid. back_url.success must be defined`) when `back_urls.success` isn't a reachable https URL — it happens with a plain `http://localhost` `FRONTEND_URL`, same family of restriction as the OAuth Connect `redirect_uri`. `POST /:id/bookings` only sends `auto_return: 'approved'` when `FRONTEND_URL` starts with `https://`; on `http` it still creates the preference and returns `checkout_url`, the payer just doesn't get auto-redirected back after paying.
+- **A club without Mercado Pago linked is unaffected.** `POST /clubs/:id/bookings` only creates a `Preference` when `clubs.mp_access_token` is set AND the court has a price; otherwise it's the exact same manual pending → owner approves/rejects flow as before. A payment failure while creating the preference falls back to the manual flow instead of failing the booking.
 
 ### HTTP behavior
 
@@ -172,6 +183,8 @@ When touching an endpoint, **diff the response against the previous code with ke
 - **Don't count matches without expanding the americano bracket** — knockout matches aren't rows in `matches`.
 - **Don't fetch players without `LEFT JOIN users … AS linked_name`** — the client resolves display names from it.
 - **Don't gate plan limits on the acting user** — always the category owner.
+- **Don't confuse `MP_ACCESS_TOKEN` (platform) with a club's own `mp_access_token`** — a club's Preference must be created with ITS OWN token, or the payment lands in the platform's account instead of the club's.
+- **Don't gate booking management behind Premium** — that stays free for every owner. Only linking Mercado Pago to collect payment automatically is Premium.
 - **Don't let co-organizers edit/delete a category, transfer it, or manage co-organizers** — those are `is_owner` only.
 - **Don't trust the JWT for `role`** — `requireAdmin` re-reads it from the database.
 - **Don't add a schema change only as a loose `migration_*.sql`** — it must be in `schema.sql` or it never reaches production.

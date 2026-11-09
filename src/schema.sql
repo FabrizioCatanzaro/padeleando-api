@@ -395,7 +395,7 @@ ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
   CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
                   'collab_invite','ownership_transfer','ownership_received','premium_claim',
                   'player_unlinked','new_tournament','club_claim','booking_decided','booking_requested',
-                  'booking_cancelled'));
+                  'booking_cancelled','registration_received','registration_decided','registration_partner'));
 
 -- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
 -- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
@@ -568,3 +568,98 @@ ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS price_60 NUMERIC(10,2);
 -- Backfill idempotente: precio de 60 igual al viejo y el de 30 la mitad; el dueño lo corrige
 UPDATE club_courts SET price_60 = price, price_30 = ROUND(price / 2, 2)
 WHERE price_60 IS NULL AND price IS NOT NULL;
+
+-- Mercado Pago Connect por club (Premium): el dueño vincula su propia cuenta
+-- para cobrar reservas desde la app. Tokens de la cuenta del CLUB, no de la
+-- plataforma (eso es MP_ACCESS_TOKEN, para las suscripciones).
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_user_id       TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_access_token  TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_refresh_token TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_public_key    TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_connected_at  TIMESTAMPTZ;
+
+-- Estado del cobro de una reserva cuando el club tiene Mercado Pago vinculado.
+-- NULL = el club no cobra online (flujo manual de siempre).
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_status TEXT
+  CHECK (payment_status IS NULL OR payment_status IN ('pending', 'approved', 'rejected'));
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS mp_preference_id TEXT;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS mp_payment_id    TEXT;
+
+-- Ronda del calendario de la previa (americano). POST /tournaments/:id/schedule
+-- guarda el calendario generado como partidos programados con su ronda, para
+-- que los jugadores lo vean. NULL = programado a mano, sin ronda.
+ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS round INTEGER;
+
+-- Bajas de parejas (2026-11-08). Una pareja retirada no se borra: su historia
+-- cuenta en la tabla. Sus partidos programados pasan a W.O. 6-0 para el rival
+-- (matches.walkover) y en el cuadro sus cruces se resuelven solos por W.O.
+ALTER TABLE pairs ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+  CHECK (status IN ('active', 'withdrawn'));
+ALTER TABLE pairs ADD COLUMN IF NOT EXISTS withdrawn_at TIMESTAMPTZ;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS walkover BOOLEAN NOT NULL DEFAULT false;
+
+-- Categoría de juego (2026-11-09): rama C (Caballeros) o D (Damas) + número
+-- del 1 (nivel más alto) al 10. users.category = la que declara el jugador;
+-- groups.level / tournaments.level = la del torneo (NULL en la jornada =
+-- hereda la de la categoría del organizador). La inscripción la usa para
+-- marcar a los jugadores excedidos de nivel.
+ALTER TABLE users       ADD COLUMN IF NOT EXISTS category TEXT CHECK (category IS NULL OR category ~ '^[CD]([1-9]|10)$');
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS level    TEXT;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS level    TEXT;
+-- Categoría del torneo: C7 / D5 (fija), M6 (mixto de categoría) o SUMA:
+-- SC11 / SD11 / SM11 (caballeros, damas, mixto). Ver lib/category.js.
+ALTER TABLE groups      DROP CONSTRAINT IF EXISTS groups_level_check;
+ALTER TABLE groups      ADD  CONSTRAINT groups_level_check
+  CHECK (level IS NULL OR level ~ '^([CDM]([1-9]|10)|S[CDM]([89]|1[0-5]))$');
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_level_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_level_check
+  CHECK (level IS NULL OR level ~ '^([CDM]([1-9]|10)|S[CDM]([89]|1[0-5]))$');
+
+-- Puntaje del cuestionario de nivel (1.0 a 8.0). Se guarda junto con la
+-- categoría que el jugador confirmó; NULL si la eligió directo.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS level_score NUMERIC(2,1) CHECK (level_score IS NULL OR level_score BETWEEN 1.0 AND 8.0);
+
+-- Inscripción a torneos (2026-11-09). Ver el documento "Diseño: inscripción a
+-- torneos". Una fila por inscripción: individual (solo) o con pareja (pair).
+-- Al aprobarla se crean o reutilizan los jugadores y, si corresponde, la pareja.
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_capacity      INTEGER CHECK (signup_capacity IS NULL OR signup_capacity > 0);
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_capacity_unit TEXT    CHECK (signup_capacity_unit IS NULL OR signup_capacity_unit IN ('pair', 'player'));
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS signup_closes_at     TIMESTAMPTZ;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_capacity      INTEGER CHECK (signup_capacity IS NULL OR signup_capacity > 0);
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_capacity_unit TEXT    CHECK (signup_capacity_unit IS NULL OR signup_capacity_unit IN ('pair', 'player'));
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_closes_at     TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS tournament_registrations (
+  id            TEXT PRIMARY KEY,
+  tournament_id TEXT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL CHECK (kind IN ('pair', 'solo')),
+  status        TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'rejected', 'waitlist', 'cancelled')),
+  created_by    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- Jugador 1: siempre el que se inscribe.
+  p1_user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- Compañero: con cuenta (p2_user_id) o sin cuenta (nombre y teléfono).
+  p2_user_id    TEXT REFERENCES users(id) ON DELETE SET NULL,
+  p2_name       TEXT,
+  p2_phone      TEXT,
+  -- Lo que se creó al aprobar.
+  p1_player_id  TEXT REFERENCES players(id) ON DELETE SET NULL,
+  p2_player_id  TEXT REFERENCES players(id) ON DELETE SET NULL,
+  pair_id       TEXT REFERENCES pairs(id)   ON DELETE SET NULL,
+  paid          BOOLEAN NOT NULL DEFAULT false,
+  reject_reason TEXT,
+  decided_by    TEXT REFERENCES users(id) ON DELETE SET NULL,
+  decided_at    TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT registrations_partner_check CHECK (
+    kind = 'solo' OR p2_user_id IS NOT NULL OR (p2_name IS NOT NULL AND p2_phone IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_registrations_tournament ON tournament_registrations(tournament_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_registrations_p1         ON tournament_registrations(p1_user_id);
+CREATE INDEX IF NOT EXISTS idx_registrations_p2         ON tournament_registrations(p2_user_id);
+-- Una sola inscripción activa por usuario y torneo como titular (la de
+-- compañero se controla en la ruta, porque cruza dos columnas).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_registrations_active_p1
+  ON tournament_registrations(tournament_id, p1_user_id)
+  WHERE status IN ('pending', 'approved', 'waitlist');

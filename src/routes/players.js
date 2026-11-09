@@ -56,10 +56,13 @@ router.get('/', optionalAuth, async (req, res, next) => {
 // Plantel de la categoría, para la pestaña Jugadores. Trae lo mismo que la vista
 // de un torneo (cuenta vinculada, invitación pendiente) más en cuántos torneos
 // jugó cada uno — que es el dato que sólo tiene sentido a nivel categoría.
-router.get('/group/:groupId', async (req, res, next) => {
+router.get('/group/:groupId', optionalAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const { groupId } = req.params;
+    // El que no organiza no ve a los jugadores que sólo están en jornadas que
+    // todavía no empezaron (plantel oculto, Fabri 2026-11-09).
+    const manager = req.user ? (await canManageGroup(sql, req.user.id, groupId)) === true : false;
     const players = await sql`
       SELECT
         p.*,
@@ -85,6 +88,20 @@ router.get('/group/:groupId', async (req, res, next) => {
       LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
       LEFT   JOIN player_invitations pi
         ON   pi.player_id = p.id AND pi.group_id = ${groupId} AND pi.status = 'pending'
+      WHERE  ${manager}::boolean
+         OR  NOT EXISTS (
+               SELECT 1 FROM tournament_players tp
+               JOIN tournaments t ON t.id = tp.tournament_id AND t.group_id = ${groupId}
+               WHERE tp.player_id = p.id)
+         OR  EXISTS (
+               SELECT 1 FROM tournament_players tp
+               JOIN tournaments t ON t.id = tp.tournament_id AND t.group_id = ${groupId}
+               WHERE tp.player_id = p.id
+                 AND (t.status = 'finished' OR t.bracket IS NOT NULL
+                      OR (t.live_match IS NOT NULL AND jsonb_typeof(t.live_match) = 'array' AND jsonb_array_length(t.live_match) > 0)
+                      OR EXISTS (SELECT 1 FROM matches m WHERE m.tournament_id = t.id)
+                      OR (t.event_date IS NOT NULL
+                          AND (t.event_date + COALESCE(t.event_time, TIME '00:00')) AT TIME ZONE 'America/Argentina/Buenos_Aires' <= NOW())))
       ORDER  BY p.name ASC
     `;
     res.json(players);
@@ -193,6 +210,29 @@ router.delete('/:playerId/tournament/:tournamentId', requireAuth, requireTournam
   try {
     const { playerId, tournamentId } = req.params;
     const sql = getDb();
+
+    // Americano: sacarlo con una pareja activa dejaba una pareja con un jugador
+    // fuera del torneo. Primero se retira o se elimina la pareja. En Liga las
+    // parejas cambian libremente y no se bloquea.
+    const [enPareja] = req.accessCtx.format !== 'americano' ? [] : await sql`
+      SELECT id FROM pairs
+      WHERE tournament_id = ${tournamentId} AND status = 'active'
+        AND (p1_id = ${playerId} OR p2_id = ${playerId})
+      LIMIT 1
+    `;
+    if (enPareja) {
+      return res.status(409).json({
+        error: 'Este jugador está en una pareja. Retirá o eliminá la pareja antes de sacarlo del torneo.',
+        code: 'player_in_pair',
+      });
+    }
+
+    // Sus partidos programados ya no se pueden jugar.
+    await sql`
+      DELETE FROM scheduled_matches
+      WHERE tournament_id = ${tournamentId}
+        AND ${playerId} IN (team1_p1, team1_p2, team2_p1, team2_p2)
+    `;
     await sql`
       DELETE FROM tournament_players
       WHERE tournament_id = ${tournamentId} AND player_id = ${playerId}

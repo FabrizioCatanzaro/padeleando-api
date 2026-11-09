@@ -18,6 +18,7 @@ import readonlyRouter    from './routes/readonly.js';
 import authRouter        from './routes/auth.js';
 import invitationsRouter    from './routes/invitations.js';
 import joinRequestsRouter   from './routes/join-requests.js';
+import registrationsRouter from './routes/registrations.js';
 import collaboratorsRouter  from './routes/collaborators.js';
 import subscriptionsRouter  from './routes/subscriptions.js';
 import photosRouter         from './routes/photos.js';
@@ -100,6 +101,8 @@ const NEVER_STORE = [
   '/api/notifications',
   '/api/invitations',
   '/api/emails',
+  // Inscripciones: llevan teléfonos y datos por usuario
+  '/api/registrations',
   // "Mis reservas" es privado por jugador: nunca en caché compartida
   '/api/bookings',
   // Sub-rutas solo-admin de /api/clubs: sin esto las tomaba el caché público de /api/clubs
@@ -107,8 +110,10 @@ const NEVER_STORE = [
   '/api/clubs/claims',
 ];
 
-// Gestión de reservas del dueño: trae datos de quien reservó, nunca en caché
-const NEVER_STORE_PATTERNS = [/\/bookings\/manage$/];
+// Gestión de reservas del dueño y Mercado Pago Connect: nunca en caché
+// compartida -- son GET pero devuelven datos por-usuario (o hacen un redirect
+// con efectos), y sin esto el prefijo público de /api/clubs los agarraría.
+const NEVER_STORE_PATTERNS = [/\/bookings\/manage$/, /\/mercadopago\/(connect|callback)$/];
 
 // Respuestas que dependen de quién mira: private, no-cache (nearby queda público)
 const VIEWER_DEPENDENT_PATTERNS = [
@@ -144,6 +149,7 @@ app.use('/api/pairs',       pairsRouter);
 app.use('/api/readonly',    readonlyRouter);
 app.use('/api/invitations',    invitationsRouter);
 app.use('/api/join-requests',  joinRequestsRouter);
+app.use('/api/registrations',  registrationsRouter);
 app.use('/api/follows',        followsRouter);
 app.use('/api/notifications',  notificationsRouter);
 app.use('/api/subscriptions', subscriptionsRouter);

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { getDb }  from '../db.js';
 import { resolveSignup } from '../lib/signup.js';
+import { hasStarted } from '../lib/registrations.js';
 
 const router = Router();
 
@@ -47,6 +48,8 @@ router.get('/', async (req, res, next) => {
                g.id AS group_id, g.name AS group_name, g.emojis AS group_emojis,
                u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
                c.id AS club_id, c.name AS club_name, c.photo_url AS club_photo_url, c.location_name AS club_location_name,
+               t.live_match, (t.bracket IS NOT NULL) AS has_bracket,
+               (SELECT COUNT(*)::int FROM matches m WHERE m.tournament_id = t.id) AS match_count,
                (SELECT COUNT(*)::int FROM tournament_players tp WHERE tp.tournament_id = t.id) AS player_count
         FROM   tournaments t
         JOIN   groups g ON g.id = t.group_id
@@ -124,7 +127,11 @@ router.get('/', async (req, res, next) => {
           court:      m.court ?? null,
         })),
       })),
-      upcoming: upcoming.map((t) => ({ ...card(t), player_count: t.player_count ?? 0 })),
+      // La cantidad de inscriptos se publica cuando empieza la jornada.
+      upcoming: upcoming.map((t) => {
+        const started = hasStarted({ ...t, bracket: t.has_bracket || null }, t.match_count);
+        return { ...card(t), player_count: started ? (t.player_count ?? 0) : null, roster_hidden: !started };
+      }),
       signup: signup.map((t) => ({
         ...card(t),
         signup: resolveSignup(

@@ -3,6 +3,7 @@ import { getDb }  from '../db.js';
 import { uid }    from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireTournamentManage, requireMatchManage } from '../middleware/access.js';
+import { withdrawnTeamError } from '../lib/fixture.js';
 
 const router = Router();
 
@@ -36,6 +37,9 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     if (scoreError) return res.status(400).json({ error: scoreError });
 
     const sql = getDb();
+
+    const retirada = await withdrawnTeamError(sql, tournamentId, team1, team2);
+    if (retirada) return res.status(400).json({ error: retirada });
 
     // Un americano en borrador (menos de 8 parejas) todavía no se puede jugar.
     // El format ya viene resuelto por requireTournamentManage: no hace falta

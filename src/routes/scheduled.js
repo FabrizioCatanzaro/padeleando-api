@@ -3,7 +3,7 @@ import { getDb }  from '../db.js';
 import { uid }    from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireTournamentManage, requireScheduledManage } from '../middleware/access.js';
-import { MAX_PREVIA_MATCHES, countPairAppearances, pairKey } from '../lib/fixture.js';
+import { MAX_PREVIA_MATCHES, countPairAppearances, pairKey, withdrawnTeamError } from '../lib/fixture.js';
 
 const router = Router();
 
@@ -63,6 +63,8 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     }
 
     const sql = getDb();
+    const retirada = await withdrawnTeamError(sql, tournamentId, team1, team2);
+    if (retirada) return res.status(400).json({ error: retirada });
     if (req.accessCtx.format === 'americano') {
       const errTope = await chequearTopePrevia(sql, tournamentId, team1, team2);
       if (errTope) return res.status(400).json({ error: errTope });
@@ -93,6 +95,10 @@ router.patch('/:id', requireAuth, requireScheduledManage, async (req, res, next)
     if (hora === undefined) return res.status(400).json({ error: 'Hora inválida' });
 
     const sql = getDb();
+    if (cambiaEquipos) {
+      const retirada = await withdrawnTeamError(sql, req.accessCtx.tournament_id, team1, team2);
+      if (retirada) return res.status(400).json({ error: retirada });
+    }
     if (cambiaEquipos && req.accessCtx.format === 'americano') {
       const errTope = await chequearTopePrevia(
         sql, req.accessCtx.tournament_id, team1, team2, req.params.id,
