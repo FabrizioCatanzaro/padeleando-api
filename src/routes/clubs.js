@@ -1,4 +1,6 @@
 import { Router } from 'express';
+import jwt from 'jsonwebtoken';
+import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 import { getDb, withTransaction } from '../db.js';
 import { uid }    from '../uid.js';
 import { requireAuth, requireAdmin, optionalAuth } from '../middleware/auth.js';
@@ -8,6 +10,13 @@ import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
 
 const router = Router();
+
+// Cliente de la PLATAFORMA (mismo token que subscriptions.js): lee pagos hechos
+// a través de cuentas conectadas por OAuth, sin depender del token de cada club.
+const platformMp = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
+// El "state" del OAuth de Mercado Pago viaja firmado (no es sesión): identifica
+// a qué club atar el token cuando MP redirige de vuelta al callback.
+const MP_STATE_SECRET = process.env.JWT_SECRET;
 
 // Normaliza los campos editables de un club desde el body (alta o solicitud).
 function clubFields(body = {}) {
@@ -391,7 +400,12 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         c.owner_visible,
         CASE WHEN c.owner_visible THEN ou.name        ELSE NULL END AS owner_display_name,
         CASE WHEN c.owner_visible THEN ou.username     ELSE NULL END AS owner_username,
-        CASE WHEN c.owner_visible THEN ou.avatar_url    ELSE NULL END AS owner_avatar_url
+        CASE WHEN c.owner_visible THEN ou.avatar_url    ELSE NULL END AS owner_avatar_url,
+        (c.mp_access_token IS NOT NULL) AS mp_connected,
+        (EXISTS (
+          SELECT 1 FROM subscriptions s
+          WHERE s.user_id = c.owner_id AND s.plan = 'premium' AND s.status = 'active'
+        )) AS owner_is_premium
         FROM clubs c
         LEFT JOIN users ou ON ou.id = c.owner_id
         WHERE c.id = ${req.params.id}
@@ -404,7 +418,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              FROM matches m
              JOIN tournaments mt ON mt.id = m.tournament_id
              JOIN groups mg ON mg.id = mt.group_id AND mg.is_public = true
-            WHERE mt.club_id = ${req.params.id})                AS partidos,
+            WHERE mt.club_id = ${req.params.id} AND NOT m.walkover) AS partidos,
           (SELECT COUNT(DISTINCT tp.player_id)::int
              FROM tournament_players tp
              JOIN tournaments pt ON pt.id = tp.tournament_id
@@ -960,6 +974,147 @@ router.patch('/:id/courts/:courtId/move', requireAuth, requireClubManage, async 
   } catch (err) { next(err); }
 });
 
+// ── Mercado Pago Connect del club (Premium) ─────────────────────────────────
+// El dueño vincula su propia cuenta de MP para cobrar reservas desde la app.
+// GET /:id/mercadopago/connect: arma la URL de autorización de MP. Solo Premium.
+router.get('/:id/mercadopago/connect', requireAuth, requireClubManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [club] = await sql`
+      SELECT c.owner_id,
+             (EXISTS (
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id = c.owner_id AND s.plan = 'premium' AND s.status = 'active'
+             )) AS owner_is_premium
+      FROM clubs c WHERE c.id = ${req.params.id}
+    `;
+    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
+    if (!club.owner_is_premium) {
+      return res.status(403).json({ error: 'Vincular Mercado Pago es una función Premium', code: 'plan_limit' });
+    }
+
+    const state = jwt.sign({ clubId: req.params.id }, MP_STATE_SECRET, { expiresIn: '10m' });
+    const authorize_url =
+      `https://auth.mercadopago.com/authorization?client_id=${process.env.MP_CLIENT_ID}` +
+      `&response_type=code&platform_id=mp&state=${encodeURIComponent(state)}` +
+      `&redirect_uri=${encodeURIComponent(process.env.MP_CONNECT_REDIRECT_URI)}`;
+    res.json({ authorize_url });
+  } catch (err) { next(err); }
+});
+
+// GET /mercadopago/callback: MP redirige acá con ?code&state. Público (el
+// "code" de MP es el secreto real; el state firmado evita que alguien pegue un
+// clubId ajeno acá).
+router.get('/mercadopago/callback', async (req, res) => {
+  const fail = (clubId) => res.redirect(`${process.env.FRONTEND_URL}/club/${clubId ?? ''}?mp=error`);
+  try {
+    const { code, state } = req.query;
+    let clubId;
+    try {
+      ({ clubId } = jwt.verify(state, MP_STATE_SECRET));
+    } catch {
+      return fail(null);
+    }
+    if (!code) return fail(clubId);
+
+    const tokenRes = await fetch('https://api.mercadopago.com/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id:     process.env.MP_CLIENT_ID,
+        client_secret: process.env.MP_CLIENT_SECRET,
+        grant_type:    'authorization_code',
+        code,
+        redirect_uri:  process.env.MP_CONNECT_REDIRECT_URI,
+      }),
+    });
+    if (!tokenRes.ok) return fail(clubId);
+    const data = await tokenRes.json();
+
+    const sql = getDb();
+    await sql`
+      UPDATE clubs
+      SET mp_user_id = ${data.user_id ?? null}, mp_access_token = ${data.access_token},
+          mp_refresh_token = ${data.refresh_token ?? null}, mp_public_key = ${data.public_key ?? null},
+          mp_connected_at = NOW()
+      WHERE id = ${clubId}
+    `;
+    res.redirect(`${process.env.FRONTEND_URL}/club/${clubId}?mp=connected`);
+  } catch (err) {
+    console.error('Error en el callback de Mercado Pago:', err.message);
+    fail(null);
+  }
+});
+
+// DELETE /:id/mercadopago: desvincular. No revoca el token en MP (eso lo hace
+// el dueño desde su propia cuenta); solo lo borramos de nuestro lado.
+router.delete('/:id/mercadopago', requireAuth, requireClubManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    await sql`
+      UPDATE clubs
+      SET mp_user_id = NULL, mp_access_token = NULL, mp_refresh_token = NULL,
+          mp_public_key = NULL, mp_connected_at = NULL
+      WHERE id = ${req.params.id}
+    `;
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// POST /mercadopago/webhook: notificaciones de pagos de reservas. Se lee con
+// el token de la PLATAFORMA (la aplicación OAuth ve los pagos de las cuentas
+// que conectó), no con el del club -- así no hace falta saber a qué club
+// pertenece el pago antes de consultarlo.
+router.post('/mercadopago/webhook', async (req, res) => {
+  try {
+    const body = req.body;
+    if (body?.type === 'payment' && body.data?.id) {
+      const payment = await new Payment(platformMp).get({ id: body.data.id });
+      const groupId = payment?.external_reference;
+      if (groupId) {
+        const sql = getDb();
+        const [first] = await sql`SELECT club_id, status FROM bookings WHERE group_id = ${groupId} LIMIT 1`;
+        if (first && first.status === 'pending') {
+          if (payment.status === 'approved') {
+            const rows = await sql`
+              SELECT id, status, date, start_time, duration_minutes, user_id, court_id
+              FROM bookings WHERE group_id = ${groupId} ORDER BY start_time
+            `;
+            try {
+              await sql`
+                UPDATE bookings
+                SET status = 'confirmed', payment_status = 'approved', mp_payment_id = ${String(payment.id)}, decided_at = NOW()
+                WHERE group_id = ${groupId}
+              `;
+              const [club] = await sql`SELECT name FROM clubs WHERE id = ${first.club_id}`;
+              await cancelOverlappingPending({
+                sql, clubId: first.club_id, confirmedRows: rows,
+                excludeGroupId: groupId, actorId: null, clubName: club?.name ?? 'El club',
+              });
+            } catch (e) {
+              // Carrera con otra reserva confirmada: el pago quedó aprobado pero
+              // el turno ya no está libre. Se deja registrado para revisar a mano.
+              if (e.code !== '23505') throw e;
+              await sql`
+                UPDATE bookings SET payment_status = 'approved', mp_payment_id = ${String(payment.id)}
+                WHERE group_id = ${groupId}
+              `;
+            }
+          } else if (payment.status === 'rejected' || payment.status === 'cancelled') {
+            await sql`
+              UPDATE bookings SET payment_status = 'rejected', mp_payment_id = ${String(payment.id)}
+              WHERE group_id = ${groupId} AND status = 'pending'
+            `;
+          }
+        }
+      }
+    }
+  } catch (_) {
+    // Nunca fallar: MP necesita siempre 200 para no reintentar
+  }
+  res.sendStatus(200);
+});
+
 // Reservas: pending no bloquea, solo confirmed; la duración sale de clubs.slot_minutes, no del body
 const BOOKING_HORIZON_DAYS = 7;
 
@@ -1002,7 +1157,8 @@ router.get('/:id/bookings/manage', requireAuth, requireClubBookingManage, async 
       SELECT b.id, b.group_id, b.court_id, c.name AS court_name, b.date, b.start_time,
              b.duration_minutes, b.price, b.status, b.guest_name, b.guest_contact, b.user_id,
              u.username AS user_username,
-             b.decision_reason, b.decided_at, b.created_at
+             b.decision_reason, b.decided_at, b.created_at,
+             b.payment_status, b.mp_preference_id, b.mp_payment_id
       FROM bookings b
       LEFT JOIN club_courts c ON c.id = b.court_id
       LEFT JOIN users u ON u.id = b.user_id
@@ -1125,7 +1281,7 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
     }
 
     const sql = getDb();
-    const [club] = await sql`SELECT id, name, owner_id, slot_minutes FROM clubs WHERE id = ${req.params.id}`;
+    const [club] = await sql`SELECT id, name, owner_id, slot_minutes, mp_access_token FROM clubs WHERE id = ${req.params.id}`;
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
     // Los turnos deben ser consecutivos y sin repetir
@@ -1139,6 +1295,7 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
     let court_id = null;
     let court_name = null;
     let price = null;
+    let totalPrice = null;
     if (req.body?.court_id) {
       const [court] = await sql`
         SELECT id, name, price_30, price_60 FROM club_courts WHERE id = ${req.body.court_id} AND club_id = ${req.params.id} AND active = true
@@ -1147,7 +1304,7 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
       court_id = court.id;
       court_name = court.name;
       // Precio total repartido en partes iguales entre las filas; es solo informativo
-      const totalPrice = computeTotalPrice(court.price_30, court.price_60, sorted.length);
+      totalPrice = computeTotalPrice(court.price_30, court.price_60, sorted.length);
       price = totalPrice != null ? Math.round((totalPrice / sorted.length) * 100) / 100 : null;
     }
 
@@ -1164,11 +1321,46 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
         guestContact: guest_contact,
         status: 'pending',
       });
-      // Avisar al dueño, o a los admins si no hay dueño; best-effort
+      const groupId = bookings[0].group_id;
+
+      // Club con Mercado Pago vinculado y precio cargado: se cobra online y la
+      // reserva se confirma sola cuando el webhook avisa el pago aprobado. Sin
+      // alguna de las dos cosas, sigue el flujo manual de siempre.
+      let checkout_url = null;
+      if (club.mp_access_token && totalPrice != null) {
+        try {
+          const clubMp = new MercadoPagoConfig({ accessToken: club.mp_access_token });
+          // auto_return exige back_urls https; en dev (FRONTEND_URL http) se omite o MP rechaza toda la preferencia
+          const frontendIsHttps = /^https:\/\//.test(process.env.FRONTEND_URL || '');
+          const pref = await new Preference(clubMp).create({
+            body: {
+              items: [{ title: `Turno en ${club.name}`, quantity: 1, unit_price: totalPrice, currency_id: 'ARS' }],
+              external_reference: groupId,
+              notification_url: `${process.env.API_PUBLIC_URL}/api/clubs/mercadopago/webhook`,
+              back_urls: {
+                success: `${process.env.FRONTEND_URL}/club/${req.params.id}?pago=exito`,
+                pending: `${process.env.FRONTEND_URL}/club/${req.params.id}?pago=pendiente`,
+                failure: `${process.env.FRONTEND_URL}/club/${req.params.id}?pago=error`,
+              },
+              ...(frontendIsHttps ? { auto_return: 'approved' } : {}),
+            },
+          });
+          checkout_url = pref.init_point ?? pref.sandbox_init_point ?? null;
+          await sql`UPDATE bookings SET mp_preference_id = ${pref.id}, payment_status = 'pending' WHERE group_id = ${groupId}`;
+        } catch (mpErr) {
+          // No se pudo armar el cobro: la reserva queda pending para aprobar a mano
+          console.error('No se pudo crear la preferencia de pago de la reserva:', mpErr.message);
+        }
+      }
+
+      // Avisar al dueño, o a los admins si no hay dueño; best-effort. Si va a
+      // pago online no hace falta que apruebe nada, pero igual se entera.
       try {
         const endTime = minutesToTime(timeToMinutes(sorted[sorted.length - 1]) + club.slot_minutes);
         const courtLabel = court_name ? ` en ${court_name}` : '';
-        const body = `${guest_name} pidió un turno${courtLabel} para el ${req.body.date} de ${sorted[0]} a ${endTime} hs.`;
+        const body = checkout_url
+          ? `${guest_name} está pagando un turno${courtLabel} para el ${req.body.date} de ${sorted[0]} a ${endTime} hs.`
+          : `${guest_name} pidió un turno${courtLabel} para el ${req.body.date} de ${sorted[0]} a ${endTime} hs.`;
         const actorId = req.user?.id ?? null;
         // entity_id es el club: el front lleva a su ficha
         if (club.owner_id) {
@@ -1190,7 +1382,7 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
         console.error('No se pudo notificar la solicitud de turno nueva:', notifyErr.message);
       }
 
-      res.status(201).json(bookings);
+      res.status(201).json({ bookings, checkout_url });
     } catch (e) {
       if (e.code === '23505') return res.status(409).json({ error: 'Ese horario ya no está completamente disponible -- alguien tomó uno de esos turnos justo antes que vos.' });
       throw e;

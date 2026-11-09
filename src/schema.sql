@@ -569,6 +569,22 @@ ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS price_60 NUMERIC(10,2);
 UPDATE club_courts SET price_60 = price, price_30 = ROUND(price / 2, 2)
 WHERE price_60 IS NULL AND price IS NOT NULL;
 
+-- Mercado Pago Connect por club (Premium): el dueño vincula su propia cuenta
+-- para cobrar reservas desde la app. Tokens de la cuenta del CLUB, no de la
+-- plataforma (eso es MP_ACCESS_TOKEN, para las suscripciones).
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_user_id       TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_access_token  TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_refresh_token TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_public_key    TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS mp_connected_at  TIMESTAMPTZ;
+
+-- Estado del cobro de una reserva cuando el club tiene Mercado Pago vinculado.
+-- NULL = el club no cobra online (flujo manual de siempre).
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_status TEXT
+  CHECK (payment_status IS NULL OR payment_status IN ('pending', 'approved', 'rejected'));
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS mp_preference_id TEXT;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS mp_payment_id    TEXT;
+
 -- Ronda del calendario de la previa (americano). POST /tournaments/:id/schedule
 -- guarda el calendario generado como partidos programados con su ronda, para
 -- que los jugadores lo vean. NULL = programado a mano, sin ronda.
