@@ -6,6 +6,7 @@ import { uploadTournamentPhoto }    from '../middleware/upload.js';
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { canManageGroup }           from '../lib/access.js';
 import { getActiveSubscription }    from './subscriptions.js';
+import { parseInstagramUrl, instagramEmbedUrl, MAX_INSTAGRAM_POSTS } from '../lib/instagram.js';
 
 const router = Router({ mergeParams: true });
 
@@ -32,6 +33,75 @@ router.get('/', async (req, res, next) => {
       ORDER  BY is_cover DESC, created_at DESC
     `;
     res.json(photos);
+  } catch (err) { next(err); }
+});
+
+// ── Posts de Instagram ──────────────────────────────────────────────────────
+// Van antes de las rutas /:photoId para que "instagram" no se lea como un id.
+const withEmbed = (p) => ({ ...p, embed_url: instagramEmbedUrl(p) });
+
+// GET /api/tournaments/:tournamentId/photos/instagram — público
+router.get('/instagram', async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const rows = await sql`
+      SELECT id, tournament_id, kind, shortcode, url, created_at
+      FROM   tournament_instagram_posts
+      WHERE  tournament_id = ${req.params.tournamentId}
+      ORDER  BY created_at DESC
+    `;
+    res.json(rows.map(withEmbed));
+  } catch (err) { next(err); }
+});
+
+// POST /api/tournaments/:tournamentId/photos/instagram — { url }; organizador, premium del DUEÑO
+router.post('/instagram', requireAuth, async (req, res, next) => {
+  try {
+    const { tournamentId } = req.params;
+    const sql = getDb();
+    let post;
+    try { post = parseInstagramUrl(req.body?.url); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    const owner = await getTournamentOwnership(sql, tournamentId);
+    if (!owner) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!(await canManageGroup(sql, req.user.id, owner.group_id)))
+      return res.status(403).json({ error: 'Sin permiso' });
+    const ownerSub = await getActiveSubscription(sql, owner.user_id);
+    if (ownerSub.plan !== 'premium')
+      return res.status(403).json({ error: 'Las fotos son una función Premium del dueño de la categoría' });
+
+    const [{ count }] = await sql`
+      SELECT COUNT(*)::int AS count FROM tournament_instagram_posts WHERE tournament_id = ${tournamentId}
+    `;
+    if (count >= MAX_INSTAGRAM_POSTS)
+      return res.status(400).json({ error: `Límite de ${MAX_INSTAGRAM_POSTS} posts de Instagram por torneo alcanzado` });
+
+    const [row] = await sql`
+      INSERT INTO tournament_instagram_posts (id, tournament_id, kind, shortcode, url, created_by)
+      VALUES (${uid()}, ${tournamentId}, ${post.kind}, ${post.shortcode}, ${post.url}, ${req.user.id})
+      ON CONFLICT (tournament_id, shortcode) DO NOTHING
+      RETURNING id, tournament_id, kind, shortcode, url, created_at
+    `;
+    if (!row) return res.status(409).json({ error: 'Ese post ya está en la galería' });
+    res.status(201).json(withEmbed(row));
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/tournaments/:tournamentId/photos/instagram/:postId — organizador
+router.delete('/instagram/:postId', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [post] = await sql`
+      SELECT ip.id, t.group_id FROM tournament_instagram_posts ip
+      JOIN   tournaments t ON t.id = ip.tournament_id
+      WHERE  ip.id = ${req.params.postId} AND ip.tournament_id = ${req.params.tournamentId}
+    `;
+    if (!post) return res.status(404).json({ error: 'Post no encontrado' });
+    if (!(await canManageGroup(sql, req.user.id, post.group_id)))
+      return res.status(403).json({ error: 'Sin permiso' });
+    await sql`DELETE FROM tournament_instagram_posts WHERE id = ${post.id}`;
+    res.json({ ok: true });
   } catch (err) { next(err); }
 });
 

@@ -108,6 +108,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         u.username   AS linked_username,
         u.name       AS linked_name,
         u.avatar_url AS linked_avatar_url,
+        u.category   AS linked_category,
         (s.id IS NOT NULL) AS is_premium,
         pi.id        AS invitation_id,
         pi.status    AS invitation_status,
@@ -134,7 +135,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
 
     const removedPlayers = orphanIds.length
       ? await sql`
-          SELECT p.*, u.name AS linked_name, u.avatar_url AS linked_avatar_url,
+          SELECT p.*, u.name AS linked_name, u.avatar_url AS linked_avatar_url, u.category AS linked_category,
                  (s.id IS NOT NULL) AS is_premium
           FROM   players p
           LEFT   JOIN users u ON u.id = p.user_id
