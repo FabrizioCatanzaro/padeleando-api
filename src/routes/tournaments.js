@@ -14,7 +14,7 @@ import {
 } from '../lib/tournamentLogic.js';
 import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations.js';
 import {
-  parseLigaSettings, generateFecha, validateFecha, crossesFromRows, fechaDatesError,
+  parseLigaSettings, LIGA_KEYS, generateFecha, validateFecha, crossesFromRows, fechaDatesError,
 } from '../lib/ligaFechas.js';
 
 const router = Router();
@@ -239,6 +239,13 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
       signup = parseSignupFields(req.body);
       liga = parseLigaSettings(req.body, { format });
     } catch (e) { return res.status(400).json({ error: e.message }); }
+    // Una liga nueva copia los puntos de la última liga de la categoría.
+    if (format === 'liga' && liga.points_win === undefined && liga.points_loss === undefined) {
+      const [prev] = await getDb()`
+        SELECT points_win, points_loss FROM tournaments
+        WHERE group_id = ${groupId} AND format = 'liga' ORDER BY created_at DESC LIMIT 1`;
+      if (prev) { liga.points_win = prev.points_win; liga.points_loss = prev.points_loss; }
+    }
     if (liga.liga_mode === 'temporada' && mode !== 'pairs') {
       return res.status(400).json({ error: 'La liga en varios días se juega con parejas fijas' });
     }
@@ -403,9 +410,9 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
            (id, group_id, name, mode, format, number_of_courts, club_id, event_date, event_time, pending_club_request_id,
             signup_open, signup_price, signup_price_unit, signup_contacts, level,
             signup_capacity, signup_capacity_unit, signup_closes_at,
-            liga_mode, allow_rematch, winner_format, playoff_size, rules)
+            liga_mode, allow_rematch, winner_format, playoff_size, rules, points_win, points_loss)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18,
-                 $19, $20, $21, $22, $23) RETURNING *`,
+                 $19, $20, $21, $22, $23, $24, $25) RETURNING *`,
         [tId, groupId, name.trim(), mode, format, number_of_courts ?? 1,
          club_id ?? null, event_date || null, event_time || null, pending_club_request_id ?? null,
          signup.signup_open ?? null, signup.signup_price ?? null, signup.signup_price_unit ?? null,
@@ -413,7 +420,8 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
          signup.level ?? null,
          signup.signup_capacity ?? null, signup.signup_capacity_unit ?? null, signup.signup_closes_at ?? null,
          liga.liga_mode ?? 'jornada', liga.allow_rematch ?? false,
-         liga.winner_format ?? 'tabla', liga.playoff_size ?? null, signup.rules ?? null]
+         liga.winner_format ?? 'tabla', liga.playoff_size ?? null, signup.rules ?? null,
+         liga.points_win ?? 3, liga.points_loss ?? 0]
       );
 
       if (players.length) {
@@ -540,11 +548,10 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
     // Opciones de la liga por fechas: se validan contra lo guardado, porque
     // la edición puede traer solo una.
     let liga = {};
-    const tocaLiga = ['liga_mode', 'allow_rematch', 'winner_format', 'playoff_size']
-      .some((k) => req.body[k] !== undefined);
+    const tocaLiga = LIGA_KEYS.some((k) => req.body[k] !== undefined);
     if (tocaLiga || mode !== undefined) {
       const [cur] = await sql`
-        SELECT t.format, t.mode, t.liga_mode, t.winner_format, t.playoff_size,
+        SELECT t.format, t.mode, t.liga_mode, t.winner_format, t.playoff_size, t.points_win, t.points_loss,
                EXISTS (SELECT 1 FROM tournament_fechas f WHERE f.tournament_id = t.id) AS has_fechas
         FROM tournaments t WHERE t.id = ${id}
       `;
@@ -575,6 +582,8 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           allow_rematch    = COALESCE(${liga.allow_rematch ?? null}::boolean, allow_rematch),
           winner_format    = COALESCE(${liga.winner_format ?? null}, winner_format),
           playoff_size     = CASE WHEN ${'playoff_size' in liga}::boolean THEN ${liga.playoff_size ?? null}::int ELSE playoff_size END,
+          points_win       = COALESCE(${liga.points_win ?? null}::int, points_win),
+          points_loss      = COALESCE(${liga.points_loss ?? null}::int, points_loss),
           club_id          = CASE WHEN ${club_id !== undefined}::boolean    THEN ${club_id || null}    ELSE club_id    END,
           pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id || null} ELSE pending_club_request_id END,
           event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END,
@@ -994,7 +1003,7 @@ router.post('/:id/playoffs', requireAuth, requireTournamentManage, async (req, r
     const id = req.params.id;
     const result = await withTransaction(async (client) => {
       const { rows: [t] } = await client.query(
-        'SELECT id, format, mode, status, bracket, winner_format, playoff_size FROM tournaments WHERE id = $1 FOR UPDATE', [id]
+        'SELECT id, format, mode, status, bracket, winner_format, playoff_size, points_win, points_loss FROM tournaments WHERE id = $1 FOR UPDATE', [id]
       );
       if (!t) return { status: 404, error: 'Torneo no encontrado' };
       if (t.format !== 'liga' || t.winner_format !== 'playoffs') {
@@ -1013,7 +1022,8 @@ router.post('/:id/playoffs', requireAuth, requireTournamentManage, async (req, r
            WHERE pr.tournament_id = $1 ORDER BY pr.id`, [id]),
         client.query('SELECT * FROM matches WHERE tournament_id = $1', [id]),
       ]);
-      const tabla = computeStandings(pairsRaw, matches).filter((s) => !s.withdrawn);
+      const tabla = computeStandings(pairsRaw, matches, { win: t.points_win ?? 3, loss: t.points_loss ?? 0 })
+        .filter((s) => !s.withdrawn);
       if (tabla.length < t.playoff_size) {
         return { status: 400, error: `Hay ${tabla.length} parejas activas y a playoffs pasan ${t.playoff_size}` };
       }

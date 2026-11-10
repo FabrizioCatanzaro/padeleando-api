@@ -114,7 +114,7 @@ export function countLeagueTitles(rows) {
 
   // Mismo desempate que la tabla de la jornada (comparePairRows): victorias,
   // diferencia, % de victorias, games a favor. Empatados en todo, comparten título.
-  const asRow = (p) => ({ wins: p.pg, diff: p.diff, played: p.pj, gf: p.gf ?? 0, pair_id: '' });
+  const asRow = (p) => ({ points: p.pts ?? 0, wins: p.pg, diff: p.diff, played: p.pj, gf: p.gf ?? 0, pair_id: '' });
   let titles = 0;
   for (const players of Object.values(byTournament)) {
     const sorted = [...players].sort((a, b) => comparePairRows(asRow(a), asRow(b)));

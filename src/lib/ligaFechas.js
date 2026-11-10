@@ -341,6 +341,8 @@ export function fechaDatesError(start_date, end_date) {
 export const LIGA_MODES     = ['jornada', 'temporada'];
 export const WINNER_FORMATS = ['tabla', 'playoffs'];
 export const MAX_PLAYOFF_SIZE = 16;
+export const MAX_POINTS = 10;
+export const LIGA_KEYS = ['liga_mode', 'allow_rematch', 'winner_format', 'playoff_size', 'points_win', 'points_loss'];
 
 /**
  * Lee las opciones de liga del body de un alta o una edición de torneo.
@@ -355,7 +357,7 @@ export const MAX_PLAYOFF_SIZE = 16;
 export function parseLigaSettings(body = {}, { format = 'liga', current = {} } = {}) {
   const has = (k) => body[k] !== undefined;
   const out = {};
-  if (!['liga_mode', 'allow_rematch', 'winner_format', 'playoff_size'].some(has)) return out;
+  if (!LIGA_KEYS.some(has)) return out;
   if (format !== 'liga') throw new Error('Estas opciones son solo para torneos Liga');
 
   if (has('liga_mode')) {
@@ -377,6 +379,16 @@ export function parseLigaSettings(body = {}, { format = 'liga', current = {} } =
     }
     out.playoff_size = v;
   }
+
+  for (const k of ['points_win', 'points_loss']) {
+    if (!has(k)) continue;
+    const v = body[k];
+    if (!Number.isInteger(v) || v < 0 || v > MAX_POINTS) throw new Error(`Los puntos van de 0 a ${MAX_POINTS}`);
+    out[k] = v;
+  }
+  const win  = out.points_win  ?? current.points_win  ?? 3;
+  const loss = out.points_loss ?? current.points_loss ?? 0;
+  if (loss > win) throw new Error('La derrota no puede sumar más que la victoria');
 
   const winner = out.winner_format ?? current.winner_format ?? 'tabla';
   const size = 'playoff_size' in out ? out.playoff_size : (current.playoff_size ?? null);

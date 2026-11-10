@@ -270,7 +270,8 @@ export function winRate(wins, played) {
 // el orden de filas que devolvía Postgres, que difiere entre queries.
 // Debe coincidir con compareStandingRows del front (utils/helpers.js).
 export function comparePairRows(a, b) {
-  return b.wins - a.wins
+  return (b.points ?? 0) - (a.points ?? 0)
+      || b.wins - a.wins
       || b.diff - a.diff
       || winRate(b.wins, b.played) - winRate(a.wins, a.played)
       || b.gf - a.gf
@@ -285,10 +286,11 @@ export function comparePairRows(a, b) {
  * @param {Array} matches - registros de la tabla matches
  * @returns {Array} standings ordenados con comparePairRows
  */
-export function computeStandings(pairs, matches) {
+export function computeStandings(pairs, matches, { win = 3, loss = 0 } = {}) {
   return pairs
     .map((pr) => {
       let wins = 0;
+      let losses = 0;
       let played = 0;
       let gf = 0;
       let gc = 0;
@@ -301,18 +303,19 @@ export function computeStandings(pairs, matches) {
         const isTeam2 = m.team2_p1 === pr.p1_id || m.team2_p1 === pr.p2_id
                      || m.team2_p2 === pr.p1_id || m.team2_p2 === pr.p2_id;
         if (isTeam1 || isTeam2) played++;
-        if (isTeam1) {
-          if (s1 > s2) wins++;
-          gf += s1; gc += s2;
-        } else if (isTeam2) {
-          if (s2 > s1) wins++;
-          gf += s2; gc += s1;
+        const won = isTeam1 ? s1 > s2 : s2 > s1;
+        if (isTeam1 || isTeam2) {
+          if (won) wins++;
+          // La derrota por W.O. no suma los puntos de derrota.
+          else if (!m.walkover) losses++;
+          gf += isTeam1 ? s1 : s2; gc += isTeam1 ? s2 : s1;
         }
       }
       return {
         pair_id:   pr.id,
         pair_name: `${pr.p1_name} & ${pr.p2_name}`,
         wins,
+        points: wins * win + losses * loss,
         played,
         diff: gf - gc,
         gf,

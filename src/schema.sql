@@ -723,3 +723,11 @@ CREATE INDEX IF NOT EXISTS idx_matches_tournament_round ON matches(tournament_id
 ALTER TABLE groups      ADD COLUMN IF NOT EXISTS rules TEXT;
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rules TEXT;
 ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS rules_accepted_at TIMESTAMPTZ;
+
+-- Puntos de la tabla de una liga (2026-11-10). La tabla ordena por puntos y
+-- después por victorias. La derrota por W.O. no suma los puntos de derrota.
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS points_win  INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS points_loss INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_points_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_points_check
+  CHECK (points_win BETWEEN 0 AND 10 AND points_loss BETWEEN 0 AND 10 AND points_loss <= points_win);

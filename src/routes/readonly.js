@@ -142,6 +142,8 @@ router.get('/:tournamentId', async (req, res, next) => {
       allow_rematch:  tournament.allow_rematch ?? false,
       winner_format:  tournament.winner_format ?? 'tabla',
       playoff_size:   tournament.playoff_size ?? null,
+      points_win:     tournament.points_win ?? 3,
+      points_loss:    tournament.points_loss ?? 0,
       // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
       signup: publicSignup(resolveSignup(tournament, {
         signup_open:       tournament.group_signup_open,

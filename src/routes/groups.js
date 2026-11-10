@@ -591,7 +591,13 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           ELSE m.score2 - m.score1 END), 0)::int AS diff,
         COALESCE(SUM(CASE
           WHEN (m.team1_p1 = pl.id OR m.team1_p2 = pl.id) THEN m.score1
-          ELSE m.score2 END), 0)::int AS gf
+          ELSE m.score2 END), 0)::int AS gf,
+        -- Puntos de la tabla: la derrota por W.O. no suma.
+        COALESCE(SUM(CASE
+          WHEN (m.team1_p1 = pl.id OR m.team1_p2 = pl.id) AND m.score1 > m.score2 THEN t.points_win
+          WHEN (m.team2_p1 = pl.id OR m.team2_p2 = pl.id) AND m.score2 > m.score1 THEN t.points_win
+          WHEN m.id IS NOT NULL AND NOT m.walkover THEN t.points_loss
+          ELSE 0 END), 0)::int AS pts
       FROM tournaments t
       JOIN tournament_players tp ON tp.tournament_id = t.id
       JOIN players pl            ON pl.id = tp.player_id
@@ -1096,23 +1102,24 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       finishedIds.length ? sql`
         SELECT tournament_id, player_id,
                SUM(won)::int AS wins, SUM(diff)::int AS gdiff,
-               SUM(gf)::int AS gf, COUNT(*)::int AS played
+               SUM(gf)::int AS gf, COUNT(*)::int AS played,
+               SUM(CASE WHEN won = 0 AND NOT walkover THEN 1 ELSE 0 END)::int AS lost
         FROM (
           -- Un marcador igualado no es un partido válido: el front tampoco lo cuenta.
           SELECT tournament_id, team1_p1 AS player_id,
-                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END) AS won, score1 - score2 AS diff, score1 AS gf
+                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END) AS won, score1 - score2 AS diff, score1 AS gf, walkover
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team1_p2,
-                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END), score1 - score2, score1
+                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END), score1 - score2, score1, walkover
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team1_p2 IS NOT NULL AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team2_p1,
-                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2
+                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2, walkover
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team2_p2,
-                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2
+                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2, walkover
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team2_p2 IS NOT NULL AND score1 <> score2
         ) sub WHERE player_id IS NOT NULL
         GROUP BY tournament_id, player_id
@@ -1248,7 +1255,10 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
         if (!tWins.length) continue;
         // Mismo desempate que la tabla: victorias, diferencia, % de victorias,
         // games a favor (comparePairRows / compareStandingRows del front).
-        const asRow   = (w) => ({ wins: w.wins, diff: w.gdiff, played: w.played, gf: w.gf, pair_id: '' });
+        const asRow   = (w) => ({
+          points: w.wins * (t.points_win ?? 3) + w.lost * (t.points_loss ?? 0),
+          wins: w.wins, diff: w.gdiff, played: w.played, gf: w.gf, pair_id: '',
+        });
         const sorted  = [...tWins].sort((a, b) => comparePairRows(asRow(a), asRow(b)));
         const topList = sorted.filter((w) => comparePairRows(asRow(w), asRow(sorted[0])) === 0);
         const topIds  = new Set(topList.map((w) => w.player_id));
