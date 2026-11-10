@@ -137,6 +137,10 @@ router.get('/:tournamentId', async (req, res, next) => {
       // Las canchas mandan sobre number_of_courts, que es una copia vieja del club.
       club_courts:         tournament.club_courts ?? null,
       bracket:        tournament.bracket ?? null,
+      liga_mode:      tournament.liga_mode ?? 'jornada',
+      allow_rematch:  tournament.allow_rematch ?? false,
+      winner_format:  tournament.winner_format ?? 'tabla',
+      playoff_size:   tournament.playoff_size ?? null,
       // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
       signup: publicSignup(resolveSignup(tournament, {
         signup_open:       tournament.group_signup_open,
