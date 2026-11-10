@@ -182,7 +182,8 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     // Para el que no organiza: el cupo sin números y, antes de que empiece
     // el torneo, el plantel oculto (Fabri, 2026-11-09).
     if (!can_manage) {
-      const rosterHidden = !hasStarted(tournament, matches.length);
+      // En la liga por fechas, armar una fecha publica el fixture.
+      const rosterHidden = !hasStarted(tournament, matches.length) && fechas.length === 0;
       const used = signup.capacity != null ? await countUsedPlayers(sql, id) : 0;
       const {
         signup_capacity, signup_capacity_unit, group_signup_capacity, group_signup_capacity_unit, ...visible
@@ -733,6 +734,10 @@ router.post('/:id/fechas', requireAuth, requireTournamentManage, async (req, res
         [uid(), id, number, start_date, end_date || null]
       );
       await insertFechaCrosses(client, id, number, plan.crosses, ctx.pairs);
+      // La fecha 1 le da día al torneo si no lo tenía: lo usan las tarjetas y el inicio.
+      if (number === 1) {
+        await client.query('UPDATE tournaments SET event_date = COALESCE(event_date, $2::date) WHERE id = $1', [id, start_date]);
+      }
       return { fecha, scheduled_matches: await fechaScheduled(client, id, number), ...plan };
     });
 

@@ -107,7 +107,8 @@ router.get('/:tournamentId', async (req, res, next) => {
       ...extraPlayers.map((p) => ({ ...p, removed: true })),
     ];
  
-    const rosterHidden = !hasStarted(tournament, matches.length);
+    // En la liga por fechas, armar una fecha publica el fixture.
+    const rosterHidden = !hasStarted(tournament, matches.length) && fechas.length === 0;
 
     res.json({
       id:             tournament.id,
