@@ -12,6 +12,7 @@ import { hasStarted } from '../lib/registrations.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
+  countBracketPlayed,
 } from '../lib/profileStats.js';
 
 // GET /api/groups — solo los del usuario autenticado
@@ -1070,6 +1071,8 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     ]);
 
     if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
+    // Los partidos del cuadro no están en `matches`: se suman para que coincida con el torneo.
+    for (const t of tournaments) t.match_count += countBracketPlayed(t.bracket);
 
     const viewerId = req.user?.id ?? null;
     const is_owner = !!viewerId && group.user_id === viewerId;
