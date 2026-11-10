@@ -694,3 +694,71 @@ function propagateWinner(bracket, completedId, winnerId, winnerName) {
     bracket.final.pair2_name = winnerName;
   }
 }
+
+const emptyResult = () => ({ score1: null, score2: null, winner_id: null, winner_name: null });
+
+/**
+ * Cuadro de playoffs de una liga: las primeras parejas de la tabla, de 2 a 16.
+ * Con 8 o más usa el cuadro del americano. Con menos, los primeros pasan
+ * directo y el resto juega una ronda previa; el ganador toma el seed del mejor
+ * ubicado de su cruce.
+ * @param {Array} standings - ya ordenados y recortados al tamaño de los playoffs
+ */
+export function generatePlayoffBracket(standings) {
+  const N = standings.length;
+  if (N < 2 || N > 16) throw new Error('Los playoffs van de 2 a 16 parejas');
+  if (N >= 8) return { ...generateBracket(standings), kind: 'playoffs' };
+
+  const seed = (s) => ({ pair_id: standings[s - 1].pair_id, pair_name: standings[s - 1].pair_name });
+  // Ronda principal: 2 o 4 lugares. Los que no entran directo juegan la previa.
+  const M = N >= 4 ? 4 : 2;
+  const D = 2 * M - N;
+  const previaKey = M === 4 ? 'cuartos' : 'semis';
+  const previa = [];
+  for (let i = 0; i < N - M; i++) {
+    const hi = D + 1 + i;
+    const lo = N - i;
+    previa.push({
+      id: `${previaKey[0]}${i}`,
+      ...Object.fromEntries(Object.entries(seed(hi)).map(([k, v]) => [k.replace('pair_', 'pair1_'), v])),
+      ...Object.fromEntries(Object.entries(seed(lo)).map(([k, v]) => [k.replace('pair_', 'pair2_'), v])),
+      ...emptyResult(),
+      winner_seed: hi,
+    });
+  }
+  // Un lugar de la ronda principal: la pareja directa o el ganador de un cruce previo.
+  const slot = (s) => (s <= D
+    ? { source: null, seedNum: s, ...seed(s) }
+    : { source: previa[s - D - 1].id, seedNum: s, pair_id: null, pair_name: null });
+  const cruce = (id, a, b, extra = {}) => {
+    const s1 = slot(a), s2 = slot(b);
+    return {
+      id, source1: s1.source, source2: s2.source, seed1: s1.seedNum, seed2: s2.seedNum,
+      pair1_id: s1.pair_id, pair1_name: s1.pair_name, pair2_id: s2.pair_id, pair2_name: s2.pair_name,
+      ...emptyResult(), ...extra,
+    };
+  };
+
+  let semis = [];
+  let final;
+  if (M === 4) {
+    semis = [cruce('s0', 1, 4), cruce('s1', 2, 3)];
+    final = { id: 'f0', source1: 's0', source2: 's1', pair1_id: null, pair1_name: null, pair2_id: null, pair2_name: null, ...emptyResult() };
+  } else {
+    semis = previa;
+    final = cruce('f0', 1, 2);
+  }
+
+  return applyBracketWalkovers({
+    kind: 'playoffs',
+    generated_at: new Date().toISOString(),
+    total_pairs: N,
+    direct_count: D,
+    standings,
+    octavos: [],
+    cuartos: M === 4 ? previa : [],
+    semis,
+    final,
+    withdrawn_pair_ids: [],
+  });
+}

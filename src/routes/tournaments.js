@@ -10,6 +10,7 @@ import {
   generatePreviaSchedule, computeStandings, generateBracket,
   applyBracketResult, clearBracketResult, findBracketMatch,
   isPreviaComplete, isBracketMatchReady, planScheduleRows, applyBracketWalkovers,
+  generatePlayoffBracket,
 } from '../lib/tournamentLogic.js';
 import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations.js';
 import {
@@ -979,6 +980,49 @@ router.post('/:id/bracket', requireAuth, requireTournamentManage, async (req, re
     }
 
     res.json({ ...updated, bracket });
+  } catch (err) { next(err); }
+});
+
+// POST /api/tournaments/:id/playoffs — cierra la tabla de una liga con playoffs
+// y arma el cuadro con las primeras `playoff_size` parejas activas. Los partidos
+// del cuadro se cargan y se deshacen igual que en el americano.
+router.post('/:id/playoffs', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const result = await withTransaction(async (client) => {
+      const { rows: [t] } = await client.query(
+        'SELECT id, format, mode, status, bracket, winner_format, playoff_size FROM tournaments WHERE id = $1 FOR UPDATE', [id]
+      );
+      if (!t) return { status: 404, error: 'Torneo no encontrado' };
+      if (t.format !== 'liga' || t.winner_format !== 'playoffs') {
+        return { status: 400, error: 'Esta liga no se define por playoffs' };
+      }
+      if (t.mode !== 'pairs') return { status: 400, error: 'Los playoffs se juegan con parejas fijas' };
+      if (t.status === 'finished') return { status: 400, error: 'El torneo está finalizado' };
+      if (t.bracket) return { status: 409, error: 'Los playoffs ya están armados', code: 'bracket_exists' };
+
+      const [{ rows: pairsRaw }, { rows: matches }] = await Promise.all([
+        client.query(
+          `SELECT pr.id, pr.p1_id, pr.p2_id, pr.status, p1.name AS p1_name, p2.name AS p2_name
+           FROM pairs pr
+           JOIN players p1 ON p1.id = pr.p1_id
+           JOIN players p2 ON p2.id = pr.p2_id
+           WHERE pr.tournament_id = $1 ORDER BY pr.id`, [id]),
+        client.query('SELECT * FROM matches WHERE tournament_id = $1', [id]),
+      ]);
+      const tabla = computeStandings(pairsRaw, matches).filter((s) => !s.withdrawn);
+      if (tabla.length < t.playoff_size) {
+        return { status: 400, error: `Hay ${tabla.length} parejas activas y a playoffs pasan ${t.playoff_size}` };
+      }
+      const clasificadas = tabla.slice(0, t.playoff_size).map((s, i) => ({ ...s, seed: i + 1 }));
+      const bracket = generatePlayoffBracket(clasificadas);
+      const { rows: [saved] } = await client.query(
+        'UPDATE tournaments SET bracket = $1::jsonb WHERE id = $2 RETURNING *', [JSON.stringify(bracket), id]
+      );
+      return { saved, bracket };
+    });
+    if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+    res.json({ ...result.saved, bracket: result.bracket });
   } catch (err) { next(err); }
 });
 

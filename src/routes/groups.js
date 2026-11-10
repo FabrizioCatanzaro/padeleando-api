@@ -417,18 +417,19 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       ORDER BY m.played_at DESC, m.created_at DESC
     `,
 
-    // Campeón americano = ganó la final del bracket (winner_id es un pair_id)
+    // Campeón por cuadro = ganó la final (winner_id es un pair_id). En el
+    // americano y en la liga con playoffs; la liga suma a títulos de liga.
     sql`
       WITH user_players AS (
         SELECT id FROM players WHERE user_id = ${owner.id}
       )
-      SELECT COUNT(*)::int AS campeon_americano
+      SELECT COUNT(*) FILTER (WHERE t.format = 'americano')::int AS campeon_americano,
+             COUNT(*) FILTER (WHERE t.format <> 'americano')::int AS campeon_playoffs
       FROM tournaments t
       JOIN pairs pr
         ON pr.tournament_id = t.id
         AND pr.id = (t.bracket->'final'->>'winner_id')
-      WHERE t.format = 'americano'
-        AND t.status = 'finished'
+      WHERE t.status = 'finished'
         AND t.bracket->'final'->>'winner_id' IS NOT NULL
         AND (
           pr.p1_id IN (SELECT id FROM user_players)
@@ -565,8 +566,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
          WHERE pr.tournament_id = t.id) AS pairs
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
-      WHERE t.format = 'americano'
-        AND t.bracket IS NOT NULL
+      WHERE t.bracket IS NOT NULL
         AND EXISTS (
           SELECT 1 FROM pairs pr
           JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
@@ -600,6 +600,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           OR m.team2_p1 = pl.id OR m.team2_p2 = pl.id)
       WHERE t.status = 'finished'
         AND t.format <> 'americano'
+        AND t.bracket IS NULL
         AND EXISTS (
           SELECT 1 FROM tournament_players tp2
           JOIN players p2 ON p2.id = tp2.player_id
@@ -688,8 +689,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
          JOIN players p2 ON p2.id = pr.p2_id
          WHERE pr.tournament_id = t.id) AS pairs
       FROM tournaments t
-      WHERE t.format = 'americano'
-        AND t.bracket IS NOT NULL
+      WHERE t.bracket IS NOT NULL
         AND EXISTS (
           SELECT 1 FROM pairs pr
           JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
@@ -774,7 +774,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       segundos_jugados: 0, partidos_con_duracion: 0,
       ajustados: 0, ajustados_ganados: 0, torneos_este_mes: 0,
     };
-    const titulosLiga      = countLeagueTitles(leagueRows);
+    const titulosLiga      = countLeagueTitles(leagueRows) + (americanoChamp?.campeon_playoffs ?? 0);
     const titulosAmericano = americanoChamp?.campeon_americano ?? 0;
     const baseStats = {
       ...base,
@@ -1079,9 +1079,10 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     const pairsModeIds = tournaments
       .filter((t) => t.status === 'finished' && t.mode === 'pairs')
       .map((t) => t.id);
-    // Americano: resolver ganador desde pares actuales (no desde el string guardado en el bracket)
+    // Con cuadro (americano o liga con playoffs) el ganador es el de la final,
+    // resuelto desde las parejas actuales y no desde el nombre guardado.
     const americanoFinished = tournaments.filter(
-      (t) => t.status === 'finished' && t.format === 'americano' && t.bracket?.final?.winner_id
+      (t) => t.status === 'finished' && t.bracket?.final?.winner_id
     );
     const americanoPairIds = americanoFinished.map((t) => t.bracket.final.winner_id);
 
@@ -1238,7 +1239,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       }
 
       for (const t of tournaments) {
-        if (t.status !== 'finished' || t.format === 'americano') continue;
+        if (t.status !== 'finished' || t.format === 'americano' || t.bracket?.final?.winner_id) continue;
 
         const tWins = winsByT[t.id] ?? [];
         if (!tWins.length) continue;
