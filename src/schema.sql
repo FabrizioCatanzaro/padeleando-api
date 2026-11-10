@@ -731,3 +731,8 @@ ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS points_loss INTEGER NOT NULL DE
 ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_points_check;
 ALTER TABLE tournaments ADD  CONSTRAINT tournaments_points_check
   CHECK (points_win BETWEEN 0 AND 10 AND points_loss BETWEEN 0 AND 10 AND points_loss <= points_win);
+
+-- Flyer del torneo (2026-11-10): imagen para promocionarlo, se muestra en 9:16.
+-- Gratis para todos. Ver POST /tournaments/:id/flyer.
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS flyer_url       TEXT;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS flyer_public_id TEXT;

@@ -3,6 +3,8 @@ import { getDb, withTransaction } from '../db.js';
 import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
+import { uploadTournamentPhoto } from '../middleware/upload.js';
+import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { canManageGroup } from '../lib/access.js';
 import { parseSignupFields, resolveSignup } from '../lib/signup.js';
 import { tournamentQuotaError } from '../lib/plan.js';
@@ -608,8 +610,38 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
 router.delete('/:id', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
     const sql = getDb();
-    await sql`DELETE FROM tournaments WHERE id = ${req.params.id}`;
+    const [gone] = await sql`DELETE FROM tournaments WHERE id = ${req.params.id} RETURNING flyer_public_id`;
+    if (gone?.flyer_public_id) await deleteByPublicId(gone.flyer_public_id);
     res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// POST /api/tournaments/:id/flyer — imagen para promocionar el torneo. Gratis, sin compuerta premium.
+router.post('/:id/flyer', requireAuth, requireTournamentManage, uploadTournamentPhoto, async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No se envió imagen' });
+    const sql = getDb();
+    const [t] = await sql`SELECT id, flyer_public_id FROM tournaments WHERE id = ${req.params.id}`;
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    const result = await uploadBuffer(req.file.buffer, { folder: `padeliando/tournaments/${t.id}/flyer` });
+    const [updated] = await sql`
+      UPDATE tournaments SET flyer_url = ${result.secure_url}, flyer_public_id = ${result.public_id}
+      WHERE id = ${t.id} RETURNING id, flyer_url
+    `;
+    if (t.flyer_public_id) await deleteByPublicId(t.flyer_public_id);
+    res.json(updated);
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/tournaments/:id/flyer
+router.delete('/:id/flyer', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [t] = await sql`SELECT id, flyer_public_id FROM tournaments WHERE id = ${req.params.id}`;
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    await sql`UPDATE tournaments SET flyer_url = NULL, flyer_public_id = NULL WHERE id = ${t.id}`;
+    if (t.flyer_public_id) await deleteByPublicId(t.flyer_public_id);
+    res.json({ id: t.id, flyer_url: null });
   } catch (err) { next(err); }
 });
 

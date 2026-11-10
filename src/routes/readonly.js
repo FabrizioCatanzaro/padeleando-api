@@ -144,6 +144,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       playoff_size:   tournament.playoff_size ?? null,
       points_win:     tournament.points_win ?? 3,
       points_loss:    tournament.points_loss ?? 0,
+      flyer_url:      tournament.flyer_url ?? null,
       // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
       signup: publicSignup(resolveSignup(tournament, {
         signup_open:       tournament.group_signup_open,
