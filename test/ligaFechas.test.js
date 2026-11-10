@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   generateFecha, validateFecha, crossesFromRows, fechaHistory,
-  scheduledIdsToCancel, fechaDatesError,
+  scheduledIdsToCancel, fechaDatesError, parseLigaSettings, isIsoDate,
 } from '../src/lib/ligaFechas.js';
 
 // N parejas: pareja i = jugadores a{i} y b{i}.
@@ -198,4 +198,34 @@ test('fechaDatesError valida los días de la fecha', () => {
   assert.match(fechaDatesError('2026-02-30', null), /primer día/);
   assert.match(fechaDatesError('2026-11-14', '2026-13-01'), /no es válido/);
   assert.match(fechaDatesError('2026-11-15', '2026-11-14'), /anterior/);
+});
+
+test('parseLigaSettings lee y valida las opciones de la liga', () => {
+  assert.deepEqual(parseLigaSettings({}), {});
+  assert.deepEqual(parseLigaSettings({ liga_mode: 'temporada', allow_rematch: true }),
+    { liga_mode: 'temporada', allow_rematch: true });
+  assert.deepEqual(parseLigaSettings({ winner_format: 'playoffs', playoff_size: 4 }),
+    { winner_format: 'playoffs', playoff_size: 4 });
+  assert.throws(() => parseLigaSettings({ liga_mode: 'temporada' }, { format: 'americano' }), /solo para torneos Liga/);
+  assert.throws(() => parseLigaSettings({ liga_mode: 'semana' }), /un solo día o en varios/);
+  assert.throws(() => parseLigaSettings({ allow_rematch: 'si' }), /cruces repetidos/);
+  assert.throws(() => parseLigaSettings({ winner_format: 'puntos' }), /campeón/);
+  assert.throws(() => parseLigaSettings({ winner_format: 'playoffs' }), /cuántas parejas/);
+  assert.throws(() => parseLigaSettings({ winner_format: 'playoffs', playoff_size: 1 }), /entre 2 y 16/);
+  assert.throws(() => parseLigaSettings({ winner_format: 'playoffs', playoff_size: 2.5 }), /entre 2 y 16/);
+  // Edición parcial: playoffs ya guardados, cambia solo la cantidad.
+  assert.deepEqual(parseLigaSettings({ playoff_size: 8 }, { current: { winner_format: 'playoffs', playoff_size: 4 } }),
+    { playoff_size: 8 });
+  assert.throws(() => parseLigaSettings({ playoff_size: null }, { current: { winner_format: 'playoffs', playoff_size: 4 } }),
+    /cuántas parejas/);
+  // Volver a tabla limpia la cantidad.
+  assert.deepEqual(parseLigaSettings({ winner_format: 'tabla' }, { current: { winner_format: 'playoffs', playoff_size: 4 } }),
+    { winner_format: 'tabla', playoff_size: null });
+});
+
+test('isIsoDate acepta solo días reales', () => {
+  assert.equal(isIsoDate('2026-11-14'), true);
+  assert.equal(isIsoDate('2026-02-30'), false);
+  assert.equal(isIsoDate('14/11/2026'), false);
+  assert.equal(isIsoDate(null), false);
 });

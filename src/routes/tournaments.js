@@ -12,6 +12,9 @@ import {
   isPreviaComplete, isBracketMatchReady, planScheduleRows, applyBracketWalkovers,
 } from '../lib/tournamentLogic.js';
 import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations.js';
+import {
+  parseLigaSettings, generateFecha, validateFecha, crossesFromRows, fechaDatesError,
+} from '../lib/ligaFechas.js';
 
 const router = Router();
 
@@ -96,8 +99,15 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     // Van en su propia lista para que nada de lo que ya cuenta partidos jugados
     // los tome por jugados.
     const scheduled = await sql`
-      SELECT * FROM scheduled_matches WHERE tournament_id = ${id}
+      SELECT *, scheduled_date::text AS scheduled_date
+      FROM scheduled_matches WHERE tournament_id = ${id}
       ORDER BY scheduled_at NULLS LAST, round NULLS LAST, position, created_at
+    `;
+
+    // Las fechas de una liga en varios días: número y días de juego.
+    const fechas = await sql`
+      SELECT id, tournament_id, number, start_date::text AS start_date, end_date::text AS end_date, created_at
+      FROM tournament_fechas WHERE tournament_id = ${id} ORDER BY number
     `;
 
     // Incluir info de vinculación: usuario registrado + invitación pendiente si aplica
@@ -185,6 +195,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         pairs: rosterHidden ? [] : pairs,
         matches,
         scheduled_matches: rosterHidden ? [] : scheduled,
+        fechas,
         roster_hidden: rosterHidden,
         is_owner, can_manage,
       });
@@ -195,7 +206,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       // Mismo nombre que en /api/readonly/:id: el frontend lee uno solo.
       group_owner_is_premium: tournament.owner_is_premium,
       signup,
-      players, pairs, matches, scheduled_matches: scheduled, is_owner, can_manage,
+      players, pairs, matches, scheduled_matches: scheduled, fechas, is_owner, can_manage,
     });
   } catch (err) { next(err); }
 });
@@ -219,9 +230,14 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     if (!['liga', 'americano'].includes(format)) return res.status(400).json({ error: 'format debe ser "liga" o "americano"' });
 
     // Lo que no venga queda en NULL: la jornada hereda ese campo de la categoría.
-    let signup;
-    try { signup = parseSignupFields(req.body); }
-    catch (e) { return res.status(400).json({ error: e.message }); }
+    let signup, liga;
+    try {
+      signup = parseSignupFields(req.body);
+      liga = parseLigaSettings(req.body, { format });
+    } catch (e) { return res.status(400).json({ error: e.message }); }
+    if (liga.liga_mode === 'temporada' && mode !== 'pairs') {
+      return res.status(400).json({ error: 'La liga en varios días se juega con parejas fijas' });
+    }
 
     // El americano se puede crear como "borrador" con menos de 8 parejas: recién al
     // llegar al mínimo se habilitan el calendario, los partidos y el cuadro
@@ -382,14 +398,18 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
         `INSERT INTO tournaments
            (id, group_id, name, mode, format, number_of_courts, club_id, event_date, event_time, pending_club_request_id,
             signup_open, signup_price, signup_price_unit, signup_contacts, level,
-            signup_capacity, signup_capacity_unit, signup_closes_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18) RETURNING *`,
+            signup_capacity, signup_capacity_unit, signup_closes_at,
+            liga_mode, allow_rematch, winner_format, playoff_size)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18,
+                 $19, $20, $21, $22) RETURNING *`,
         [tId, groupId, name.trim(), mode, format, number_of_courts ?? 1,
          club_id ?? null, event_date || null, event_time || null, pending_club_request_id ?? null,
          signup.signup_open ?? null, signup.signup_price ?? null, signup.signup_price_unit ?? null,
          signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null,
          signup.level ?? null,
-         signup.signup_capacity ?? null, signup.signup_capacity_unit ?? null, signup.signup_closes_at ?? null]
+         signup.signup_capacity ?? null, signup.signup_capacity_unit ?? null, signup.signup_closes_at ?? null,
+         liga.liga_mode ?? 'jornada', liga.allow_rematch ?? false,
+         liga.winner_format ?? 'tabla', liga.playoff_size ?? null]
       );
 
       if (players.length) {
@@ -513,6 +533,28 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
       if (!club) return res.status(404).json({ error: 'Club no encontrado' });
     }
 
+    // Opciones de la liga por fechas: se validan contra lo guardado, porque
+    // la edición puede traer solo una.
+    let liga = {};
+    const tocaLiga = ['liga_mode', 'allow_rematch', 'winner_format', 'playoff_size']
+      .some((k) => req.body[k] !== undefined);
+    if (tocaLiga || mode !== undefined) {
+      const [cur] = await sql`
+        SELECT t.format, t.mode, t.liga_mode, t.winner_format, t.playoff_size,
+               EXISTS (SELECT 1 FROM tournament_fechas f WHERE f.tournament_id = t.id) AS has_fechas
+        FROM tournaments t WHERE t.id = ${id}
+      `;
+      if (!cur) return res.status(404).json({ error: 'Torneo no encontrado' });
+      try { liga = parseLigaSettings(req.body, { format: cur.format, current: cur }); }
+      catch (e) { return res.status(400).json({ error: e.message }); }
+      if ((liga.liga_mode ?? cur.liga_mode) === 'temporada' && (mode ?? cur.mode) !== 'pairs') {
+        return res.status(400).json({ error: 'La liga en varios días se juega con parejas fijas' });
+      }
+      if (liga.liga_mode && liga.liga_mode !== cur.liga_mode && cur.has_fechas) {
+        return res.status(409).json({ error: 'La liga ya tiene fechas armadas: no se puede cambiar a un solo día' });
+      }
+    }
+
     // live_match se limpia al finalizar: nadie lo hacía y la jornada terminada
     // conservaba el último payload de partidos en curso, así que seguía
     // figurando "en vivo" en la portada y en la categoría. La condición usa el
@@ -525,6 +567,10 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           live_match       = CASE WHEN COALESCE(${status ?? null}, status) = 'finished' THEN NULL ELSE live_match END,
           mode             = COALESCE(${mode   ?? null}, mode),
           number_of_courts = COALESCE(${number_of_courts ?? null}, number_of_courts),
+          liga_mode        = COALESCE(${liga.liga_mode ?? null}, liga_mode),
+          allow_rematch    = COALESCE(${liga.allow_rematch ?? null}::boolean, allow_rematch),
+          winner_format    = COALESCE(${liga.winner_format ?? null}, winner_format),
+          playoff_size     = CASE WHEN ${'playoff_size' in liga}::boolean THEN ${liga.playoff_size ?? null}::int ELSE playoff_size END,
           club_id          = CASE WHEN ${club_id !== undefined}::boolean    THEN ${club_id || null}    ELSE club_id    END,
           pending_club_request_id = CASE WHEN ${pending_club_request_id !== undefined}::boolean THEN ${pending_club_request_id || null} ELSE pending_club_request_id END,
           event_date       = CASE WHEN ${event_date !== undefined}::boolean THEN ${event_date || null}::date ELSE event_date END,
@@ -573,6 +619,218 @@ router.patch('/:id/live', requireAuth, requireTournamentManage, async (req, res,
     const val = live_match != null ? JSON.stringify(live_match) : null;
     await sql`UPDATE tournaments SET live_match = ${val}::jsonb WHERE id = ${req.params.id}`;
     res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// ─── LIGA POR FECHAS ──────────────────────────────────────────────────────────
+// Una liga en varios días (liga_mode = 'temporada') se arma de a una fecha,
+// al azar o a mano. Los cruces se guardan como partidos programados con
+// round = número de fecha. La lógica vive en lib/ligaFechas.js.
+
+const NO_COMPLETA = 'Con estos cruces ya no se completa el todos contra todos';
+// Los días salen como texto YYYY-MM-DD: como DATE, el driver los convierte en
+// Date con la zona horaria del servidor y el día se puede correr.
+const FECHA_COLS = 'id, tournament_id, number, start_date::text AS start_date, end_date::text AS end_date, created_at';
+
+// Lee el torneo bloqueado y todo lo que el armado necesita, en una transacción.
+async function loadFechaContext(client, id) {
+  const { rows: [tournament] } = await client.query(
+    `SELECT id, format, status, liga_mode, allow_rematch FROM tournaments WHERE id = $1 FOR UPDATE`, [id]
+  );
+  if (!tournament) return { tournament: null };
+  const [{ rows: pairs }, { rows: matches }, { rows: scheduled }, { rows: fechas }] = await Promise.all([
+    client.query('SELECT id, p1_id, p2_id, status FROM pairs WHERE tournament_id = $1 ORDER BY id', [id]),
+    client.query('SELECT team1_p1, team1_p2, team2_p1, team2_p2, round FROM matches WHERE tournament_id = $1', [id]),
+    client.query('SELECT * FROM scheduled_matches WHERE tournament_id = $1', [id]),
+    client.query(`SELECT ${FECHA_COLS} FROM tournament_fechas WHERE tournament_id = $1 ORDER BY number`, [id]),
+  ]);
+  return { tournament, pairs, matches, scheduled, fechas };
+}
+
+function temporadaError(tournament) {
+  if (!tournament) return { status: 404, error: 'Torneo no encontrado' };
+  if (tournament.format !== 'liga' || tournament.liga_mode !== 'temporada') {
+    return { status: 400, error: 'Solo disponible en ligas que se juegan en varios días' };
+  }
+  if (tournament.status === 'finished') return { status: 400, error: 'El torneo está finalizado' };
+  return null;
+}
+
+// Guarda cruces de pareja contra pareja como programados de una fecha.
+async function insertFechaCrosses(client, tournamentId, number, crosses, pairs, firstPosition = 0) {
+  if (!crosses.length) return;
+  const byId = new Map(pairs.map((p) => [String(p.id), p]));
+  const rows = crosses.map(([a, b]) => [byId.get(String(a)), byId.get(String(b))]);
+  await client.query(
+    `INSERT INTO scheduled_matches
+       (id, tournament_id, team1_p1, team1_p2, team2_p1, team2_p2, round, position)
+     SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::int[], $8::int[])`,
+    [
+      rows.map(() => uid()), rows.map(() => tournamentId),
+      rows.map(([a]) => a.p1_id), rows.map(([a]) => a.p2_id),
+      rows.map(([, b]) => b.p1_id), rows.map(([, b]) => b.p2_id),
+      rows.map(() => number), rows.map((_, i) => firstPosition + i),
+    ]
+  );
+}
+
+const fechaScheduled = async (client, id, number) => (await client.query(
+  `SELECT *, scheduled_date::text AS scheduled_date
+   FROM scheduled_matches WHERE tournament_id = $1 AND round = $2
+   ORDER BY scheduled_matches.scheduled_date NULLS LAST, scheduled_at NULLS LAST, position, created_at`, [id, number]
+)).rows;
+
+// POST /api/tournaments/:id/fechas — arma la fecha siguiente.
+// Body: { start_date, end_date?, mode: 'random' | 'manual', crosses?: [[pairId, pairId]], preview? }
+// Al azar, la app elige los cruces; a mano, vienen en `crosses`. Con
+// preview: true devuelve la fecha propuesta sin guardarla, para que el
+// organizador la revise y la guarde a mano. Responde con los cruces, las
+// parejas libres y los avisos (`warnings`).
+router.post('/:id/fechas', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const { start_date, end_date = null, mode = 'random', crosses: proposed, preview = false } = req.body;
+    if (!['random', 'manual'].includes(mode)) return res.status(400).json({ error: 'mode debe ser "random" o "manual"' });
+    if (!preview) {
+      const dateErr = fechaDatesError(start_date, end_date);
+      if (dateErr) return res.status(400).json({ error: dateErr });
+    }
+    if (mode === 'manual' && (!Array.isArray(proposed) || proposed.length === 0)) {
+      return res.status(400).json({ error: 'Elegí al menos un cruce' });
+    }
+    if (mode === 'manual' && !proposed.every((c) => Array.isArray(c) && c.length === 2)) {
+      return res.status(400).json({ error: 'Cada cruce son dos parejas' });
+    }
+
+    const result = await withTransaction(async (client) => {
+      const ctx = await loadFechaContext(client, id);
+      const err = temporadaError(ctx.tournament);
+      if (err) return err;
+
+      const history = crossesFromRows(ctx.pairs, [...ctx.matches, ...ctx.scheduled]);
+      const number = ctx.fechas.length ? ctx.fechas[ctx.fechas.length - 1].number + 1 : 1;
+      const allowRematch = ctx.tournament.allow_rematch;
+
+      let plan;
+      if (mode === 'random') {
+        try {
+          const f = generateFecha({ pairs: ctx.pairs, crosses: history, allowRematch });
+          plan = {
+            crosses: f.crosses, libres: f.libres, completable: f.completable,
+            warnings: f.completable === false ? [NO_COMPLETA] : [],
+          };
+        } catch (e) { return { status: 409, error: e.message }; }
+      } else {
+        const v = validateFecha({ pairs: ctx.pairs, crosses: history, proposed, allowRematch });
+        if (v.errors.length) return { status: 400, error: v.errors[0], errors: v.errors };
+        plan = { crosses: proposed.map(([a, b]) => [String(a), String(b)]), libres: v.libres, completable: v.completable, warnings: v.warnings };
+      }
+      if (preview) return { preview: true, number, ...plan };
+
+      const { rows: [fecha] } = await client.query(
+        `INSERT INTO tournament_fechas (id, tournament_id, number, start_date, end_date)
+         VALUES ($1, $2, $3, $4, $5) RETURNING ${FECHA_COLS}`,
+        [uid(), id, number, start_date, end_date || null]
+      );
+      await insertFechaCrosses(client, id, number, plan.crosses, ctx.pairs);
+      return { fecha, scheduled_matches: await fechaScheduled(client, id, number), ...plan };
+    });
+
+    if (result.error) return res.status(result.status).json({ error: result.error, errors: result.errors });
+    res.status(result.preview ? 200 : 201).json(result);
+  } catch (err) { next(err); }
+});
+
+// PUT /api/tournaments/:id/fechas/:number — cambia los días o los cruces.
+// Body: { start_date?, end_date?, crosses?: [[pairId, pairId]] }
+// Los cruces solo se cambian si la fecha no tiene partidos jugados. Los que
+// quedan igual conservan su cancha, día y horario.
+router.put('/:id/fechas/:number', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const number = Number(req.params.number);
+    if (!Number.isInteger(number) || number < 1) return res.status(400).json({ error: 'Fecha inválida' });
+    const { crosses: proposed } = req.body;
+    if (proposed !== undefined && (!Array.isArray(proposed) || proposed.length === 0
+        || !proposed.every((c) => Array.isArray(c) && c.length === 2))) {
+      return res.status(400).json({ error: 'Elegí al menos un cruce' });
+    }
+
+    const result = await withTransaction(async (client) => {
+      const ctx = await loadFechaContext(client, id);
+      const err = temporadaError(ctx.tournament);
+      if (err) return err;
+      const fecha = ctx.fechas.find((f) => f.number === number);
+      if (!fecha) return { status: 404, error: 'Fecha no encontrada' };
+
+      const start = req.body.start_date !== undefined ? req.body.start_date : fecha.start_date;
+      const end   = req.body.end_date   !== undefined ? req.body.end_date   : fecha.end_date;
+      const dateErr = fechaDatesError(start, end);
+      if (dateErr) return { status: 400, error: dateErr };
+
+      let plan = {};
+      if (proposed !== undefined) {
+        if (ctx.matches.some((m) => m.round === number)) {
+          return { status: 409, error: 'Esta fecha ya tiene partidos jugados: sus cruces no se cambian' };
+        }
+        const own = ctx.scheduled.filter((r) => r.round === number);
+        const others = ctx.scheduled.filter((r) => r.round !== number);
+        const history = crossesFromRows(ctx.pairs, [...ctx.matches, ...others]);
+        const v = validateFecha({ pairs: ctx.pairs, crosses: history, proposed, allowRematch: ctx.tournament.allow_rematch });
+        if (v.errors.length) return { status: 400, error: v.errors[0], errors: v.errors };
+
+        // Diferencia contra lo guardado: se borra lo que sale y se agrega lo nuevo.
+        const k = (a, b) => [String(a), String(b)].sort().join('|');
+        const wanted = new Set(proposed.map(([a, b]) => k(a, b)));
+        const keepKeys = new Set();
+        const toDelete = [];
+        for (const row of own) {
+          const [c] = crossesFromRows(ctx.pairs, [row]);
+          const key = c && k(c.a, c.b);
+          if (key && wanted.has(key) && !keepKeys.has(key)) keepKeys.add(key);
+          else toDelete.push(row.id);
+        }
+        if (toDelete.length) {
+          await client.query('DELETE FROM scheduled_matches WHERE id = ANY($1::text[])', [toDelete]);
+        }
+        const toInsert = proposed.filter(([a, b]) => !keepKeys.has(k(a, b)));
+        await insertFechaCrosses(client, id, number, toInsert, ctx.pairs, own.length);
+        plan = { libres: v.libres, completable: v.completable, warnings: v.warnings };
+      }
+
+      const { rows: [updated] } = await client.query(
+        `UPDATE tournament_fechas SET start_date = $1, end_date = $2 WHERE id = $3 RETURNING ${FECHA_COLS}`,
+        [start, end || null, fecha.id]
+      );
+      return { fecha: updated, scheduled_matches: await fechaScheduled(client, id, number), ...plan };
+    });
+
+    if (result.error) return res.status(result.status).json({ error: result.error, errors: result.errors });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/tournaments/:id/fechas/:number — deshace la última fecha.
+// Solo la última y solo sin partidos jugados: borra la fecha y sus programados.
+router.delete('/:id/fechas/:number', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const number = Number(req.params.number);
+    const result = await withTransaction(async (client) => {
+      const ctx = await loadFechaContext(client, id);
+      const err = temporadaError(ctx.tournament);
+      if (err) return err;
+      const last = ctx.fechas[ctx.fechas.length - 1];
+      if (!last || last.number !== number) return { status: 400, error: 'Solo se puede borrar la última fecha' };
+      if (ctx.matches.some((m) => m.round === number)) {
+        return { status: 409, error: 'Esta fecha ya tiene partidos jugados' };
+      }
+      await client.query('DELETE FROM scheduled_matches WHERE tournament_id = $1 AND round = $2', [id, number]);
+      await client.query('DELETE FROM tournament_fechas WHERE id = $1', [last.id]);
+      return { ok: true };
+    });
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    res.json(result);
   } catch (err) { next(err); }
 });
 

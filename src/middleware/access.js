@@ -50,11 +50,12 @@ export const requireGroupManage = makeManageGuard(
 
 // Resuelve la categoría desde un torneo (:id / :tournamentId / body.tournamentId).
 // Expone también format, status y mode, que varios handlers necesitaban y
-// volvían a consultar por su cuenta.
+// volvían a consultar por su cuenta, y las opciones de la liga por fechas.
 export const requireTournamentManage = makeManageGuard(
   (req) => req.params.id ?? req.params.tournamentId ?? req.body?.tournamentId ?? null,
   (sql, tournamentId, userId) => sql`
     SELECT t.id AS tournament_id, t.group_id, t.format, t.status, t.mode,
+           t.liga_mode, t.allow_rematch,
            (g.user_id = ${userId}) AS is_owner,
            EXISTS (SELECT 1 FROM group_collaborators gc
                    WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab
@@ -84,6 +85,7 @@ export const requireScheduledManage = makeManageGuard(
   (req) => req.params.id ?? null,
   (sql, scheduledId, userId) => sql`
     SELECT sm.id AS scheduled_id, t.id AS tournament_id, t.group_id, t.format, t.status,
+           t.liga_mode, t.allow_rematch,
            (g.user_id = ${userId}) AS is_owner,
            EXISTS (SELECT 1 FROM group_collaborators gc
                    WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab
@@ -99,6 +101,7 @@ export const requirePairManage = makeManageGuard(
   (req) => req.params.id ?? null,
   (sql, pairId, userId) => sql`
     SELECT p.id AS pair_id, t.id AS tournament_id, t.group_id, t.format, t.status,
+           t.liga_mode,
            (g.user_id = ${userId}) AS is_owner,
            EXISTS (SELECT 1 FROM group_collaborators gc
                    WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab

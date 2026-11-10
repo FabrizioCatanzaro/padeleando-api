@@ -59,9 +59,16 @@ router.get('/:tournamentId', async (req, res, next) => {
     // El fixture es lo que el espectador viene a mirar antes de que empiece:
     // contra quién juega y en qué cancha.
     const scheduled = await sql`
-      SELECT * FROM scheduled_matches
+      SELECT *, scheduled_date::text AS scheduled_date
+      FROM scheduled_matches
       WHERE tournament_id = ${tournamentId}
       ORDER BY scheduled_at NULLS LAST, round NULLS LAST, position, created_at
+    `;
+
+    // Las fechas de una liga en varios días (vacío en el resto).
+    const fechas = await sql`
+      SELECT id, tournament_id, number, start_date::text AS start_date, end_date::text AS end_date, created_at
+      FROM tournament_fechas WHERE tournament_id = ${tournamentId} ORDER BY number
     `;
  
     // Canonical player list from tournament_players table
@@ -145,6 +152,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       pairs:             rosterHidden ? [] : pairs,
       matches,
       scheduled_matches: rosterHidden ? [] : scheduled,
+      fechas,
       roster_hidden:     rosterHidden,
     });
   } catch (err) { next(err); }

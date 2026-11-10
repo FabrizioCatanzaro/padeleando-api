@@ -319,8 +319,11 @@ export function scheduledIdsToCancel(pair, scheduledRows = []) {
 }
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-const validDate = (s) => ISO_DATE.test(s ?? '') && !Number.isNaN(Date.parse(`${s}T00:00:00Z`))
+/** Fecha de calendario real en formato YYYY-MM-DD (rechaza 2026-02-30). */
+export const isIsoDate = (s) => typeof s === 'string' && ISO_DATE.test(s)
+  && !Number.isNaN(Date.parse(`${s}T00:00:00Z`))
   && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
+const validDate = isIsoDate;
 
 /**
  * Días de una fecha: desde y hasta (YYYY-MM-DD). Hasta es opcional (un solo
@@ -333,4 +336,51 @@ export function fechaDatesError(start_date, end_date) {
   if (!validDate(end_date)) return 'El último día de la fecha no es válido';
   if (end_date < start_date) return 'El último día no puede ser anterior al primero';
   return null;
+}
+
+export const LIGA_MODES     = ['jornada', 'temporada'];
+export const WINNER_FORMATS = ['tabla', 'playoffs'];
+export const MAX_PLAYOFF_SIZE = 16;
+
+/**
+ * Lee las opciones de liga del body de un alta o una edición de torneo.
+ * Devuelve solo las que vinieron. Con ganador por tabla, playoff_size queda
+ * en null; con playoffs es obligatorio.
+ * @param {object} body
+ * @param {{ format?: string, current?: {winner_format?, playoff_size?} }} [ctx]
+ *   `current` son los valores guardados, para una edición parcial.
+ * @returns {{liga_mode?, allow_rematch?, winner_format?, playoff_size?}}
+ * @throws {Error} con el mensaje para el organizador
+ */
+export function parseLigaSettings(body = {}, { format = 'liga', current = {} } = {}) {
+  const has = (k) => body[k] !== undefined;
+  const out = {};
+  if (!['liga_mode', 'allow_rematch', 'winner_format', 'playoff_size'].some(has)) return out;
+  if (format !== 'liga') throw new Error('Estas opciones son solo para torneos Liga');
+
+  if (has('liga_mode')) {
+    if (!LIGA_MODES.includes(body.liga_mode)) throw new Error('Elegí si la liga se juega en un solo día o en varios días');
+    out.liga_mode = body.liga_mode;
+  }
+  if (has('allow_rematch')) {
+    if (typeof body.allow_rematch !== 'boolean') throw new Error('Indicá si se permiten cruces repetidos');
+    out.allow_rematch = body.allow_rematch;
+  }
+  if (has('winner_format')) {
+    if (!WINNER_FORMATS.includes(body.winner_format)) throw new Error('Elegí cómo se define el campeón');
+    out.winner_format = body.winner_format;
+  }
+  if (has('playoff_size')) {
+    const v = body.playoff_size;
+    if (v !== null && (!Number.isInteger(v) || v < 2 || v > MAX_PLAYOFF_SIZE)) {
+      throw new Error(`A playoffs pasan entre 2 y ${MAX_PLAYOFF_SIZE} parejas`);
+    }
+    out.playoff_size = v;
+  }
+
+  const winner = out.winner_format ?? current.winner_format ?? 'tabla';
+  const size = 'playoff_size' in out ? out.playoff_size : (current.playoff_size ?? null);
+  if (winner === 'playoffs' && size == null) throw new Error('Indicá cuántas parejas pasan a playoffs');
+  if (winner === 'tabla' && size != null) out.playoff_size = null;
+  return out;
 }
