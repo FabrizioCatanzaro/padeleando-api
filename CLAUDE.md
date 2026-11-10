@@ -73,6 +73,7 @@ src/
   middleware/       auth.js · access.js · requirePremium.js · upload.js
   lib/              access.js · plan.js · profileStats.js · signup.js · richText.js
                     tournamentLogic.js (previa, tabla de parejas, cuadro — pura, con tests)
+                    ligaFechas.js (armado de fechas de la liga por fechas — pura, con tests)
                     cloudinary.js · deleteUser.js
   emails/           React Email templates (Layout, Welcome, VerifyEmail, ResetPassword,
                     Goodbye, AdminBroadcast)

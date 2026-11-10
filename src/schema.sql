@@ -678,3 +678,42 @@ CREATE TABLE IF NOT EXISTS tournament_instagram_posts (
   UNIQUE (tournament_id, shortcode)
 );
 CREATE INDEX IF NOT EXISTS idx_instagram_posts_tournament ON tournament_instagram_posts(tournament_id, created_at);
+
+-- Liga por fechas (2026-11-09). Una liga puede jugarse en un solo día (como
+-- hasta ahora) o en varios días, con la temporada dividida en fechas. El
+-- organizador elige al crearla si se permiten cruces repetidos y cómo se
+-- define el campeón. Ver lib/ligaFechas.js y el doc "Diseño: liga por fechas".
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS liga_mode     TEXT    NOT NULL DEFAULT 'jornada';
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS allow_rematch BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS winner_format TEXT    NOT NULL DEFAULT 'tabla';
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS playoff_size  INTEGER;
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_liga_mode_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_liga_mode_check
+  CHECK (liga_mode IN ('jornada', 'temporada'));
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_winner_format_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_winner_format_check
+  CHECK (winner_format IN ('tabla', 'playoffs'));
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_playoff_size_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_playoff_size_check
+  CHECK (playoff_size IS NULL OR playoff_size >= 2);
+
+-- Las fechas de una temporada: número y días que define el organizador.
+-- end_date NULL = la fecha se juega en un solo día.
+CREATE TABLE IF NOT EXISTS tournament_fechas (
+  id            TEXT PRIMARY KEY,
+  tournament_id TEXT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  number        INTEGER NOT NULL CHECK (number >= 1),
+  start_date    DATE NOT NULL,
+  end_date      DATE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tournament_id, number),
+  CHECK (end_date IS NULL OR end_date >= start_date)
+);
+
+-- En una liga por fechas, scheduled_matches.round y matches.round son el
+-- número de fecha. Un partido postergado sigue en su fecha y se juega otro
+-- día; si nunca se juega, queda sin jugar y no suma puntos.
+ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS scheduled_date DATE;
+ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS postponed      BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE matches           ADD COLUMN IF NOT EXISTS round          INTEGER;
+CREATE INDEX IF NOT EXISTS idx_matches_tournament_round ON matches(tournament_id, round);
