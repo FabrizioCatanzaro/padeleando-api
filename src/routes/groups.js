@@ -1368,7 +1368,7 @@ router.post('/', requireAuth, async (req, res, next) => {
       INSERT INTO groups (id, name, description, user_id, is_public, emojis, location_name, place_id, lat, lon,
                           club_id, pending_club_request_id,
                           signup_open, signup_price, signup_price_unit, signup_contacts, level,
-                          signup_capacity, signup_capacity_unit, signup_closes_at)
+                          signup_capacity, signup_capacity_unit, signup_closes_at, rules)
       VALUES (${uid()}, ${name.trim()}, ${description ?? null}, ${req.user.id}, ${is_public}, ${emojis},
               ${location_name ?? null}, ${place_id ?? null}, ${lat ?? null}, ${lon ?? null},
               ${club_id ?? null}, ${pending_club_request_id ?? null},
@@ -1376,7 +1376,8 @@ router.post('/', requireAuth, async (req, res, next) => {
               ${signup.signup_price_unit ?? null},
               ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb,
               ${signup.level ?? null},
-              ${signup.signup_capacity ?? null}, ${signup.signup_capacity_unit ?? null}, ${signup.signup_closes_at ?? null})
+              ${signup.signup_capacity ?? null}, ${signup.signup_capacity_unit ?? null}, ${signup.signup_closes_at ?? null},
+              ${signup.rules ?? null})
       RETURNING *
     `;
     res.status(201).json(group);
@@ -1421,7 +1422,8 @@ router.put('/:groupId', requireAuth, async (req, res, next) => {
           level             = CASE WHEN ${'level'             in signup}::boolean THEN ${signup.level             ?? null} ELSE level END,
           signup_capacity      = CASE WHEN ${'signup_capacity'      in signup}::boolean THEN ${signup.signup_capacity      ?? null}::int ELSE signup_capacity END,
           signup_capacity_unit = CASE WHEN ${'signup_capacity_unit' in signup}::boolean THEN ${signup.signup_capacity_unit ?? null} ELSE signup_capacity_unit END,
-          signup_closes_at     = CASE WHEN ${'signup_closes_at'     in signup}::boolean THEN ${signup.signup_closes_at     ?? null}::timestamptz ELSE signup_closes_at END
+          signup_closes_at     = CASE WHEN ${'signup_closes_at'     in signup}::boolean THEN ${signup.signup_closes_at     ?? null}::timestamptz ELSE signup_closes_at END,
+          rules                = CASE WHEN ${'rules'                in signup}::boolean THEN ${signup.rules                ?? null} ELSE rules END
       WHERE id = ${req.params.groupId} RETURNING *
     `;
     res.json(updated);

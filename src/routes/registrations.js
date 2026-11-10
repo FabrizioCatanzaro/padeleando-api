@@ -29,11 +29,12 @@ class HttpError extends Error {
 const TOURNAMENT_SQL = `
   SELECT t.id, t.group_id, t.name, t.format, t.mode, t.status, t.bracket,
          t.signup_open, t.signup_price, t.signup_price_unit, t.signup_contacts, t.level,
-         t.signup_capacity, t.signup_capacity_unit, t.signup_closes_at,
+         t.signup_capacity, t.signup_capacity_unit, t.signup_closes_at, t.rules,
          g.user_id AS owner_id, g.signup_open AS g_signup_open, g.signup_price AS g_signup_price,
          g.signup_price_unit AS g_signup_price_unit, g.signup_contacts AS g_signup_contacts,
          g.level AS g_level, g.signup_capacity AS g_signup_capacity,
          g.signup_capacity_unit AS g_signup_capacity_unit, g.signup_closes_at AS g_signup_closes_at,
+         g.rules AS g_rules,
          u.social_links AS owner_social_links, g.name AS group_name
   FROM tournaments t
   JOIN groups g ON g.id = t.group_id
@@ -48,6 +49,7 @@ async function loadTournament(q, tournamentId, { lock = false } = {}) {
     signup_open: t.g_signup_open, signup_price: t.g_signup_price, signup_price_unit: t.g_signup_price_unit,
     signup_contacts: t.g_signup_contacts, level: t.g_level, signup_capacity: t.g_signup_capacity,
     signup_capacity_unit: t.g_signup_capacity_unit, signup_closes_at: t.g_signup_closes_at,
+    rules: t.g_rules,
   }, t.owner_social_links);
   return { t, signup };
 }
@@ -120,7 +122,7 @@ function sendError(res, next, err) {
 // Body: { tournamentId, kind: 'solo'|'pair', partner?: { username } | { name, phone } }
 router.post('/', requireAuth, async (req, res, next) => {
   try {
-    const { tournamentId, kind, partner } = req.body;
+    const { tournamentId, kind, partner, accept_rules } = req.body;
     if (!tournamentId) throw new HttpError(400, 'tournamentId requerido');
     if (kind !== 'solo' && kind !== 'pair') throw new HttpError(400, 'kind debe ser "solo" o "pair"');
 
@@ -133,6 +135,9 @@ router.post('/', requireAuth, async (req, res, next) => {
     if (!state.open) throw new HttpError(400, state.reason, 'signup_closed');
     if (await canManageGroup(sql, me, t.group_id)) {
       throw new HttpError(409, 'Organizás este torneo: cargate desde Gestión');
+    }
+    if (signup.rules && accept_rules !== true) {
+      throw new HttpError(400, 'Tenés que aceptar el reglamento para inscribirte', 'rules_required');
     }
 
     const { rows: [meRow] } = await q('SELECT id, category FROM users WHERE id = $1', [me]);
@@ -163,9 +168,9 @@ router.post('/', requireAuth, async (req, res, next) => {
     const id = uid();
     const { rows: [registration] } = await q(`
       INSERT INTO tournament_registrations
-        (id, tournament_id, kind, created_by, p1_user_id, p2_user_id, p2_name, p2_phone)
-      VALUES ($1, $2, $3, $4, $4, $5, $6, $7) RETURNING *`,
-      [id, tournamentId, kind, me, p2UserId, p2Name, p2Phone]);
+        (id, tournament_id, kind, created_by, p1_user_id, p2_user_id, p2_name, p2_phone, rules_accepted_at)
+      VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8) RETURNING *`,
+      [id, tournamentId, kind, me, p2UserId, p2Name, p2Phone, signup.rules ? new Date().toISOString() : null]);
 
     await notify(q, await groupManagers(q, t.group_id), 'registration_received', me, id);
     if (p2UserId) await notify(q, [p2UserId], 'registration_partner', me, id);
@@ -255,6 +260,7 @@ router.get('/mine/:tournamentId', requireAuth, async (req, res, next) => {
         availability: publicSignup(signup, { format: t.format, used }).availability,
         closes_at: signup.closes_at, level: signup.level,
         price: signup.price, price_unit: signup.unit,
+        rules: signup.rules,
       },
       // El teléfono del invitado sólo lo ve quien lo cargó.
       registration: mine && {

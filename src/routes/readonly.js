@@ -39,7 +39,8 @@ router.get('/:tournamentId', async (req, res, next) => {
              g.level             AS group_level,
              g.signup_capacity      AS group_signup_capacity,
              g.signup_capacity_unit AS group_signup_capacity_unit,
-             g.signup_closes_at     AS group_signup_closes_at
+             g.signup_closes_at     AS group_signup_closes_at,
+             g.rules                AS group_rules
       FROM   tournaments t
       JOIN   groups g ON g.id = t.group_id
       JOIN   users  u ON u.id = g.user_id
@@ -151,6 +152,7 @@ router.get('/:tournamentId', async (req, res, next) => {
         signup_capacity:      tournament.group_signup_capacity,
         signup_capacity_unit: tournament.group_signup_capacity_unit,
         signup_closes_at:     tournament.group_signup_closes_at,
+        rules:                tournament.group_rules,
       }, tournament.owner_social_links), { format: tournament.format, used: await countUsedPlayers(sql, tournamentId) }),
       // El plantel queda oculto hasta que empieza el torneo (Fabri, 2026-11-09).
       players:           rosterHidden ? [] : players,

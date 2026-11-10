@@ -8,6 +8,7 @@ export const CONTACT_TYPES = ['whatsapp', 'phone', 'email', 'instagram'];
 const MAX_CONTACTS = 4;
 const MAX_VALUE    = 80;
 const MAX_PRICE    = 100_000_000;
+export const MAX_RULES = 10_000;
 
 class SignupError extends Error {}
 
@@ -99,6 +100,18 @@ export function parseSignupFields(body) {
     }
   }
 
+  // Reglamento del torneo: texto libre; vacío vuelve a heredar.
+  if ('rules' in body) {
+    const v = body.rules;
+    if (v === null) out.rules = null;
+    else if (typeof v !== 'string') throw new SignupError('El reglamento debe ser texto');
+    else {
+      const clean = v.replace(/\r\n/g, '\n').trim();
+      if (clean.length > MAX_RULES) throw new SignupError(`El reglamento no puede superar los ${MAX_RULES} caracteres`);
+      out.rules = clean || null;
+    }
+  }
+
   return out;
 }
 
@@ -138,6 +151,7 @@ export function resolveSignup(tournament, group, ownerSocialLinks = null) {
     capacity:      pick('signup_capacity'),
     capacity_unit: pick('signup_capacity_unit') ?? 'pair',
     closes_at:     pick('signup_closes_at'),
+    rules:         pick('rules'),
   };
 }
 

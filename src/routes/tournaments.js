@@ -70,6 +70,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              g.signup_capacity      AS group_signup_capacity,
              g.signup_capacity_unit AS group_signup_capacity_unit,
              g.signup_closes_at     AS group_signup_closes_at,
+             g.rules                AS group_rules,
              ow.social_links     AS owner_social_links,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
@@ -178,6 +179,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       signup_capacity:      tournament.group_signup_capacity,
       signup_capacity_unit: tournament.group_signup_capacity_unit,
       signup_closes_at:     tournament.group_signup_closes_at,
+      rules:                tournament.group_rules,
     }, tournament.owner_social_links);
 
     // Para el que no organiza: el cupo sin números y, antes de que empiece
@@ -401,9 +403,9 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
            (id, group_id, name, mode, format, number_of_courts, club_id, event_date, event_time, pending_club_request_id,
             signup_open, signup_price, signup_price_unit, signup_contacts, level,
             signup_capacity, signup_capacity_unit, signup_closes_at,
-            liga_mode, allow_rematch, winner_format, playoff_size)
+            liga_mode, allow_rematch, winner_format, playoff_size, rules)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18,
-                 $19, $20, $21, $22) RETURNING *`,
+                 $19, $20, $21, $22, $23) RETURNING *`,
         [tId, groupId, name.trim(), mode, format, number_of_courts ?? 1,
          club_id ?? null, event_date || null, event_time || null, pending_club_request_id ?? null,
          signup.signup_open ?? null, signup.signup_price ?? null, signup.signup_price_unit ?? null,
@@ -411,7 +413,7 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
          signup.level ?? null,
          signup.signup_capacity ?? null, signup.signup_capacity_unit ?? null, signup.signup_closes_at ?? null,
          liga.liga_mode ?? 'jornada', liga.allow_rematch ?? false,
-         liga.winner_format ?? 'tabla', liga.playoff_size ?? null]
+         liga.winner_format ?? 'tabla', liga.playoff_size ?? null, signup.rules ?? null]
       );
 
       if (players.length) {
@@ -584,7 +586,8 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           level             = CASE WHEN ${'level'             in signup}::boolean THEN ${signup.level             ?? null} ELSE level END,
           signup_capacity      = CASE WHEN ${'signup_capacity'      in signup}::boolean THEN ${signup.signup_capacity      ?? null}::int ELSE signup_capacity END,
           signup_capacity_unit = CASE WHEN ${'signup_capacity_unit' in signup}::boolean THEN ${signup.signup_capacity_unit ?? null} ELSE signup_capacity_unit END,
-          signup_closes_at     = CASE WHEN ${'signup_closes_at'     in signup}::boolean THEN ${signup.signup_closes_at     ?? null}::timestamptz ELSE signup_closes_at END
+          signup_closes_at     = CASE WHEN ${'signup_closes_at'     in signup}::boolean THEN ${signup.signup_closes_at     ?? null}::timestamptz ELSE signup_closes_at END,
+          rules                = CASE WHEN ${'rules'                in signup}::boolean THEN ${signup.rules                ?? null} ELSE rules END
       WHERE id = ${id} RETURNING *
     `;
     if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });

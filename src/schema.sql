@@ -717,3 +717,9 @@ ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS scheduled_date DATE;
 ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS postponed      BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE matches           ADD COLUMN IF NOT EXISTS round          INTEGER;
 CREATE INDEX IF NOT EXISTS idx_matches_tournament_round ON matches(tournament_id, round);
+
+-- Reglamento del torneo (2026-11-10). NULL en el torneo = hereda el de la
+-- categoría. La inscripción guarda cuándo el jugador lo aceptó.
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS rules TEXT;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rules TEXT;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS rules_accepted_at TIMESTAMPTZ;
