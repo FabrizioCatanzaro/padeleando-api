@@ -13,6 +13,7 @@ import { uid } from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { canManageGroup } from '../lib/access.js';
 import { resolveSignup } from '../lib/signup.js';
+import { parseAvailability, AvailabilityError } from '../lib/availability.js';
 import { checkRegistrationLevel } from '../lib/category.js';
 import {
   ACTIVE_STATUSES, capacityInPlayers, hasRoom, signupState, parseGuestPartner, summarize, publicSignup,
@@ -27,7 +28,7 @@ class HttpError extends Error {
 // ── Lecturas compartidas ────────────────────────────────────────────────────
 
 const TOURNAMENT_SQL = `
-  SELECT t.id, t.group_id, t.name, t.format, t.mode, t.status, t.bracket,
+  SELECT t.id, t.group_id, t.name, t.format, t.mode, t.status, t.bracket, t.liga_mode,
          t.signup_open, t.signup_price, t.signup_price_unit, t.signup_contacts, t.level,
          t.signup_capacity, t.signup_capacity_unit, t.signup_closes_at, t.rules,
          g.user_id AS owner_id, g.signup_open AS g_signup_open, g.signup_price AS g_signup_price,
@@ -123,6 +124,9 @@ function sendError(res, next, err) {
 router.post('/', requireAuth, async (req, res, next) => {
   try {
     const { tournamentId, kind, partner, accept_rules } = req.body;
+    let availability = null;
+    try { availability = parseAvailability(req.body.availability); }
+    catch (e) { if (e instanceof AvailabilityError) throw new HttpError(400, e.message); throw e; }
     if (!tournamentId) throw new HttpError(400, 'tournamentId requerido');
     if (kind !== 'solo' && kind !== 'pair') throw new HttpError(400, 'kind debe ser "solo" o "pair"');
 
@@ -168,9 +172,11 @@ router.post('/', requireAuth, async (req, res, next) => {
     const id = uid();
     const { rows: [registration] } = await q(`
       INSERT INTO tournament_registrations
-        (id, tournament_id, kind, created_by, p1_user_id, p2_user_id, p2_name, p2_phone, rules_accepted_at)
-      VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8) RETURNING *`,
-      [id, tournamentId, kind, me, p2UserId, p2Name, p2Phone, signup.rules ? new Date().toISOString() : null]);
+        (id, tournament_id, kind, created_by, p1_user_id, p2_user_id, p2_name, p2_phone, rules_accepted_at, availability)
+      VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9::jsonb) RETURNING *`,
+      [id, tournamentId, kind, me, p2UserId, p2Name, p2Phone, signup.rules ? new Date().toISOString() : null,
+       // Solo las ligas en varios días piden disponibilidad.
+       t.liga_mode === 'temporada' && availability ? JSON.stringify(availability) : null]);
 
     await notify(q, await groupManagers(q, t.group_id), 'registration_received', me, id);
     if (p2UserId) await notify(q, [p2UserId], 'registration_partner', me, id);
@@ -270,6 +276,31 @@ router.get('/mine/:tournamentId', requireAuth, async (req, res, next) => {
       in_tournament: inTournament,
       can_manage: canManage === true,
     });
+  } catch (err) { sendError(res, next, err); }
+});
+
+// ── PATCH /api/registrations/:id/availability ──────────────────────────────
+// La edita cualquiera de los dos jugadores mientras el torneo no terminó.
+router.patch('/:id/availability', requireAuth, async (req, res, next) => {
+  try {
+    let availability;
+    try { availability = parseAvailability(req.body.availability); }
+    catch (e) { if (e instanceof AvailabilityError) throw new HttpError(400, e.message); throw e; }
+    const sql = getDb();
+    const q = httpQuery(sql);
+    const { rows: [r] } = await q(`
+      SELECT r.id, r.status, r.p1_user_id, r.p2_user_id, t.status AS t_status, t.liga_mode
+      FROM tournament_registrations r JOIN tournaments t ON t.id = r.tournament_id
+      WHERE r.id = $1`, [req.params.id]);
+    if (!r) throw new HttpError(404, 'Inscripción no encontrada');
+    if (r.p1_user_id !== req.user.id && r.p2_user_id !== req.user.id) throw new HttpError(403, 'No autorizado');
+    if (r.t_status === 'finished') throw new HttpError(400, 'El torneo ya terminó');
+    if (r.liga_mode !== 'temporada') throw new HttpError(400, 'Este torneo se juega en un solo día');
+    if (!['pending', 'approved', 'waitlist'].includes(r.status)) throw new HttpError(400, 'La inscripción no está activa');
+    const { rows: [x] } = await q(
+      'UPDATE tournament_registrations SET availability = $2::jsonb WHERE id = $1 RETURNING id, availability',
+      [r.id, availability ? JSON.stringify(availability) : null]);
+    res.json(x);
   } catch (err) { sendError(res, next, err); }
 });
 

@@ -736,3 +736,7 @@ ALTER TABLE tournaments ADD  CONSTRAINT tournaments_points_check
 -- Gratis para todos. Ver POST /tournaments/:id/flyer.
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS flyer_url       TEXT;
 ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS flyer_public_id TEXT;
+
+-- Disponibilidad horaria de la inscripción a una liga en varios días
+-- (2026-11-10): rangos por día de la semana y una nota. Ver lib/availability.js.
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS availability JSONB;

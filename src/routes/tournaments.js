@@ -4,6 +4,7 @@ import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
 import { uploadTournamentPhoto } from '../middleware/upload.js';
+import { availabilityByPair } from '../lib/availability.js';
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { canManageGroup } from '../lib/access.js';
 import { parseSignupFields, resolveSignup } from '../lib/signup.js';
@@ -207,12 +208,19 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       });
     }
 
+    // La disponibilidad de cada pareja la ve solo quien organiza.
+    const regs = tournament.liga_mode === 'temporada' ? await sql`
+      SELECT id, p1_player_id, p2_player_id, availability FROM tournament_registrations
+      WHERE tournament_id = ${id} AND status = 'approved' AND availability IS NOT NULL
+    ` : [];
+    const disponibles = availabilityByPair(pairs, regs);
+
     res.json({
       ...tournament,
       // Mismo nombre que en /api/readonly/:id: el frontend lee uno solo.
       group_owner_is_premium: tournament.owner_is_premium,
       signup,
-      players, pairs, matches, scheduled_matches: scheduled, fechas, is_owner, can_manage,
+      players, pairs: pairs.map((p) => ({ ...p, availability: disponibles[p.id] ?? [] })), matches, scheduled_matches: scheduled, fechas, is_owner, can_manage,
     });
   } catch (err) { next(err); }
 });
