@@ -1124,12 +1124,19 @@ router.patch('/:id/prizes/:prizeId/winner', requireAuth, requireTournamentManage
          winner_pair_id   = (SELECT id FROM pairs WHERE id = $3 AND tournament_id = $1),
          winner_player_id = (SELECT player_id FROM tournament_players WHERE player_id = $4 AND tournament_id = $1)
        WHERE id = $2 AND tournament_id = $1 AND kind = 'especial'
+         AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM pairs WHERE id = $3 AND tournament_id = $1))
+         AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM tournament_players WHERE player_id = $4 AND tournament_id = $1))
        RETURNING ${PRIZE_COLS}`,
       [req.params.id, req.params.prizeId, pairId, playerId]
     );
-    if (!row) return res.status(404).json({ error: 'Premio especial no encontrado' });
-    if ((pairId && !row.winner_pair_id) || (playerId && !row.winner_player_id)) {
-      return res.status(400).json({ error: 'El ganador tiene que ser del torneo' });
+    if (!row) {
+      // Sin fila no se escribió nada: falta el premio o el ganador no es del torneo.
+      const [prize] = await sql`
+        SELECT 1 FROM tournament_prizes
+        WHERE id = ${req.params.prizeId} AND tournament_id = ${req.params.id} AND kind = 'especial'`;
+      return prize
+        ? res.status(400).json({ error: 'El ganador tiene que ser del torneo' })
+        : res.status(404).json({ error: 'Premio especial no encontrado' });
     }
     res.json(row);
   } catch (err) { next(err); }
