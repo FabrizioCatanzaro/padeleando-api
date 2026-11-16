@@ -5,7 +5,7 @@ const router = Router();
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
-import { parseSignupFields } from '../lib/signup.js';
+import { publicSocialLinks, parseSignupFields } from '../lib/signup.js';
 import { groupQuotaError } from '../lib/plan.js';
 import { comparePairRows } from '../lib/tournamentLogic.js';
 import { hasStarted } from '../lib/registrations.js';
@@ -183,6 +183,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     if (owner.id === ANON_ID) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     const isOwner  = req.user?.id === owner.id;
+    if (!isOwner) owner.social_links = publicSocialLinks(owner.social_links);
     const viewerId = req.user?.id ?? null;
     // Sólo tiene sentido preguntar por el seguimiento si mira otra persona.
     const followerId = isOwner ? null : viewerId;
@@ -1077,6 +1078,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     ]);
 
     if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
+    group.owner_social_links = publicSocialLinks(group.owner_social_links);
     // Los partidos del cuadro no están en `matches`: se suman para que coincida con el torneo.
     for (const t of tournaments) t.match_count += countBracketPlayed(t.bracket);
 

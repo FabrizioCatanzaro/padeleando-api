@@ -4,6 +4,7 @@ import { uid }    from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireTournamentManage, requireMatchManage } from '../middleware/access.js';
 import { withdrawnTeamError } from '../lib/fixture.js';
+import { usaFechas, esCopa } from '../lib/copa.js';
 
 const router = Router();
 
@@ -25,7 +26,7 @@ function validateScore(score1, score2) {
 // POST /api/matches
 router.post('/', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
-    const { tournamentId, team1, team2, score1, score2, playedAt, duration_seconds, sets, sets_format, court, scheduledId } = req.body;
+    const { tournamentId, team1, team2, score1, score2, playedAt, duration_seconds, sets, sets_format, court, court_id, scheduledId } = req.body;
 
     if (!tournamentId || !team1?.[0] || !team1?.[1] || !team2?.[0] || !team2?.[1]) {
       return res.status(400).json({ error: 'Datos incompletos' });
@@ -35,6 +36,9 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     }
     const scoreError = validateScore(score1, score2);
     if (scoreError) return res.status(400).json({ error: scoreError });
+    if (esCopa(req.accessCtx) && !usaFechas(req.accessCtx)) {
+      return res.status(400).json({ error: 'En la copa de cuadro los partidos se cargan en el cuadro' });
+    }
 
     const sql = getDb();
 
@@ -57,20 +61,23 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     // En la liga por fechas, si venía del fixture, el partido jugado conserva
     // su fecha (round), aunque se haya postergado y jugado otro día. En el
     // americano round es la ronda de la previa y no se copia.
-    const temporada = req.accessCtx.format === 'liga' && req.accessCtx.liga_mode === 'temporada';
+    const temporada = usaFechas(req.accessCtx);
     const [programado] = scheduledId && temporada
-      ? await sql`SELECT round FROM scheduled_matches WHERE id = ${scheduledId} AND tournament_id = ${tournamentId}`
+      ? await sql`SELECT round, court_id FROM scheduled_matches WHERE id = ${scheduledId} AND tournament_id = ${tournamentId}`
       : [];
+    const canchaId = court_id !== undefined ? court_id : (programado?.court_id ?? null);
 
     const [match] = await sql`
       INSERT INTO matches
         (id, tournament_id, team1_p1, team1_p2, team2_p1, team2_p2,
-         score1, score2, played_at, duration_seconds, sets_format, sets, court, round)
+         score1, score2, played_at, duration_seconds, sets_format, sets, court, round, court_id)
       VALUES
         (${uid()}, ${tournamentId},
          ${team1[0]}, ${team1[1]}, ${team2[0]}, ${team2[1]},
          ${score1}, ${score2}, ${playedAt ?? today}, ${duration_seconds},
-         ${sets_format ?? null}, ${setsJson}, ${court ?? null}, ${programado?.round ?? null})
+         ${sets_format ?? null}, ${setsJson}, ${court ?? null}, ${programado?.round ?? null},
+         (SELECT cc.id FROM club_courts cc JOIN tournaments t ON t.club_id = cc.club_id
+          WHERE cc.id = ${canchaId ?? null} AND t.id = ${tournamentId}))
       RETURNING *
     `;
 
@@ -88,7 +95,7 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
 // PUT /api/matches/:id
 router.put('/:id', requireAuth, requireMatchManage, async (req, res, next) => {
   try {
-    const { team1, team2, score1, score2, playedAt, duration_seconds, sets, sets_format, court } = req.body;
+    const { team1, team2, score1, score2, playedAt, duration_seconds, sets, sets_format, court, court_id } = req.body;
     const scoreError = validateScore(score1, score2);
     if (scoreError) return res.status(400).json({ error: scoreError });
 
@@ -103,7 +110,11 @@ router.put('/:id', requireAuth, requireMatchManage, async (req, res, next) => {
         duration_seconds = ${duration_seconds},
         sets_format = ${sets_format ?? null},
         sets        = ${setsJson},
-        court       = ${court ?? null}
+        court       = ${court ?? null},
+        court_id    = CASE WHEN ${court_id !== undefined}::boolean THEN (
+                        SELECT cc.id FROM club_courts cc JOIN tournaments t ON t.club_id = cc.club_id
+                        WHERE cc.id = ${court_id ?? null} AND t.id = matches.tournament_id)
+                      ELSE court_id END
       WHERE id = ${req.params.id} RETURNING *
     `;
     if (!match) return res.status(404).json({ error: 'Partido no encontrado' });

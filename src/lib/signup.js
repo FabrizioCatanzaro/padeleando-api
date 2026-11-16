@@ -115,11 +115,16 @@ export function parseSignupFields(body) {
   return out;
 }
 
+/** Redes del perfil que puede ver otra persona: sin las marcadas como privadas. */
+export function publicSocialLinks(socialLinks) {
+  return Array.isArray(socialLinks) ? socialLinks.filter((l) => l?.private !== true) : socialLinks;
+}
+
 // El perfil guarda la url en formatos irregulares; no se inventa el país que falte.
 export function profileContacts(socialLinks) {
   if (!Array.isArray(socialLinks)) return [];
   const out = [];
-  for (const link of socialLinks) {
+  for (const link of publicSocialLinks(socialLinks)) {
     const url = String(link?.url ?? '').trim();
     if (!url) continue;
     if (link.network === 'whatsapp') {

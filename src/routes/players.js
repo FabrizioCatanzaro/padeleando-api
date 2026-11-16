@@ -4,6 +4,8 @@ import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { requireGroupManage, requireTournamentManage } from '../middleware/access.js';
 import { canManageGroup } from '../lib/access.js';
+import { parseAvailability } from '../lib/availability.js';
+import { parseWhatsapp, usaFechas, esCopa } from '../lib/copa.js';
 
 const router = Router();
 
@@ -204,6 +206,46 @@ router.post('/resolve', requireAuth, requireGroupManage, async (req, res, next) 
   } catch (err) { next(err); }
 });
 
+// PATCH /api/players/:playerId/tournament/:tournamentId/datos — el organizador edita
+// la disponibilidad y el WhatsApp de un jugador en ese torneo.
+// Body: { availability?, whatsapp?, whatsapp_visible? }
+router.patch('/:playerId/tournament/:tournamentId/datos', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    const { playerId, tournamentId } = req.params;
+    const has = (k) => Object.hasOwn(req.body, k);
+    if (!usaFechas(req.accessCtx) && !esCopa(req.accessCtx)) {
+      return res.status(400).json({ error: 'Este torneo no pide disponibilidad' });
+    }
+    let availability = null, whatsapp = null;
+    try {
+      if (has('availability')) availability = parseAvailability(req.body.availability);
+      if (has('whatsapp')) whatsapp = parseWhatsapp(req.body.whatsapp);
+    } catch (e) { return res.status(400).json({ error: e.message }); }
+    if (has('whatsapp_visible') && typeof req.body.whatsapp_visible !== 'boolean') {
+      return res.status(400).json({ error: 'whatsapp_visible debe ser true o false' });
+    }
+    const disp = availability ? JSON.stringify(availability) : null;
+    const sql = getDb();
+    // La inscripción guarda una copia: se actualiza junto con el jugador.
+    const [[row]] = await Promise.all([
+      sql`
+        UPDATE tournament_players
+        SET availability     = CASE WHEN ${has('availability')}::boolean THEN ${disp}::jsonb ELSE availability END,
+            whatsapp         = CASE WHEN ${has('whatsapp')}::boolean THEN ${whatsapp} ELSE whatsapp END,
+            whatsapp_visible = CASE WHEN ${has('whatsapp_visible')}::boolean THEN ${req.body.whatsapp_visible ?? false} ELSE whatsapp_visible END
+        WHERE tournament_id = ${tournamentId} AND player_id = ${playerId}
+        RETURNING player_id, availability, whatsapp, whatsapp_visible`,
+      has('availability') ? sql`
+        UPDATE tournament_registrations
+        SET availability    = CASE WHEN p1_player_id = ${playerId} THEN ${disp}::jsonb ELSE availability END,
+            p2_availability = CASE WHEN p2_player_id = ${playerId} THEN ${disp}::jsonb ELSE p2_availability END
+        WHERE tournament_id = ${tournamentId} AND ${playerId} IN (p1_player_id, p2_player_id)` : [],
+    ]);
+    if (!row) return res.status(404).json({ error: 'El jugador no está en este torneo' });
+    res.json(row);
+  } catch (err) { next(err); }
+});
+
 // DELETE /api/players/:playerId/tournament/:tournamentId
 // Elimina al jugador de una jornada específica (no del grupo completo)
 router.delete('/:playerId/tournament/:tournamentId', requireAuth, requireTournamentManage, async (req, res, next) => {
@@ -214,7 +256,7 @@ router.delete('/:playerId/tournament/:tournamentId', requireAuth, requireTournam
     // Americano: sacarlo con una pareja activa dejaba una pareja con un jugador
     // fuera del torneo. Primero se retira o se elimina la pareja. En Liga las
     // parejas cambian libremente y no se bloquea.
-    const [enPareja] = req.accessCtx.format !== 'americano' ? [] : await sql`
+    const [enPareja] = !['americano', 'copa'].includes(req.accessCtx.format) ? [] : await sql`
       SELECT id FROM pairs
       WHERE tournament_id = ${tournamentId} AND status = 'active'
         AND (p1_id = ${playerId} OR p2_id = ${playerId})

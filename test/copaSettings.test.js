@@ -5,6 +5,7 @@ import {
 } from '../src/lib/copa.js';
 import { quotaMessage } from '../src/lib/plan.js';
 import { capacityInPlayers } from '../src/lib/registrations.js';
+import { publicSocialLinks, profileContacts } from '../src/lib/signup.js';
 
 const zonas = (extra = {}) => ({ mode: 'zonas', zonas: 4, ruedas: 1, clasifican: 2, mejores_extra: 0, plata: false, tercer_puesto: false, ...extra });
 
@@ -132,4 +133,15 @@ test('privacidad: cada rol ve lo que le corresponde', () => {
   assert.deepEqual(jugador.a, { whatsapp: '+5411' });
   assert.deepEqual(jugador.b, { availability: null, whatsapp: '+5422', whatsapp_visible: false });
   assert.equal(jugador.c, undefined);
+});
+
+test('redes del perfil: las privadas no salen ni como contacto de inscripción', () => {
+  const links = [
+    { network: 'whatsapp', url: 'https://wa.me/5491155551234', private: true },
+    { network: 'instagram', url: 'https://instagram.com/fabri' },
+  ];
+  assert.deepEqual(publicSocialLinks(links), [links[1]]);
+  assert.equal(publicSocialLinks(null), null);
+  assert.deepEqual(profileContacts(links), [{ type: 'instagram', value: '@fabri', from_profile: true }]);
+  assert.equal(profileContacts([{ ...links[0], private: false }])[0].value, '+5491155551234');
 });
