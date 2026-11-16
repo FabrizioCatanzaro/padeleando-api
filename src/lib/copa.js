@@ -440,3 +440,36 @@ export function generateCupBracket(seeds, { tercerPuesto = false, kind = 'copa' 
   }
   return applyBracketWalkovers(out);
 }
+
+// Qué no se puede cambiar según el avance: null si la edición está permitida.
+export function copaConfigLockError(current, next, { sorteado = false, hasFechas = false, hasBracket = false } = {}) {
+  const cambia = (k) => current[k] !== next[k];
+  if (hasBracket && Object.keys(next).some(cambia)) return 'El cuadro ya está armado: las opciones de la copa no se cambian';
+  if (sorteado && cambia('zonas')) return 'Los grupos ya están armados: deshacé el sorteo para cambiar la cantidad';
+  if (hasFechas && cambia('ruedas')) return 'Ya hay fechas armadas: las ruedas no se cambian';
+  return null;
+}
+
+const WHATSAPP = /^[+\d][\d\s()-]{5,24}$/;
+/** WhatsApp de un jugador: null si viene vacío. Lanza Error si no es un teléfono. */
+export function parseWhatsapp(v) {
+  const s = String(v ?? '').trim();
+  if (!s) return null;
+  if (!WHATSAPP.test(s)) throw new Error('El WhatsApp no es válido');
+  return s;
+}
+
+// Datos por jugador que ve cada quien: el organizador todo, el jugador lo suyo y los WhatsApp visibles.
+export function datosVisibles(rows, { canManage = false, ownPlayerIds = [] } = {}) {
+  const own = new Set(ownPlayerIds.map(String));
+  const out = {};
+  for (const r of rows) {
+    const mio = own.has(String(r.player_id));
+    if (canManage || mio) {
+      out[r.player_id] = { availability: r.availability ?? null, whatsapp: r.whatsapp ?? null, whatsapp_visible: r.whatsapp_visible === true };
+    } else if (own.size > 0 && r.whatsapp_visible === true && r.whatsapp) {
+      out[r.player_id] = { whatsapp: r.whatsapp };
+    }
+  }
+  return out;
+}

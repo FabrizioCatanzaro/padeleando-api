@@ -6,6 +6,8 @@ export const ACTIVE_STATUSES = ['pending', 'approved', 'waitlist'];
 
 /** Tope del americano: 16 parejas. */
 export const AMERICANO_MAX_PLAYERS = 32;
+/** Tope de la copa: 32 parejas. */
+export const COPA_MAX_PLAYERS = 64;
 
 /** Lugares que ocupa una inscripción, contados en jugadores. */
 export const slotsFor = (kind) => (kind === 'pair' ? 2 : 1);
@@ -17,6 +19,7 @@ export const slotsFor = (kind) => (kind === 'pair' ? 2 : 1);
 export function capacityInPlayers({ capacity, unit, format }) {
   let cap = capacity == null ? null : capacity * (unit === 'player' ? 1 : 2);
   if (format === 'americano') cap = cap == null ? AMERICANO_MAX_PLAYERS : Math.min(cap, AMERICANO_MAX_PLAYERS);
+  if (format === 'copa') cap = cap == null ? COPA_MAX_PLAYERS : Math.min(cap, COPA_MAX_PLAYERS);
   return cap;
 }
 

@@ -747,10 +747,10 @@ ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bracket_plata JSONB;
 ALTER TABLE pairs ADD COLUMN IF NOT EXISTS zona         SMALLINT CHECK (zona IS NULL OR zona BETWEEN 1 AND 8);
 ALTER TABLE pairs ADD COLUMN IF NOT EXISTS cabeza_serie SMALLINT CHECK (cabeza_serie IS NULL OR cabeza_serie >= 1);
 
--- Disponibilidad y WhatsApp por jugador. La inscripción los guarda hasta la aprobación.
-ALTER TABLE players ADD COLUMN IF NOT EXISTS availability     JSONB;
-ALTER TABLE players ADD COLUMN IF NOT EXISTS whatsapp         TEXT;
-ALTER TABLE players ADD COLUMN IF NOT EXISTS whatsapp_visible BOOLEAN NOT NULL DEFAULT false;
+-- Disponibilidad y WhatsApp por jugador y torneo: `players` es una fila por categoría.
+ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS availability     JSONB;
+ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS whatsapp         TEXT;
+ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS whatsapp_visible BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS p2_availability     JSONB;
 ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS p1_whatsapp         TEXT;
 ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS p1_whatsapp_visible BOOLEAN NOT NULL DEFAULT false;
@@ -759,12 +759,14 @@ ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS p2_whatsapp_visibl
 -- La disponibilidad por inscripción pasa a sus dos jugadores. Solo completa vacíos.
 UPDATE tournament_registrations SET p2_availability = availability
 WHERE kind = 'pair' AND availability IS NOT NULL AND p2_availability IS NULL;
-UPDATE players p SET availability = r.availability
+UPDATE tournament_players tp SET availability = r.availability
 FROM tournament_registrations r
-WHERE r.status = 'approved' AND r.availability IS NOT NULL AND p.availability IS NULL AND p.id = r.p1_player_id;
-UPDATE players p SET availability = r.p2_availability
+WHERE r.status = 'approved' AND r.availability IS NOT NULL AND tp.availability IS NULL
+  AND tp.tournament_id = r.tournament_id AND tp.player_id = r.p1_player_id;
+UPDATE tournament_players tp SET availability = r.p2_availability
 FROM tournament_registrations r
-WHERE r.status = 'approved' AND r.p2_availability IS NOT NULL AND p.availability IS NULL AND p.id = r.p2_player_id;
+WHERE r.status = 'approved' AND r.p2_availability IS NOT NULL AND tp.availability IS NULL
+  AND tp.tournament_id = r.tournament_id AND tp.player_id = r.p2_player_id;
 
 -- Cancha con nombre: referencia a la cancha del club. `court` sigue para el número.
 ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS court_id TEXT REFERENCES club_courts(id) ON DELETE SET NULL;
