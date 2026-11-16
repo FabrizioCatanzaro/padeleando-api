@@ -519,7 +519,7 @@ export function applyBracketWalkovers(bracket) {
   const withdrawn = new Set((bracket.withdrawn_pair_ids ?? []).map(String));
   if (withdrawn.size === 0) return bracket;
   let b = bracket;
-  const order = () => [...(b.octavos ?? []), ...(b.cuartos ?? []), ...(b.semis ?? []), b.final];
+  const order = () => [...(b.dieciseisavos ?? []), ...(b.octavos ?? []), ...(b.cuartos ?? []), ...(b.semis ?? []), b.final];
   for (let changed = true; changed;) {
     changed = false;
     for (const m of order()) {
@@ -581,7 +581,9 @@ export function applyBracketResult(bracket, matchId, score1, score2, duration_se
   match.winner_id        = winnerId;
   match.winner_name      = match[`${winner}_name`];
 
-  if (b.final.id !== matchId) propagateWinner(b, matchId, match.winner_id, match.winner_name);
+  if (b.final.id !== matchId && b.tercer?.id !== matchId) propagateWinner(b, matchId, match.winner_id, match.winner_name);
+  const loser = winner === 'pair1' ? 'pair2' : 'pair1';
+  setTercerSlot(b, matchId, match[`${loser}_id`], match[`${loser}_name`]);
 
   return b;
 }
@@ -603,6 +605,7 @@ export function clearBracketResult(bracket, matchId) {
 
 /** Limpia los slots y resultados de todo lo que cuelga de un partido. */
 function clearDescendants(bracket, matchId) {
+  if (setTercerSlot(bracket, matchId, null, null)) resetMatchResult(bracket.tercer);
   const queue = [matchId];
   while (queue.length) {
     const child = findChildSlot(bracket, queue.shift());
@@ -611,6 +614,7 @@ function clearDescendants(bracket, matchId) {
     child.match[`pair${child.slot}_name`] = null;
     if (child.match.winner_id !== null) {
       resetMatchResult(child.match);
+      if (setTercerSlot(bracket, child.match.id, null, null)) resetMatchResult(bracket.tercer);
       queue.push(child.match.id);
     }
   }
@@ -628,9 +632,21 @@ function resetMatchResult(match) {
   match.winner_name      = null;
 }
 
+// El perdedor de una semifinal pasa al partido por el tercer puesto, si existe.
+function setTercerSlot(bracket, semiId, pairId, pairName) {
+  const t = bracket.tercer;
+  if (!t) return false;
+  const slot = t.source1 === semiId ? 1 : t.source2 === semiId ? 2 : null;
+  if (!slot) return false;
+  t[`pair${slot}_id`]   = pairId;
+  t[`pair${slot}_name`] = pairName;
+  return true;
+}
+
 export function findBracketMatch(bracket, matchId) {
   if (bracket.final?.id === matchId) return bracket.final;
-  for (const round of ['octavos', 'cuartos', 'semis']) {
+  if (bracket.tercer?.id === matchId) return bracket.tercer;
+  for (const round of ['dieciseisavos', 'octavos', 'cuartos', 'semis']) {
     const found = (bracket[round] ?? []).find((m) => m.id === matchId);
     if (found) return found;
   }
@@ -642,7 +658,7 @@ export function findBracketMatch(bracket, matchId) {
  * Los slots de cuartos sin source (parejas con bye) no dependen de ningún resultado.
  */
 function findChildSlot(bracket, matchId) {
-  for (const qm of bracket.cuartos) {
+  for (const qm of [...(bracket.octavos ?? []), ...bracket.cuartos]) {
     if (qm.slot1_source === matchId) return { match: qm, slot: 1 };
     if (qm.slot2_source === matchId) return { match: qm, slot: 2 };
   }
@@ -660,8 +676,8 @@ function findChildSlot(bracket, matchId) {
  * y rellena pair1 o pair2 con el ganador.
  */
 function propagateWinner(bracket, completedId, winnerId, winnerName) {
-  // octavos → cuartos
-  for (const qm of bracket.cuartos) {
+  // 16vos → octavos → cuartos
+  for (const qm of [...(bracket.octavos ?? []), ...bracket.cuartos]) {
     if (qm.slot1_source === completedId) {
       qm.pair1_id   = winnerId;
       qm.pair1_name = winnerName;
