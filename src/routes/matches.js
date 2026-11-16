@@ -54,15 +54,23 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     const today = new Date().toISOString().slice(0, 10);
     const setsJson = sets?.length ? JSON.stringify(sets) : null;
 
+    // En la liga por fechas, si venía del fixture, el partido jugado conserva
+    // su fecha (round), aunque se haya postergado y jugado otro día. En el
+    // americano round es la ronda de la previa y no se copia.
+    const temporada = req.accessCtx.format === 'liga' && req.accessCtx.liga_mode === 'temporada';
+    const [programado] = scheduledId && temporada
+      ? await sql`SELECT round FROM scheduled_matches WHERE id = ${scheduledId} AND tournament_id = ${tournamentId}`
+      : [];
+
     const [match] = await sql`
       INSERT INTO matches
         (id, tournament_id, team1_p1, team1_p2, team2_p1, team2_p2,
-         score1, score2, played_at, duration_seconds, sets_format, sets, court)
+         score1, score2, played_at, duration_seconds, sets_format, sets, court, round)
       VALUES
         (${uid()}, ${tournamentId},
          ${team1[0]}, ${team1[1]}, ${team2[0]}, ${team2[1]},
          ${score1}, ${score2}, ${playedAt ?? today}, ${duration_seconds},
-         ${sets_format ?? null}, ${setsJson}, ${court ?? null})
+         ${sets_format ?? null}, ${setsJson}, ${court ?? null}, ${programado?.round ?? null})
       RETURNING *
     `;
 

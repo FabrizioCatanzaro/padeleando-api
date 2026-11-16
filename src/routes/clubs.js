@@ -428,13 +428,12 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         JOIN groups g ON g.id = t.group_id AND g.is_public = true
         WHERE t.club_id = ${req.params.id}
       `,
-      // El cuadro del americano no vive en `matches`: se cuenta aparte.
+      // El cuadro (americano o playoffs de liga) no vive en `matches`: se cuenta aparte.
       sql`
         SELECT t.bracket
         FROM tournaments t
         JOIN groups g ON g.id = t.group_id AND g.is_public = true
         WHERE t.club_id = ${req.params.id}
-          AND t.format = 'americano'
           AND t.bracket IS NOT NULL
       `,
       // Trae TODAS las canchas acá (activas e inactivas): se filtran abajo.

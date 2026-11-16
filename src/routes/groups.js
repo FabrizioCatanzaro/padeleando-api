@@ -12,6 +12,7 @@ import { hasStarted } from '../lib/registrations.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
+  countBracketPlayed,
 } from '../lib/profileStats.js';
 
 // GET /api/groups — solo los del usuario autenticado
@@ -417,18 +418,19 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       ORDER BY m.played_at DESC, m.created_at DESC
     `,
 
-    // Campeón americano = ganó la final del bracket (winner_id es un pair_id)
+    // Campeón por cuadro = ganó la final (winner_id es un pair_id). En el
+    // americano y en la liga con playoffs; la liga suma a títulos de liga.
     sql`
       WITH user_players AS (
         SELECT id FROM players WHERE user_id = ${owner.id}
       )
-      SELECT COUNT(*)::int AS campeon_americano
+      SELECT COUNT(*) FILTER (WHERE t.format = 'americano')::int AS campeon_americano,
+             COUNT(*) FILTER (WHERE t.format <> 'americano')::int AS campeon_playoffs
       FROM tournaments t
       JOIN pairs pr
         ON pr.tournament_id = t.id
         AND pr.id = (t.bracket->'final'->>'winner_id')
-      WHERE t.format = 'americano'
-        AND t.status = 'finished'
+      WHERE t.status = 'finished'
         AND t.bracket->'final'->>'winner_id' IS NOT NULL
         AND (
           pr.p1_id IN (SELECT id FROM user_players)
@@ -565,8 +567,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
          WHERE pr.tournament_id = t.id) AS pairs
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
-      WHERE t.format = 'americano'
-        AND t.bracket IS NOT NULL
+      WHERE t.bracket IS NOT NULL
         AND EXISTS (
           SELECT 1 FROM pairs pr
           JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
@@ -590,7 +591,13 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           ELSE m.score2 - m.score1 END), 0)::int AS diff,
         COALESCE(SUM(CASE
           WHEN (m.team1_p1 = pl.id OR m.team1_p2 = pl.id) THEN m.score1
-          ELSE m.score2 END), 0)::int AS gf
+          ELSE m.score2 END), 0)::int AS gf,
+        -- Puntos de la tabla: la derrota por W.O. no suma.
+        COALESCE(SUM(CASE
+          WHEN (m.team1_p1 = pl.id OR m.team1_p2 = pl.id) AND m.score1 > m.score2 THEN t.points_win
+          WHEN (m.team2_p1 = pl.id OR m.team2_p2 = pl.id) AND m.score2 > m.score1 THEN t.points_win
+          WHEN m.id IS NOT NULL AND NOT m.walkover THEN t.points_loss
+          ELSE 0 END), 0)::int AS pts
       FROM tournaments t
       JOIN tournament_players tp ON tp.tournament_id = t.id
       JOIN players pl            ON pl.id = tp.player_id
@@ -600,6 +607,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           OR m.team2_p1 = pl.id OR m.team2_p2 = pl.id)
       WHERE t.status = 'finished'
         AND t.format <> 'americano'
+        AND t.bracket IS NULL
         AND EXISTS (
           SELECT 1 FROM tournament_players tp2
           JOIN players p2 ON p2.id = tp2.player_id
@@ -688,8 +696,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
          JOIN players p2 ON p2.id = pr.p2_id
          WHERE pr.tournament_id = t.id) AS pairs
       FROM tournaments t
-      WHERE t.format = 'americano'
-        AND t.bracket IS NOT NULL
+      WHERE t.bracket IS NOT NULL
         AND EXISTS (
           SELECT 1 FROM pairs pr
           JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
@@ -774,7 +781,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       segundos_jugados: 0, partidos_con_duracion: 0,
       ajustados: 0, ajustados_ganados: 0, torneos_este_mes: 0,
     };
-    const titulosLiga      = countLeagueTitles(leagueRows);
+    const titulosLiga      = countLeagueTitles(leagueRows) + (americanoChamp?.campeon_playoffs ?? 0);
     const titulosAmericano = americanoChamp?.campeon_americano ?? 0;
     const baseStats = {
       ...base,
@@ -1070,6 +1077,8 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     ]);
 
     if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
+    // Los partidos del cuadro no están en `matches`: se suman para que coincida con el torneo.
+    for (const t of tournaments) t.match_count += countBracketPlayed(t.bracket);
 
     const viewerId = req.user?.id ?? null;
     const is_owner = !!viewerId && group.user_id === viewerId;
@@ -1079,9 +1088,10 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     const pairsModeIds = tournaments
       .filter((t) => t.status === 'finished' && t.mode === 'pairs')
       .map((t) => t.id);
-    // Americano: resolver ganador desde pares actuales (no desde el string guardado en el bracket)
+    // Con cuadro (americano o liga con playoffs) el ganador es el de la final,
+    // resuelto desde las parejas actuales y no desde el nombre guardado.
     const americanoFinished = tournaments.filter(
-      (t) => t.status === 'finished' && t.format === 'americano' && t.bracket?.final?.winner_id
+      (t) => t.status === 'finished' && t.bracket?.final?.winner_id
     );
     const americanoPairIds = americanoFinished.map((t) => t.bracket.final.winner_id);
 
@@ -1092,23 +1102,24 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       finishedIds.length ? sql`
         SELECT tournament_id, player_id,
                SUM(won)::int AS wins, SUM(diff)::int AS gdiff,
-               SUM(gf)::int AS gf, COUNT(*)::int AS played
+               SUM(gf)::int AS gf, COUNT(*)::int AS played,
+               SUM(CASE WHEN won = 0 AND NOT walkover THEN 1 ELSE 0 END)::int AS lost
         FROM (
           -- Un marcador igualado no es un partido válido: el front tampoco lo cuenta.
           SELECT tournament_id, team1_p1 AS player_id,
-                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END) AS won, score1 - score2 AS diff, score1 AS gf
+                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END) AS won, score1 - score2 AS diff, score1 AS gf, walkover
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team1_p2,
-                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END), score1 - score2, score1
+                 (CASE WHEN score1 > score2 THEN 1 ELSE 0 END), score1 - score2, score1, walkover
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team1_p2 IS NOT NULL AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team2_p1,
-                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2
+                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2, walkover
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND score1 <> score2
           UNION ALL
           SELECT tournament_id, team2_p2,
-                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2
+                 (CASE WHEN score2 > score1 THEN 1 ELSE 0 END), score2 - score1, score2, walkover
           FROM matches WHERE tournament_id = ANY(${finishedIds}) AND team2_p2 IS NOT NULL AND score1 <> score2
         ) sub WHERE player_id IS NOT NULL
         GROUP BY tournament_id, player_id
@@ -1238,13 +1249,16 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
       }
 
       for (const t of tournaments) {
-        if (t.status !== 'finished' || t.format === 'americano') continue;
+        if (t.status !== 'finished' || t.format === 'americano' || t.bracket?.final?.winner_id) continue;
 
         const tWins = winsByT[t.id] ?? [];
         if (!tWins.length) continue;
         // Mismo desempate que la tabla: victorias, diferencia, % de victorias,
         // games a favor (comparePairRows / compareStandingRows del front).
-        const asRow   = (w) => ({ wins: w.wins, diff: w.gdiff, played: w.played, gf: w.gf, pair_id: '' });
+        const asRow   = (w) => ({
+          points: w.wins * (t.points_win ?? 3) + w.lost * (t.points_loss ?? 0),
+          wins: w.wins, diff: w.gdiff, played: w.played, gf: w.gf, pair_id: '',
+        });
         const sorted  = [...tWins].sort((a, b) => comparePairRows(asRow(a), asRow(b)));
         const topList = sorted.filter((w) => comparePairRows(asRow(w), asRow(sorted[0])) === 0);
         const topIds  = new Set(topList.map((w) => w.player_id));
@@ -1364,7 +1378,7 @@ router.post('/', requireAuth, async (req, res, next) => {
       INSERT INTO groups (id, name, description, user_id, is_public, emojis, location_name, place_id, lat, lon,
                           club_id, pending_club_request_id,
                           signup_open, signup_price, signup_price_unit, signup_contacts, level,
-                          signup_capacity, signup_capacity_unit, signup_closes_at)
+                          signup_capacity, signup_capacity_unit, signup_closes_at, rules)
       VALUES (${uid()}, ${name.trim()}, ${description ?? null}, ${req.user.id}, ${is_public}, ${emojis},
               ${location_name ?? null}, ${place_id ?? null}, ${lat ?? null}, ${lon ?? null},
               ${club_id ?? null}, ${pending_club_request_id ?? null},
@@ -1372,7 +1386,8 @@ router.post('/', requireAuth, async (req, res, next) => {
               ${signup.signup_price_unit ?? null},
               ${signup.signup_contacts ? JSON.stringify(signup.signup_contacts) : null}::jsonb,
               ${signup.level ?? null},
-              ${signup.signup_capacity ?? null}, ${signup.signup_capacity_unit ?? null}, ${signup.signup_closes_at ?? null})
+              ${signup.signup_capacity ?? null}, ${signup.signup_capacity_unit ?? null}, ${signup.signup_closes_at ?? null},
+              ${signup.rules ?? null})
       RETURNING *
     `;
     res.status(201).json(group);
@@ -1417,7 +1432,8 @@ router.put('/:groupId', requireAuth, async (req, res, next) => {
           level             = CASE WHEN ${'level'             in signup}::boolean THEN ${signup.level             ?? null} ELSE level END,
           signup_capacity      = CASE WHEN ${'signup_capacity'      in signup}::boolean THEN ${signup.signup_capacity      ?? null}::int ELSE signup_capacity END,
           signup_capacity_unit = CASE WHEN ${'signup_capacity_unit' in signup}::boolean THEN ${signup.signup_capacity_unit ?? null} ELSE signup_capacity_unit END,
-          signup_closes_at     = CASE WHEN ${'signup_closes_at'     in signup}::boolean THEN ${signup.signup_closes_at     ?? null}::timestamptz ELSE signup_closes_at END
+          signup_closes_at     = CASE WHEN ${'signup_closes_at'     in signup}::boolean THEN ${signup.signup_closes_at     ?? null}::timestamptz ELSE signup_closes_at END,
+          rules                = CASE WHEN ${'rules'                in signup}::boolean THEN ${signup.rules                ?? null} ELSE rules END
       WHERE id = ${req.params.groupId} RETURNING *
     `;
     res.json(updated);

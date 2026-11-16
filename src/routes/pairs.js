@@ -4,6 +4,7 @@ import { uid }    from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireTournamentManage, requirePairManage } from '../middleware/access.js';
 import { walkoverMatchesFor, applyBracketWalkovers } from '../lib/tournamentLogic.js';
+import { scheduledIdsToCancel } from '../lib/ligaFechas.js';
 
 const router = Router();
 
@@ -108,8 +109,9 @@ router.put('/:id', requireAuth, requirePairManage, async (req, res, next) => {
 // DELETE /api/pairs/:id
 // Americano: sólo para parejas que no jugaron. Borrar una con partidos dejaba a
 // sus rivales con partidos que el calendario ya no contaba y desarmaba el
-// cuadro; con partidos jugados se retira (POST /:id/withdraw). En Liga se
-// borra siempre: sus partidos quedan, porque la tabla es por jugador.
+// cuadro; con partidos jugados se retira (POST /:id/withdraw). Lo mismo en la
+// liga en varios días: borrarla sacaría sus cruces del fixture. En la Liga de
+// un día se borra siempre: sus partidos quedan, porque la tabla es por jugador.
 router.delete('/:id', requireAuth, requirePairManage, async (req, res, next) => {
   try {
     const sql = getDb();
@@ -118,6 +120,13 @@ router.delete('/:id', requireAuth, requirePairManage, async (req, res, next) => 
       WHERE p.id = ${req.params.id}
     `;
     if (!pair) return res.status(404).json({ error: 'Pareja no encontrada' });
+    const temporada = req.accessCtx.format === 'liga' && req.accessCtx.liga_mode === 'temporada';
+    if (temporada && await countPairMatches(sql, pair) > 0) {
+      return res.status(409).json({
+        error: 'Esta pareja ya jugó en la liga. Dala de baja en lugar de eliminarla: sus partidos jugados se mantienen.',
+        code: 'pair_has_matches',
+      });
+    }
     if (req.accessCtx.format === 'americano' && (pair.bracket || await countPairMatches(sql, pair) > 0)) {
       return res.status(409).json({
         error: 'Esta pareja ya jugó en el torneo. Retirala en lugar de eliminarla: pierde 6-0 lo que le queda.',
@@ -138,13 +147,16 @@ router.delete('/:id', requireAuth, requirePairManage, async (req, res, next) => 
 
 // POST /api/pairs/:id/withdraw — baja de una pareja con el torneo en juego.
 // La pareja queda en el torneo como retirada: su historia sigue en la tabla.
-// Sus partidos programados pasan a W.O. 6-0 para el rival y, si hay cuadro,
-// sus cruces se resuelven solos por W.O. y el rival avanza. No se deshace.
-// Sólo en Americano: en Liga las parejas se editan o se borran libremente.
+// Americano: sus partidos programados pasan a W.O. 6-0 para el rival y, si hay
+// cuadro, sus cruces se resuelven solos por W.O. y el rival avanza.
+// Liga en varios días: sus programados se cancelan y los jugados se mantienen;
+// no entra en las fechas que se armen después (Fabri, 2026-11-09).
+// No se deshace. En la Liga de un día las parejas se editan o se borran.
 router.post('/:id/withdraw', requireAuth, requirePairManage, async (req, res, next) => {
   try {
-    if (req.accessCtx.format !== 'americano') {
-      return res.status(400).json({ error: 'Retirar una pareja sólo existe en el formato Americano' });
+    const temporada = req.accessCtx.format === 'liga' && req.accessCtx.liga_mode === 'temporada';
+    if (req.accessCtx.format !== 'americano' && !temporada) {
+      return res.status(400).json({ error: 'Retirar una pareja solo existe en el Americano y en la liga en varios días' });
     }
     const result = await withTransaction(async (client) => {
       const { rows: [pair] } = await client.query('SELECT * FROM pairs WHERE id = $1', [req.params.id]);
@@ -162,6 +174,13 @@ router.post('/:id/withdraw', requireAuth, requirePairManage, async (req, res, ne
       const { rows: scheduled } = await client.query(
         'SELECT * FROM scheduled_matches WHERE tournament_id = $1', [pair.tournament_id]
       );
+      if (temporada) {
+        const cancelar = scheduledIdsToCancel(pair, scheduled);
+        if (cancelar.length) {
+          await client.query('DELETE FROM scheduled_matches WHERE id = ANY($1::text[])', [cancelar]);
+        }
+        return { walkovers: 0, cancelled: cancelar.length };
+      }
       const walkovers = walkoverMatchesFor(pair, scheduled);
       const today = new Date().toISOString().slice(0, 10);
       for (const w of walkovers) {
@@ -181,11 +200,11 @@ router.post('/:id/withdraw', requireAuth, requirePairManage, async (req, res, ne
         await client.query('UPDATE tournaments SET bracket = $1::jsonb WHERE id = $2',
           [JSON.stringify(bracket), tournament.id]);
       }
-      return { walkovers: walkovers.length };
+      return { walkovers: walkovers.length, cancelled: 0 };
     });
 
     if (result.error) return res.status(result.status).json({ error: result.error });
-    res.json({ ok: true, walkovers: result.walkovers });
+    res.json({ ok: true, walkovers: result.walkovers, cancelled: result.cancelled });
   } catch (err) { next(err); }
 });
 

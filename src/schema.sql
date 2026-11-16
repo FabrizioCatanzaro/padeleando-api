@@ -678,3 +678,65 @@ CREATE TABLE IF NOT EXISTS tournament_instagram_posts (
   UNIQUE (tournament_id, shortcode)
 );
 CREATE INDEX IF NOT EXISTS idx_instagram_posts_tournament ON tournament_instagram_posts(tournament_id, created_at);
+
+-- Liga por fechas (2026-11-09). Una liga puede jugarse en un solo día (como
+-- hasta ahora) o en varios días, con la temporada dividida en fechas. El
+-- organizador elige al crearla si se permiten cruces repetidos y cómo se
+-- define el campeón. Ver lib/ligaFechas.js y el doc "Diseño: liga por fechas".
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS liga_mode     TEXT    NOT NULL DEFAULT 'jornada';
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS allow_rematch BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS winner_format TEXT    NOT NULL DEFAULT 'tabla';
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS playoff_size  INTEGER;
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_liga_mode_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_liga_mode_check
+  CHECK (liga_mode IN ('jornada', 'temporada'));
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_winner_format_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_winner_format_check
+  CHECK (winner_format IN ('tabla', 'playoffs'));
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_playoff_size_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_playoff_size_check
+  CHECK (playoff_size IS NULL OR playoff_size >= 2);
+
+-- Las fechas de una temporada: número y días que define el organizador.
+-- end_date NULL = la fecha se juega en un solo día.
+CREATE TABLE IF NOT EXISTS tournament_fechas (
+  id            TEXT PRIMARY KEY,
+  tournament_id TEXT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  number        INTEGER NOT NULL CHECK (number >= 1),
+  start_date    DATE NOT NULL,
+  end_date      DATE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tournament_id, number),
+  CHECK (end_date IS NULL OR end_date >= start_date)
+);
+
+-- En una liga por fechas, scheduled_matches.round y matches.round son el
+-- número de fecha. Un partido postergado sigue en su fecha y se juega otro
+-- día; si nunca se juega, queda sin jugar y no suma puntos.
+ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS scheduled_date DATE;
+ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS postponed      BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE matches           ADD COLUMN IF NOT EXISTS round          INTEGER;
+CREATE INDEX IF NOT EXISTS idx_matches_tournament_round ON matches(tournament_id, round);
+
+-- Reglamento del torneo (2026-11-10). NULL en el torneo = hereda el de la
+-- categoría. La inscripción guarda cuándo el jugador lo aceptó.
+ALTER TABLE groups      ADD COLUMN IF NOT EXISTS rules TEXT;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rules TEXT;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS rules_accepted_at TIMESTAMPTZ;
+
+-- Puntos de la tabla de una liga (2026-11-10). La tabla ordena por puntos y
+-- después por victorias. La derrota por W.O. no suma los puntos de derrota.
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS points_win  INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS points_loss INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_points_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_points_check
+  CHECK (points_win BETWEEN 0 AND 10 AND points_loss BETWEEN 0 AND 10 AND points_loss <= points_win);
+
+-- Flyer del torneo (2026-11-10): imagen para promocionarlo, se muestra en 9:16.
+-- Gratis para todos. Ver POST /tournaments/:id/flyer.
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS flyer_url       TEXT;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS flyer_public_id TEXT;
+
+-- Disponibilidad horaria de la inscripción a una liga en varios días
+-- (2026-11-10): rangos por día de la semana y una nota. Ver lib/availability.js.
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS availability JSONB;

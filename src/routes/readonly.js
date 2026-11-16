@@ -39,7 +39,8 @@ router.get('/:tournamentId', async (req, res, next) => {
              g.level             AS group_level,
              g.signup_capacity      AS group_signup_capacity,
              g.signup_capacity_unit AS group_signup_capacity_unit,
-             g.signup_closes_at     AS group_signup_closes_at
+             g.signup_closes_at     AS group_signup_closes_at,
+             g.rules                AS group_rules
       FROM   tournaments t
       JOIN   groups g ON g.id = t.group_id
       JOIN   users  u ON u.id = g.user_id
@@ -59,9 +60,16 @@ router.get('/:tournamentId', async (req, res, next) => {
     // El fixture es lo que el espectador viene a mirar antes de que empiece:
     // contra quién juega y en qué cancha.
     const scheduled = await sql`
-      SELECT * FROM scheduled_matches
+      SELECT *, scheduled_date::text AS scheduled_date
+      FROM scheduled_matches
       WHERE tournament_id = ${tournamentId}
       ORDER BY scheduled_at NULLS LAST, round NULLS LAST, position, created_at
+    `;
+
+    // Las fechas de una liga en varios días (vacío en el resto).
+    const fechas = await sql`
+      SELECT id, tournament_id, number, start_date::text AS start_date, end_date::text AS end_date, created_at
+      FROM tournament_fechas WHERE tournament_id = ${tournamentId} ORDER BY number
     `;
  
     // Canonical player list from tournament_players table
@@ -100,7 +108,8 @@ router.get('/:tournamentId', async (req, res, next) => {
       ...extraPlayers.map((p) => ({ ...p, removed: true })),
     ];
  
-    const rosterHidden = !hasStarted(tournament, matches.length);
+    // En la liga por fechas, armar una fecha publica el fixture.
+    const rosterHidden = !hasStarted(tournament, matches.length) && fechas.length === 0;
 
     res.json({
       id:             tournament.id,
@@ -129,6 +138,13 @@ router.get('/:tournamentId', async (req, res, next) => {
       // Las canchas mandan sobre number_of_courts, que es una copia vieja del club.
       club_courts:         tournament.club_courts ?? null,
       bracket:        tournament.bracket ?? null,
+      liga_mode:      tournament.liga_mode ?? 'jornada',
+      allow_rematch:  tournament.allow_rematch ?? false,
+      winner_format:  tournament.winner_format ?? 'tabla',
+      playoff_size:   tournament.playoff_size ?? null,
+      points_win:     tournament.points_win ?? 3,
+      points_loss:    tournament.points_loss ?? 0,
+      flyer_url:      tournament.flyer_url ?? null,
       // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
       signup: publicSignup(resolveSignup(tournament, {
         signup_open:       tournament.group_signup_open,
@@ -139,12 +155,14 @@ router.get('/:tournamentId', async (req, res, next) => {
         signup_capacity:      tournament.group_signup_capacity,
         signup_capacity_unit: tournament.group_signup_capacity_unit,
         signup_closes_at:     tournament.group_signup_closes_at,
+        rules:                tournament.group_rules,
       }, tournament.owner_social_links), { format: tournament.format, used: await countUsedPlayers(sql, tournamentId) }),
       // El plantel queda oculto hasta que empieza el torneo (Fabri, 2026-11-09).
       players:           rosterHidden ? [] : players,
       pairs:             rosterHidden ? [] : pairs,
       matches,
       scheduled_matches: rosterHidden ? [] : scheduled,
+      fechas,
       roster_hidden:     rosterHidden,
     });
   } catch (err) { next(err); }
