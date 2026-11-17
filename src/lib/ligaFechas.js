@@ -241,7 +241,8 @@ export function generateFecha({ pairs, crosses = [], allowRematch = false, rng =
     canPair: (a, b) => !faced.has(edgeKey(a, b)),
   });
   if (best.crosses.length === 0) throw new Error('Ya se jugaron todos los cruces');
-  return { crosses: best.crosses, libres: best.libres, completable: false, round };
+  // Con una baja el grafo deja de ser regular, pero si esta fecha cierra lo que falta, se completa.
+  return { crosses: best.crosses, libres: best.libres, completable: best.crosses.length === realEdges, round };
 }
 
 /**
