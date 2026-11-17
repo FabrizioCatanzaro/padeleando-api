@@ -441,6 +441,33 @@ export function generateCupBracket(seeds, { tercerPuesto = false, kind = 'copa' 
   return applyBracketWalkovers(out);
 }
 
+// Partidos que faltan para cerrar la fase de grupos, entre parejas activas del mismo grupo.
+export function gruposPendientes(pairs, matches, ruedas = 1) {
+  const jugados = new Map();
+  for (const m of matches) {
+    if (m.score1 == null || m.score2 == null) continue;
+    const k = edgeKey(pairKey([m.team1_p1, m.team1_p2]), pairKey([m.team2_p1, m.team2_p2]));
+    jugados.set(k, (jugados.get(k) ?? 0) + 1);
+  }
+  let faltan = 0;
+  for (const [, pairsZ] of pairsByZona(pairs)) {
+    const act = activas(pairsZ).map((p) => pairKey([p.p1_id, p.p2_id]));
+    for (let i = 0; i < act.length; i++) {
+      for (let j = i + 1; j < act.length; j++) faltan += Math.max(0, ruedas - (jugados.get(edgeKey(act[i], act[j])) ?? 0));
+    }
+  }
+  return faltan;
+}
+
+// Reordena una propuesta de siembra con los ids que mandó el organizador. null si no son las mismas parejas.
+export function ordenarSemillas(propuesta, orden) {
+  if (orden == null) return propuesta;
+  if (!Array.isArray(orden) || orden.length !== propuesta.length) return null;
+  const porId = new Map(propuesta.map((r) => [String(r.pair_id), r]));
+  if (new Set(orden.map(String)).size !== orden.length || orden.some((id) => !porId.has(String(id)))) return null;
+  return orden.map((id, i) => ({ ...porId.get(String(id)), seed: i + 1 }));
+}
+
 // Qué no se puede cambiar según el avance: null si la edición está permitida.
 export function copaConfigLockError(current, next, { sorteado = false, hasFechas = false, hasBracket = false } = {}) {
   const cambia = (k) => current[k] !== next[k];

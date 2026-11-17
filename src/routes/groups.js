@@ -543,6 +543,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         t.club_id,
         COALESCE(t.event_date, t.created_at::date)::text AS day,
         t.bracket,
+        t.bracket_plata,
         COALESCE(
           g.is_public
           OR ${isOwner}::boolean
@@ -689,6 +690,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       )
       SELECT
         t.bracket,
+        t.bracket_plata,
         (SELECT json_agg(json_build_object(
             'id',       pr.id,
             'user_ids', json_build_array(p1.user_id, p2.user_id)))
@@ -962,7 +964,7 @@ router.get('/:groupId/history', async (req, res, next) => {
     const sql = getDb();
 
     const tournaments = await sql`
-      SELECT t.id, t.name, t.created_at, t.status, t.mode, t.format, t.bracket,
+      SELECT t.id, t.name, t.created_at, t.status, t.mode, t.format, t.bracket, t.bracket_plata,
              t.event_date, t.event_time, t.live_match,
              t.club_id, c.name AS club_name, c.photo_url AS club_photo_url
       FROM   tournaments t
@@ -1080,7 +1082,10 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
     group.owner_social_links = publicSocialLinks(group.owner_social_links);
     // Los partidos del cuadro no están en `matches`: se suman para que coincida con el torneo.
-    for (const t of tournaments) t.match_count += countBracketPlayed(t.bracket);
+    for (const t of tournaments) {
+      t.match_count += countBracketPlayed(t.bracket) + countBracketPlayed(t.bracket_plata);
+      delete t.bracket_plata;
+    }
 
     const viewerId = req.user?.id ?? null;
     const is_owner = !!viewerId && group.user_id === viewerId;

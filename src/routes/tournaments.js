@@ -12,7 +12,7 @@ import {
   generatePreviaSchedule, computeStandings, generateBracket,
   applyBracketResult, clearBracketResult, findBracketMatch,
   isPreviaComplete, isBracketMatchReady, planScheduleRows, applyBracketWalkovers,
-  generatePlayoffBracket,
+  generatePlayoffBracket, isWithdrawn,
 } from '../lib/tournamentLogic.js';
 import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations.js';
 import {
@@ -21,6 +21,7 @@ import {
 import {
   parseCopaSettings, parsePrizes, copaConfigLockError, datosVisibles, esCopa, esCopaZonas, usaFechas, COPA_MAX_PAIRS,
   sortearZonas, validateZonas, generateCopaFecha, validateCopaFecha,
+  zonaStandings, rankClasificados, seedCuadro, seedCuadroDirecto, generateCupBracket, gruposPendientes, ordenarSemillas,
 } from '../lib/copa.js';
 
 const router = Router();
@@ -1224,6 +1225,129 @@ router.post('/:id/schedule', requireAuth, requireTournamentManage, async (req, r
   } catch (err) { next(err); }
 });
 
+// Columna del cuadro que toca un pedido: el principal o, con ?copa=plata, el de plata.
+const columnaCuadro = (req) => (req.query.copa === 'plata' ? 'bracket_plata' : 'bracket');
+const semilla = (r) => ({ seed: r.seed, pair_id: r.pair_id, pair_name: r.pair_name, zona: r.zona ?? null, pos: r.pos ?? null, via: r.via ?? null });
+const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
+const HORA_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// Torneo, parejas y partidos de grupo de una copa, en un solo viaje. `q` devuelve { rows }.
+async function cargarCopa(q, id) {
+  const [{ rows: [t] }, { rows: pairs }, { rows: matches }] = await Promise.all([
+    q(`SELECT id, format, status, copa_config, points_win, points_loss, (bracket IS NOT NULL) AS armado
+       FROM tournaments WHERE id = $1`, [id]),
+    q(`SELECT pr.id, pr.p1_id, pr.p2_id, pr.status, pr.zona, pr.cabeza_serie,
+              COALESCE(u1.name, p1.name) AS p1_name, COALESCE(u2.name, p2.name) AS p2_name
+       FROM pairs pr
+       JOIN players p1 ON p1.id = pr.p1_id LEFT JOIN users u1 ON u1.id = p1.user_id
+       JOIN players p2 ON p2.id = pr.p2_id LEFT JOIN users u2 ON u2.id = p2.user_id
+       WHERE pr.tournament_id = $1 ORDER BY pr.id`, [id]),
+    q(`SELECT team1_p1, team1_p2, team2_p1, team2_p2, score1, score2, sets, walkover
+       FROM matches WHERE tournament_id = $1`, [id]),
+  ]);
+  return { t, pairs, matches };
+}
+
+// Siembra propuesta: cuadro de oro, de plata y lo que falta para poder armarlos.
+function propuestaCopa(t, pairs, matches) {
+  const cfg = t.copa_config;
+  if (cfg.mode !== 'zonas') {
+    const oro = seedCuadroDirecto({ pairs });
+    if (oro.length < 2) return { error: 'Hacen falta al menos 2 parejas confirmadas para armar el cuadro' };
+    return { oro, plata: null, pendientes: 0, sin_grupo: 0 };
+  }
+  if (!pairs.some((p) => p.zona != null)) return { error: 'Primero armá los grupos' };
+  const tablas = zonaStandings(pairs, matches, { win: t.points_win ?? 3, loss: t.points_loss ?? 0 });
+  const { clasificados, resto } = rankClasificados(tablas, cfg);
+  if (clasificados.length < 2) return { error: 'Hacen falta al menos 2 parejas clasificadas' };
+  return {
+    oro: seedCuadro(clasificados),
+    plata: cfg.plata && resto.length >= 2 ? seedCuadro(resto) : null,
+    pendientes: gruposPendientes(pairs, matches, cfg.ruedas ?? 1),
+    sin_grupo: pairs.filter((p) => !isWithdrawn(p) && p.zona == null).length,
+  };
+}
+
+// POST /api/tournaments/:id/copa/cuadro — propuesta de cruces de la copa, sin guardar nada.
+router.post('/:id/copa/cuadro', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    if (!esCopa(req.accessCtx)) return res.status(400).json({ error: 'Solo disponible en la copa' });
+    if (req.accessCtx.has_bracket) return res.status(409).json({ error: 'El cuadro ya está armado', code: 'bracket_exists' });
+    const sql = getDb();
+    const { t, pairs, matches } = await cargarCopa(async (text, params) => ({ rows: await sql.query(text, params) }), req.params.id);
+    const p = propuestaCopa(t, pairs, matches);
+    if (p.error) return res.status(400).json({ error: p.error });
+    res.json({ oro: p.oro.map(semilla), plata: p.plata?.map(semilla) ?? null, pendientes: p.pendientes, sin_grupo: p.sin_grupo });
+  } catch (err) { next(err); }
+});
+
+// PUT /api/tournaments/:id/copa/cuadro — arma los cuadros. Body: { oro?: [pair_id], plata?: [pair_id] } con el orden de siembra.
+router.put('/:id/copa/cuadro', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    if (!esCopa(req.accessCtx)) return res.status(400).json({ error: 'Solo disponible en la copa' });
+    const id = req.params.id;
+    const result = await withTransaction(async (client) => {
+      await client.query('SELECT id FROM tournaments WHERE id = $1 FOR UPDATE', [id]);
+      const { t, pairs, matches } = await cargarCopa((text, params) => client.query(text, params), id);
+      if (t.status === 'finished') return { status: 400, error: 'El torneo está finalizado' };
+      if (t.armado) return { status: 409, error: 'El cuadro ya está armado', code: 'bracket_exists' };
+      const p = propuestaCopa(t, pairs, matches);
+      if (p.error) return { status: 400, error: p.error };
+      if (p.sin_grupo > 0) return { status: 400, error: 'Hay parejas sin grupo. Ubicalas antes de armar los playoffs.', code: 'sin_grupo' };
+      if (p.pendientes > 0) {
+        return { status: 400, error: `Faltan ${p.pendientes} ${p.pendientes === 1 ? 'partido' : 'partidos'} de la fase de grupos`, code: 'grupos_incompletos' };
+      }
+      const oro = ordenarSemillas(p.oro, req.body.oro);
+      const plata = p.plata ? ordenarSemillas(p.plata, req.body.plata) : null;
+      if (!oro || (p.plata && !plata)) return { status: 400, error: 'El orden no coincide con las parejas clasificadas' };
+      const bracket = generateCupBracket(oro.map(semilla), { tercerPuesto: !!t.copa_config.tercer_puesto, kind: 'copa' });
+      const bracketPlata = plata ? generateCupBracket(plata.map(semilla), { kind: 'plata' }) : null;
+      const { rows: [saved] } = await client.query(
+        'UPDATE tournaments SET bracket = $1::jsonb, bracket_plata = $2::jsonb WHERE id = $3 RETURNING *',
+        [JSON.stringify(bracket), bracketPlata ? JSON.stringify(bracketPlata) : null, id]
+      );
+      return { saved };
+    });
+    if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+    res.json(result.saved);
+  } catch (err) { next(err); }
+});
+
+// PATCH /api/tournaments/:id/bracket/:matchId/programar — día, hora y cancha de un cruce de la copa.
+// Body: { date, time, court, court_id }; null borra el dato. ?copa=plata para el cuadro de plata.
+router.patch('/:id/bracket/:matchId/programar', requireAuth, requireTournamentManage, async (req, res, next) => {
+  try {
+    if (!esCopa(req.accessCtx)) return res.status(400).json({ error: 'Solo disponible en la copa' });
+    const { date = null, time = null, court = null, court_id = null } = req.body;
+    if (date != null && !FECHA_RE.test(date)) return res.status(400).json({ error: 'Fecha inválida' });
+    if (time != null && !HORA_RE.test(time)) return res.status(400).json({ error: 'Hora inválida' });
+    if (court != null && !(Number.isInteger(court) && court >= 1 && court <= 99)) return res.status(400).json({ error: 'Cancha inválida' });
+    if (court_id != null && typeof court_id !== 'string') return res.status(400).json({ error: 'Cancha inválida' });
+    const col = columnaCuadro(req);
+    const result = await withTransaction(async (client) => {
+      const [{ rows: [t] }, { rows: canchas }] = await Promise.all([
+        client.query(`SELECT ${col} AS cuadro FROM tournaments WHERE id = $1 FOR UPDATE`, [req.params.id]),
+        court_id != null
+          ? client.query(`SELECT cc.id FROM club_courts cc JOIN tournaments t ON t.club_id = cc.club_id
+                          WHERE cc.id = $1 AND t.id = $2`, [court_id, req.params.id])
+          : Promise.resolve({ rows: [] }),
+      ]);
+      if (!t?.cuadro) return { status: 400, error: 'El cuadro aún no fue armado' };
+      if (court_id != null && canchas.length === 0) return { status: 400, error: 'La cancha no es del club del torneo' };
+      const cuadro = structuredClone(t.cuadro);
+      const match = findBracketMatch(cuadro, req.params.matchId);
+      if (!match) return { status: 404, error: 'Partido de cuadro no encontrado' };
+      match.programado = date || time || court != null || court_id != null ? { date, time, court, court_id } : null;
+      const { rows: [saved] } = await client.query(
+        `UPDATE tournaments SET ${col} = $1::jsonb WHERE id = $2 RETURNING *`, [JSON.stringify(cuadro), req.params.id]
+      );
+      return { saved };
+    });
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    res.json(result.saved);
+  } catch (err) { next(err); }
+});
+
 // POST /api/tournaments/:id/bracket
 // Genera el cuadro eliminatorio a partir de la tabla de la fase previa.
 // Guarda el bracket en tournaments.bracket y lo retorna.
@@ -1336,12 +1460,11 @@ router.patch('/:id/bracket', requireAuth, requireTournamentManage, async (req, r
     const { bracket } = req.body;
     if (!bracket) return res.status(400).json({ error: 'bracket requerido' });
     const sql = getDb();
-    const [updated] = await sql`
-      UPDATE tournaments SET bracket = ${JSON.stringify(bracket)}::jsonb
-      WHERE id = ${req.params.id} RETURNING *
-    `;
+    const [updated] = await sql.query(
+      `UPDATE tournaments SET ${columnaCuadro(req)} = $1::jsonb WHERE id = $2 RETURNING *`, [JSON.stringify(bracket), req.params.id]
+    );
     if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });
-    res.json({ ...updated, bracket });
+    res.json({ ...updated, [columnaCuadro(req)]: bracket });
   } catch (err) { next(err); }
 });
 
@@ -1352,7 +1475,7 @@ router.delete('/:id/bracket', requireAuth, requireTournamentManage, async (req, 
   try {
     const sql = getDb();
     const [updated] = await sql`
-      UPDATE tournaments SET bracket = NULL, live_match = NULL
+      UPDATE tournaments SET bracket = NULL, bracket_plata = NULL, live_match = NULL
       WHERE id = ${req.params.id} RETURNING *
     `;
     if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });
@@ -1378,14 +1501,15 @@ router.patch('/:id/bracket/:matchId', requireAuth, requireTournamentManage, asyn
     if (sets != null && !Array.isArray(sets)) return res.status(400).json({ error: 'sets debe ser una lista' });
 
     const { matchId } = req.params;
+    const col = columnaCuadro(req);
     const result = await withTransaction(async (client) => {
       const { rows: [tournament] } = await client.query(
         'SELECT * FROM tournaments WHERE id = $1 FOR UPDATE', [req.params.id]
       );
       if (!tournament) return { status: 404, error: 'Torneo no encontrado' };
-      if (!tournament.bracket) return { status: 400, error: 'El bracket aún no fue generado' };
+      if (!tournament[col]) return { status: 400, error: 'El bracket aún no fue generado' };
 
-      const match = findBracketMatch(tournament.bracket, matchId);
+      const match = findBracketMatch(tournament[col], matchId);
       if (!match) return { status: 404, error: 'Partido de bracket no encontrado' };
       if (!isBracketMatchReady(match)) {
         return { status: 400, error: 'Este partido todavía no tiene las dos parejas definidas' };
@@ -1393,20 +1517,20 @@ router.patch('/:id/bracket/:matchId', requireAuth, requireTournamentManage, asyn
 
       // Si en la ronda siguiente espera una pareja retirada, ese cruce se
       // resuelve solo por W.O.
-      const updated = applyBracketWalkovers(applyBracketResult(tournament.bracket, matchId, score1, score2, duration_seconds ?? null, court ?? null, {
+      const updated = applyBracketWalkovers(applyBracketResult(tournament[col], matchId, score1, score2, duration_seconds ?? null, court ?? null, {
         sets_format: sets_format ?? null,
         sets: Array.isArray(sets) ? sets : [],
       }));
 
       const { rows: [saved] } = await client.query(
-        'UPDATE tournaments SET bracket = $1::jsonb WHERE id = $2 RETURNING *',
+        `UPDATE tournaments SET ${col} = $1::jsonb WHERE id = $2 RETURNING *`,
         [JSON.stringify(updated), req.params.id]
       );
       return { saved, bracket: updated };
     });
 
     if (result.error) return res.status(result.status).json({ error: result.error });
-    res.json({ ...result.saved, bracket: result.bracket });
+    res.json({ ...result.saved, [col]: result.bracket });
   } catch (err) { next(err); }
 });
 
@@ -1416,27 +1540,28 @@ router.patch('/:id/bracket/:matchId', requireAuth, requireTournamentManage, asyn
 // de ese ganador. Misma transacción con FOR UPDATE que el PATCH.
 router.delete('/:id/bracket/:matchId', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
+    const col = columnaCuadro(req);
     const result = await withTransaction(async (client) => {
       const { rows: [tournament] } = await client.query(
         'SELECT * FROM tournaments WHERE id = $1 FOR UPDATE', [req.params.id]
       );
       if (!tournament) return { status: 404, error: 'Torneo no encontrado' };
-      if (!tournament.bracket) return { status: 400, error: 'El bracket aún no fue generado' };
+      if (!tournament[col]) return { status: 400, error: 'El bracket aún no fue generado' };
 
-      const cleared = clearBracketResult(tournament.bracket, req.params.matchId);
+      const cleared = clearBracketResult(tournament[col], req.params.matchId);
       if (!cleared) return { status: 404, error: 'Partido de bracket no encontrado' };
       // Un W.O. contra una pareja retirada vuelve a resolverse: no se puede borrar.
       const updated = applyBracketWalkovers(cleared);
 
       const { rows: [saved] } = await client.query(
-        'UPDATE tournaments SET bracket = $1::jsonb WHERE id = $2 RETURNING *',
+        `UPDATE tournaments SET ${col} = $1::jsonb WHERE id = $2 RETURNING *`,
         [JSON.stringify(updated), req.params.id]
       );
       return { saved, bracket: updated };
     });
 
     if (result.error) return res.status(result.status).json({ error: result.error });
-    res.json({ ...result.saved, bracket: result.bracket });
+    res.json({ ...result.saved, [col]: result.bracket });
   } catch (err) { next(err); }
 });
 

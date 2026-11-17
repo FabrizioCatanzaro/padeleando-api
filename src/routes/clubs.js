@@ -430,7 +430,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       `,
       // El cuadro (americano o playoffs de liga) no vive en `matches`: se cuenta aparte.
       sql`
-        SELECT t.bracket
+        SELECT t.bracket, t.bracket_plata
         FROM tournaments t
         JOIN groups g ON g.id = t.group_id AND g.is_public = true
         WHERE t.club_id = ${req.params.id}
@@ -448,7 +448,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
 
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
-    const bracketPlayed = brackets.reduce((n, r) => n + countBracketPlayed(r.bracket), 0);
+    const bracketPlayed = brackets.reduce((n, r) => n + countBracketPlayed(r.bracket) + countBracketPlayed(r.bracket_plata), 0);
     const isManager = req.user?.role === 'admin' || club.is_owner === true;
     const courts_list = isManager ? courtsList : courtsList.filter((c) => c.active);
     // Más estricto que isManager: el admin solo gestiona reservas de clubes sin dueño

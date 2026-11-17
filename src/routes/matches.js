@@ -4,7 +4,11 @@ import { uid }    from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireTournamentManage, requireMatchManage } from '../middleware/access.js';
 import { withdrawnTeamError } from '../lib/fixture.js';
-import { usaFechas, esCopa } from '../lib/copa.js';
+import { usaFechas, esCopa, esCopaZonas } from '../lib/copa.js';
+
+// Con los playoffs armados, la fase de grupos de la copa queda fija.
+const gruposCerrados = (ctx) => esCopaZonas(ctx) && ctx.has_bracket;
+const GRUPOS_CERRADOS = { error: 'Los playoffs ya están armados. Borrá el cuadro para cambiar la fase de grupos.', code: 'bracket_exists' };
 
 const router = Router();
 
@@ -39,6 +43,7 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     if (esCopa(req.accessCtx) && !usaFechas(req.accessCtx)) {
       return res.status(400).json({ error: 'En la copa de cuadro los partidos se cargan en el cuadro' });
     }
+    if (gruposCerrados(req.accessCtx)) return res.status(409).json(GRUPOS_CERRADOS);
 
     const sql = getDb();
 
@@ -98,6 +103,7 @@ router.put('/:id', requireAuth, requireMatchManage, async (req, res, next) => {
     const { team1, team2, score1, score2, playedAt, duration_seconds, sets, sets_format, court, court_id } = req.body;
     const scoreError = validateScore(score1, score2);
     if (scoreError) return res.status(400).json({ error: scoreError });
+    if (gruposCerrados(req.accessCtx)) return res.status(409).json(GRUPOS_CERRADOS);
 
     const sql = getDb();
     const setsJson = sets?.length ? JSON.stringify(sets) : null;
@@ -125,6 +131,7 @@ router.put('/:id', requireAuth, requireMatchManage, async (req, res, next) => {
 // DELETE /api/matches/:id
 router.delete('/:id', requireAuth, requireMatchManage, async (req, res, next) => {
   try {
+    if (gruposCerrados(req.accessCtx)) return res.status(409).json(GRUPOS_CERRADOS);
     const sql = getDb();
     await sql`DELETE FROM matches WHERE id = ${req.params.id}`;
     res.json({ ok: true });

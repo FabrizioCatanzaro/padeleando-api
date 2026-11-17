@@ -3,7 +3,20 @@
 // matches: acá se expanden para que el perfil mida lo mismo que el torneo.
 import { comparePairRows } from './tournamentLogic.js';
 
-const ROUNDS = ['octavos', 'cuartos', 'semis'];
+const ROUNDS = ['dieciseisavos', 'octavos', 'cuartos', 'semis'];
+
+// Todos los nodos de un cuadro con su ronda, tercer puesto incluido.
+export function bracketNodes(bracket) {
+  if (!bracket) return [];
+  return [
+    ...ROUNDS.flatMap((r) => (bracket[r] ?? []).map((m) => ({ ...m, round: r }))),
+    ...(bracket.final ? [{ ...bracket.final, round: 'final' }] : []),
+    ...(bracket.tercer ? [{ ...bracket.tercer, round: 'tercer' }] : []),
+  ];
+}
+
+// El cuadro principal y, en la copa, el de plata.
+const cuadrosDe = (row) => [[row.bracket, ''], [row.bracket_plata, 'plata:']].filter(([b]) => b);
 
 /** Día comparable (YYYY-MM-DD): Neon devuelve las columnas DATE como Date. */
 export function dayKey(value) {
@@ -19,9 +32,7 @@ export function dayKey(value) {
  * `matches` sino en el JSONB de `tournaments.bracket`.
  */
 export function countBracketPlayed(bracket) {
-  if (!bracket) return 0;
-  return [...ROUNDS.flatMap((r) => bracket[r] ?? []), ...(bracket.final ? [bracket.final] : [])]
-    .filter((m) => m?.winner_id != null).length;
+  return bracketNodes(bracket).filter((m) => m?.winner_id != null).length;
 }
 
 /**
@@ -32,15 +43,8 @@ export function expandBracketMatches(rows) {
   const out = [];
 
   for (const row of rows) {
-    const bracket = row.bracket;
-    if (!bracket) continue;
-
     const pairById = Object.fromEntries((row.pairs ?? []).map((p) => [String(p.id), p]));
-
-    const matches = [
-      ...ROUNDS.flatMap((r) => (bracket[r] ?? []).map((m) => ({ ...m, round: r }))),
-      ...(bracket.final ? [{ ...bracket.final, round: 'final' }] : []),
-    ];
+    const matches = cuadrosDe(row).flatMap(([b, pre]) => bracketNodes(b).map((m) => ({ ...m, key: `${pre}${m.id}` })));
 
     for (const m of matches) {
       if (m.winner_id == null || m.pair1_id == null || m.pair2_id == null) continue;
@@ -66,7 +70,7 @@ export function expandBracketMatches(rows) {
       const partnerKey  = mine.keys?.[partnerIdx];
 
       out.push({
-        id:               `bracket:${row.tournament_id}:${m.id}`,
+        id:               `bracket:${row.tournament_id}:${m.key}`,
         played_at:        row.day,
         score1:           myScore,
         score2:           oppScore,
@@ -268,12 +272,8 @@ export function bracketStatsByUser(rows) {
   };
 
   for (const row of rows) {
-    if (!row.bracket) continue;
     const pairById = Object.fromEntries((row.pairs ?? []).map((p) => [String(p.id), p]));
-    const matches = [
-      ...ROUNDS.flatMap((r) => row.bracket[r] ?? []),
-      ...(row.bracket.final ? [row.bracket.final] : []),
-    ];
+    const matches = cuadrosDe(row).flatMap(([b]) => bracketNodes(b));
     for (const m of matches) {
       if (m.winner_id == null || m.pair1_id == null || m.pair2_id == null) continue;
       if (m.walkover) continue;
