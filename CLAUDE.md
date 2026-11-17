@@ -8,6 +8,20 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 
 ---
 
+## Current Status (updated 2026-11-17)
+
+- **Last sprint: Copa** — merged to `main` (front PR #44, API PR #37). It shipped the Copa format (groups + playoffs, or direct bracket, copa de plata, prizes, per-player WhatsApp/availability), the redesigned tournament setup (`Setup.jsx`: format cards with photos, config/info sub-steps, segmented `StepBar`, one-row pair loader, summary aside), WhatsApp for the multi-day liga, and the mail domain change to `soporte@padeleando.ar` (Resend now sends from `padeleando.ar`). Design doc: https://claude.ai/artifact/X8KtqZZQamuNXRxhBDqftw
+- **Production DB already has the Copa schema** (`copa_config`, `bracket_plata`, `pairs.zona`, `tournament_players` data columns, `court_id`, `tournament_prizes`). `db:init` re-applies it as a no-op.
+- **Local dev points at the production database** (`padeliando-api/.env`, backed up in `produccion.env`). For risky work, create a Neon branch of `production` (project `weathered-morning-55905272`), point `.env` at it, and delete the branch when done. Test data is named `TEST …` and deleted at the end.
+- **Git flow:** feature branch from `staging` → commits authored by Fabrizio Catanzaro → `merge --ff-only` into `staging` → Fabrizio pushes and opens the PR `staging` → `main`. Never commit `.claude/` or `.mcp.json`.
+- **Open items:**
+  - Super tie-break as a match format (left out of the Copa sprint on purpose, "option b").
+  - TV mode (`TvOverlay`) shows the main bracket only, not the copa de plata.
+  - Fecha generation can still warn "ya no se completa el todos contra todos" mid-season after a withdrawal (the last fecha was fixed; the general case is a pessimistic warning, not a wrong fixture).
+  - Pre-existing test rows in production, not from the Copa sprint: players "Test Jugador Uno", "Test Jugador Dos", "Test Claude".
+
+---
+
 ## Tech Stack
 
 - Node + **Express 5**, ESM (`"type": "module"`), run through **`tsx`** (no build step, no TypeScript in `src/`)
