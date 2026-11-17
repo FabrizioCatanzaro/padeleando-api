@@ -285,11 +285,11 @@ router.get('/mine/:tournamentId', requireAuth, async (req, res, next) => {
         price: signup.price, price_unit: signup.unit,
         rules: signup.rules,
       },
-      // El teléfono del invitado sólo lo ve quien lo cargó; el WhatsApp del titular, él o si eligió mostrarlo.
+      // El WhatsApp de cada jugador lo ve él y su compañero; p2_phone es el del jugador 2, con o sin cuenta.
       registration: mine && {
         ...mine,
-        p2_phone: mine.p1_user_id === req.user.id ? mine.p2_phone : null,
-        p1_whatsapp: mine.p1_user_id === req.user.id || mine.p1_whatsapp_visible ? mine.p1_whatsapp : null,
+        p2_phone: [mine.p1_user_id, mine.p2_user_id].includes(req.user.id) ? mine.p2_phone : null,
+        p1_whatsapp: mine.p1_whatsapp,
       },
       asks_player_data: pideDatos(t),
       in_tournament: inTournament,
@@ -541,7 +541,7 @@ async function approve(q, r, t, signup, actorId) {
       WHERE tp.tournament_id = $1 AND tp.player_id = v.player_id`,
       [t.id, players,
        [jsonOrNull(r.availability), jsonOrNull(r.p2_availability)].slice(0, players.length),
-       [r.p1_whatsapp, r.p2_user_id ? null : r.p2_phone].slice(0, players.length),
+       [r.p1_whatsapp, r.p2_phone].slice(0, players.length),
        [r.p1_whatsapp_visible === true, r.p2_whatsapp_visible === true].slice(0, players.length)]);
   }
 
