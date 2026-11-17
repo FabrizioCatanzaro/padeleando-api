@@ -740,3 +740,54 @@ ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS flyer_public_id TEXT;
 -- Disponibilidad horaria de la inscripción a una liga en varios días
 -- (2026-11-10): rangos por día de la semana y una nota. Ver lib/availability.js.
 ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS availability JSONB;
+
+-- Copa (2026-11-16): grupos (zonas) + playoffs, o cuadro directo. Ver lib/copa.js.
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS copa_config   JSONB;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bracket_plata JSONB;
+ALTER TABLE pairs ADD COLUMN IF NOT EXISTS zona         SMALLINT CHECK (zona IS NULL OR zona BETWEEN 1 AND 8);
+ALTER TABLE pairs ADD COLUMN IF NOT EXISTS cabeza_serie SMALLINT CHECK (cabeza_serie IS NULL OR cabeza_serie >= 1);
+
+-- Disponibilidad y WhatsApp por jugador y torneo: `players` es una fila por categoría.
+ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS availability     JSONB;
+ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS whatsapp         TEXT;
+ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS whatsapp_visible BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS p2_availability     JSONB;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS p1_whatsapp         TEXT;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS p1_whatsapp_visible BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS p2_whatsapp_visible BOOLEAN NOT NULL DEFAULT false;
+
+-- La disponibilidad por inscripción pasa a sus dos jugadores. Solo completa vacíos.
+UPDATE tournament_registrations SET p2_availability = availability
+WHERE kind = 'pair' AND availability IS NOT NULL AND p2_availability IS NULL;
+UPDATE tournament_players tp SET availability = r.availability
+FROM tournament_registrations r
+WHERE r.status = 'approved' AND r.availability IS NOT NULL AND tp.availability IS NULL
+  AND tp.tournament_id = r.tournament_id AND tp.player_id = r.p1_player_id;
+UPDATE tournament_players tp SET availability = r.p2_availability
+FROM tournament_registrations r
+WHERE r.status = 'approved' AND r.p2_availability IS NOT NULL AND tp.availability IS NULL
+  AND tp.tournament_id = r.tournament_id AND tp.player_id = r.p2_player_id;
+
+-- Cancha con nombre: referencia a la cancha del club. `court` sigue para el número.
+ALTER TABLE scheduled_matches ADD COLUMN IF NOT EXISTS court_id TEXT REFERENCES club_courts(id) ON DELETE SET NULL;
+ALTER TABLE matches           ADD COLUMN IF NOT EXISTS court_id TEXT REFERENCES club_courts(id) ON DELETE SET NULL;
+
+-- Premios del torneo. Los de puesto toman el ganador del cuadro; los especiales lo guardan.
+CREATE TABLE IF NOT EXISTS tournament_prizes (
+  id               TEXT PRIMARY KEY,
+  tournament_id    TEXT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  kind             TEXT NOT NULL CHECK (kind IN ('puesto', 'especial')),
+  cup              TEXT NOT NULL DEFAULT 'oro' CHECK (cup IN ('oro', 'plata')),
+  place            SMALLINT CHECK (place IS NULL OR place BETWEEN 1 AND 4),
+  title            TEXT,
+  description      TEXT NOT NULL,
+  winner_pair_id   TEXT REFERENCES pairs(id)   ON DELETE SET NULL,
+  winner_player_id TEXT REFERENCES players(id) ON DELETE SET NULL,
+  position         INTEGER NOT NULL DEFAULT 0,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK ((kind = 'puesto') = (place IS NOT NULL)),
+  CHECK (kind = 'puesto' OR title IS NOT NULL),
+  CHECK (winner_pair_id IS NULL OR winner_player_id IS NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_prizes_tournament ON tournament_prizes(tournament_id, position);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_prizes_place ON tournament_prizes(tournament_id, cup, place) WHERE kind = 'puesto';

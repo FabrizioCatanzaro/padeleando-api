@@ -18,8 +18,21 @@ import { checkRegistrationLevel } from '../lib/category.js';
 import {
   ACTIVE_STATUSES, capacityInPlayers, hasRoom, signupState, parseGuestPartner, summarize, publicSignup,
 } from '../lib/registrations.js';
+import { usaFechas, esCopa, parseWhatsapp } from '../lib/copa.js';
 
 const router = Router();
+
+/** Torneos que piden disponibilidad y WhatsApp a cada jugador. */
+const pideDatos = (t) => usaFechas(t) || esCopa(t);
+const jsonOrNull = (v) => (v ? JSON.stringify(v) : null);
+
+function leerDisponibilidad(v) {
+  try { return parseAvailability(v); }
+  catch (e) { if (e instanceof AvailabilityError) throw new HttpError(400, e.message); throw e; }
+}
+function leerWhatsapp(v) {
+  try { return parseWhatsapp(v); } catch (e) { throw new HttpError(400, e.message); }
+}
 
 class HttpError extends Error {
   constructor(status, message, code) { super(message); this.status = status; this.code = code; }
@@ -28,7 +41,7 @@ class HttpError extends Error {
 // ── Lecturas compartidas ────────────────────────────────────────────────────
 
 const TOURNAMENT_SQL = `
-  SELECT t.id, t.group_id, t.name, t.format, t.mode, t.status, t.bracket, t.liga_mode,
+  SELECT t.id, t.group_id, t.name, t.format, t.mode, t.status, t.bracket, t.liga_mode, t.copa_config,
          t.signup_open, t.signup_price, t.signup_price_unit, t.signup_contacts, t.level,
          t.signup_capacity, t.signup_capacity_unit, t.signup_closes_at, t.rules,
          g.user_id AS owner_id, g.signup_open AS g_signup_open, g.signup_price AS g_signup_price,
@@ -124,9 +137,10 @@ function sendError(res, next, err) {
 router.post('/', requireAuth, async (req, res, next) => {
   try {
     const { tournamentId, kind, partner, accept_rules } = req.body;
-    let availability = null;
-    try { availability = parseAvailability(req.body.availability); }
-    catch (e) { if (e instanceof AvailabilityError) throw new HttpError(400, e.message); throw e; }
+    const availability = leerDisponibilidad(req.body.availability);
+    const partnerAvailability = leerDisponibilidad(req.body.partner_availability);
+    const whatsapp = leerWhatsapp(req.body.whatsapp);
+    const whatsappVisible = req.body.whatsapp_visible === true;
     if (!tournamentId) throw new HttpError(400, 'tournamentId requerido');
     if (kind !== 'solo' && kind !== 'pair') throw new HttpError(400, 'kind debe ser "solo" o "pair"');
 
@@ -172,11 +186,14 @@ router.post('/', requireAuth, async (req, res, next) => {
     const id = uid();
     const { rows: [registration] } = await q(`
       INSERT INTO tournament_registrations
-        (id, tournament_id, kind, created_by, p1_user_id, p2_user_id, p2_name, p2_phone, rules_accepted_at, availability)
-      VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9::jsonb) RETURNING *`,
+        (id, tournament_id, kind, created_by, p1_user_id, p2_user_id, p2_name, p2_phone, rules_accepted_at, availability,
+         p2_availability, p1_whatsapp, p1_whatsapp_visible)
+      VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12) RETURNING *`,
       [id, tournamentId, kind, me, p2UserId, p2Name, p2Phone, signup.rules ? new Date().toISOString() : null,
-       // Solo las ligas en varios días piden disponibilidad.
-       t.liga_mode === 'temporada' && availability ? JSON.stringify(availability) : null]);
+       // Solo los torneos con fixture por día piden disponibilidad y WhatsApp.
+       pideDatos(t) ? jsonOrNull(availability) : null,
+       pideDatos(t) && kind === 'pair' ? jsonOrNull(partnerAvailability) : null,
+       pideDatos(t) ? whatsapp : null, pideDatos(t) && whatsapp ? whatsappVisible : false]);
 
     await notify(q, await groupManagers(q, t.group_id), 'registration_received', me, id);
     if (p2UserId) await notify(q, [p2UserId], 'registration_partner', me, id);
@@ -268,11 +285,13 @@ router.get('/mine/:tournamentId', requireAuth, async (req, res, next) => {
         price: signup.price, price_unit: signup.unit,
         rules: signup.rules,
       },
-      // El teléfono del invitado sólo lo ve quien lo cargó.
+      // El WhatsApp de cada jugador lo ve él y su compañero; p2_phone es el del jugador 2, con o sin cuenta.
       registration: mine && {
         ...mine,
-        p2_phone: mine.p1_user_id === req.user.id ? mine.p2_phone : null,
+        p2_phone: [mine.p1_user_id, mine.p2_user_id].includes(req.user.id) ? mine.p2_phone : null,
+        p1_whatsapp: mine.p1_whatsapp,
       },
+      asks_player_data: pideDatos(t),
       in_tournament: inTournament,
       can_manage: canManage === true,
     });
@@ -280,27 +299,81 @@ router.get('/mine/:tournamentId', requireAuth, async (req, res, next) => {
 });
 
 // ── PATCH /api/registrations/:id/availability ──────────────────────────────
-// La edita cualquiera de los dos jugadores mientras el torneo no terminó.
+// Body: { availability?, whatsapp?, whatsapp_visible?, partner_availability?, partner_whatsapp? }
+// Cada jugador edita sus datos. El titular edita también los del compañero sin cuenta.
+// Si la inscripción ya está aprobada, el cambio llega al jugador del torneo.
 router.patch('/:id/availability', requireAuth, async (req, res, next) => {
   try {
-    let availability;
-    try { availability = parseAvailability(req.body.availability); }
-    catch (e) { if (e instanceof AvailabilityError) throw new HttpError(400, e.message); throw e; }
+    const has = (k) => Object.hasOwn(req.body, k);
     const sql = getDb();
     const q = httpQuery(sql);
     const { rows: [r] } = await q(`
-      SELECT r.id, r.status, r.p1_user_id, r.p2_user_id, t.status AS t_status, t.liga_mode
+      SELECT r.*, t.status AS t_status, t.format, t.liga_mode, t.copa_config
       FROM tournament_registrations r JOIN tournaments t ON t.id = r.tournament_id
       WHERE r.id = $1`, [req.params.id]);
     if (!r) throw new HttpError(404, 'Inscripción no encontrada');
-    if (r.p1_user_id !== req.user.id && r.p2_user_id !== req.user.id) throw new HttpError(403, 'No autorizado');
+    const soyP1 = r.p1_user_id === req.user.id;
+    if (!soyP1 && r.p2_user_id !== req.user.id) throw new HttpError(403, 'No autorizado');
     if (r.t_status === 'finished') throw new HttpError(400, 'El torneo ya terminó');
-    if (r.liga_mode !== 'temporada') throw new HttpError(400, 'Este torneo se juega en un solo día');
+    if (!pideDatos(r)) throw new HttpError(400, 'Este torneo no pide disponibilidad');
     if (!['pending', 'approved', 'waitlist'].includes(r.status)) throw new HttpError(400, 'La inscripción no está activa');
-    const { rows: [x] } = await q(
-      'UPDATE tournament_registrations SET availability = $2::jsonb WHERE id = $1 RETURNING id, availability',
-      [r.id, availability ? JSON.stringify(availability) : null]);
-    res.json(x);
+    const editaInvitado = soyP1 && r.kind === 'pair' && !r.p2_user_id;
+    if ((has('partner_availability') || has('partner_whatsapp')) && !editaInvitado) {
+      throw new HttpError(403, 'Tu compañero edita sus propios datos');
+    }
+
+    // Columnas de la inscripción de cada jugador: quien llama es el 1 o el 2.
+    const mio = soyP1
+      ? { availability: 'availability', whatsapp: 'p1_whatsapp', visible: 'p1_whatsapp_visible', player: r.p1_player_id }
+      : { availability: 'p2_availability', whatsapp: 'p2_phone', visible: 'p2_whatsapp_visible', player: r.p2_player_id };
+    const next = { ...r };
+    const jugador = {};
+    const tocar = (playerId, campo, valor) => {
+      if (!playerId) return;
+      jugador[playerId] = { ...(jugador[playerId] ?? {}), [campo]: valor };
+    };
+    if (has('availability')) {
+      next[mio.availability] = leerDisponibilidad(req.body.availability);
+      tocar(mio.player, 'availability', next[mio.availability]);
+    }
+    if (has('whatsapp')) {
+      next[mio.whatsapp] = leerWhatsapp(req.body.whatsapp);
+      tocar(mio.player, 'whatsapp', next[mio.whatsapp]);
+    }
+    if (has('whatsapp_visible')) {
+      if (typeof req.body.whatsapp_visible !== 'boolean') throw new HttpError(400, 'whatsapp_visible debe ser true o false');
+      next[mio.visible] = req.body.whatsapp_visible;
+      tocar(mio.player, 'whatsapp_visible', next[mio.visible]);
+    }
+    if (has('partner_availability')) {
+      next.p2_availability = leerDisponibilidad(req.body.partner_availability);
+      tocar(r.p2_player_id, 'availability', next.p2_availability);
+    }
+    if (has('partner_whatsapp')) {
+      const tel = leerWhatsapp(req.body.partner_whatsapp);
+      if (!tel) throw new HttpError(400, 'El teléfono del compañero es obligatorio');
+      next.p2_phone = tel;
+      tocar(r.p2_player_id, 'whatsapp', tel);
+    }
+
+    const [{ rows: [x] }] = await Promise.all([
+      q(`UPDATE tournament_registrations
+         SET availability = $2::jsonb, p2_availability = $3::jsonb, p1_whatsapp = $4, p1_whatsapp_visible = $5,
+             p2_whatsapp_visible = $6, p2_phone = $7
+         WHERE id = $1
+         RETURNING id, availability, p2_availability, p1_whatsapp, p1_whatsapp_visible, p2_whatsapp_visible`,
+        [r.id, jsonOrNull(next.availability), jsonOrNull(next.p2_availability), next.p1_whatsapp,
+         next.p1_whatsapp_visible, next.p2_whatsapp_visible, next.p2_phone]),
+      ...(r.status === 'approved' ? Object.entries(jugador).map(([playerId, d]) => q(
+        `UPDATE tournament_players
+         SET availability     = CASE WHEN $3 THEN $4::jsonb ELSE availability END,
+             whatsapp         = CASE WHEN $5 THEN $6 ELSE whatsapp END,
+             whatsapp_visible = CASE WHEN $7 THEN $8 ELSE whatsapp_visible END
+         WHERE tournament_id = $1 AND player_id = $2`,
+        [r.tournament_id, playerId, 'availability' in d, jsonOrNull(d.availability),
+         'whatsapp' in d, d.whatsapp ?? null, 'whatsapp_visible' in d, d.whatsapp_visible ?? false])) : []),
+    ]);
+    res.json(soyP1 ? x : { ...x, p1_whatsapp: x.p1_whatsapp_visible ? x.p1_whatsapp : null });
   } catch (err) { sendError(res, next, err); }
 });
 
@@ -459,6 +532,18 @@ async function approve(q, r, t, signup, actorId) {
 
   await q(`INSERT INTO tournament_players (tournament_id, player_id)
            SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING`, [t.id, players]);
+  // Disponibilidad y WhatsApp de la inscripción pasan al jugador de este torneo.
+  if (pideDatos(t)) {
+    await q(`
+      UPDATE tournament_players tp
+      SET availability = v.availability, whatsapp = v.whatsapp, whatsapp_visible = v.visible
+      FROM (SELECT * FROM UNNEST($2::text[], $3::jsonb[], $4::text[], $5::boolean[]) AS x(player_id, availability, whatsapp, visible)) v
+      WHERE tp.tournament_id = $1 AND tp.player_id = v.player_id`,
+      [t.id, players,
+       [jsonOrNull(r.availability), jsonOrNull(r.p2_availability)].slice(0, players.length),
+       [r.p1_whatsapp, r.p2_phone].slice(0, players.length),
+       [r.p1_whatsapp_visible === true, r.p2_whatsapp_visible === true].slice(0, players.length)]);
+  }
 
   // En Liga en modo libre no hay parejas fijas: entran los dos jugadores.
   let pairId = null;

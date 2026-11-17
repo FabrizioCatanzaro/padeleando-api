@@ -55,7 +55,7 @@ export const requireTournamentManage = makeManageGuard(
   (req) => req.params.id ?? req.params.tournamentId ?? req.body?.tournamentId ?? null,
   (sql, tournamentId, userId) => sql`
     SELECT t.id AS tournament_id, t.group_id, t.format, t.status, t.mode,
-           t.liga_mode, t.allow_rematch,
+           t.liga_mode, t.allow_rematch, t.copa_config, (t.bracket IS NOT NULL) AS has_bracket,
            (g.user_id = ${userId}) AS is_owner,
            EXISTS (SELECT 1 FROM group_collaborators gc
                    WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab
@@ -70,6 +70,7 @@ export const requireMatchManage = makeManageGuard(
   (req) => req.params.id ?? null,
   (sql, matchId, userId) => sql`
     SELECT m.id AS match_id, t.id AS tournament_id, t.group_id, t.format, t.status,
+           t.liga_mode, t.copa_config, (t.bracket IS NOT NULL) AS has_bracket,
            (g.user_id = ${userId}) AS is_owner,
            EXISTS (SELECT 1 FROM group_collaborators gc
                    WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab
@@ -85,7 +86,7 @@ export const requireScheduledManage = makeManageGuard(
   (req) => req.params.id ?? null,
   (sql, scheduledId, userId) => sql`
     SELECT sm.id AS scheduled_id, t.id AS tournament_id, t.group_id, t.format, t.status,
-           t.liga_mode, t.allow_rematch,
+           t.liga_mode, t.allow_rematch, t.copa_config,
            (g.user_id = ${userId}) AS is_owner,
            EXISTS (SELECT 1 FROM group_collaborators gc
                    WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab
@@ -101,7 +102,7 @@ export const requirePairManage = makeManageGuard(
   (req) => req.params.id ?? null,
   (sql, pairId, userId) => sql`
     SELECT p.id AS pair_id, t.id AS tournament_id, t.group_id, t.format, t.status,
-           t.liga_mode,
+           t.liga_mode, t.copa_config,
            (g.user_id = ${userId}) AS is_owner,
            EXISTS (SELECT 1 FROM group_collaborators gc
                    WHERE gc.group_id = g.id AND gc.user_id = ${userId}) AS is_collab

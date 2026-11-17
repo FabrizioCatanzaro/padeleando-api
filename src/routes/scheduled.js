@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireTournamentManage, requireScheduledManage } from '../middleware/access.js';
 import { MAX_PREVIA_MATCHES, countPairAppearances, pairKey, withdrawnTeamError, buildFacedMap } from '../lib/fixture.js';
 import { isIsoDate } from '../lib/ligaFechas.js';
+import { usaFechas, esCopa, validateCopaFecha } from '../lib/copa.js';
 
 const router = Router();
 
@@ -30,7 +31,9 @@ function normalizarDia(v) {
   return isIsoDate(v) ? v : undefined;
 }
 
-const esTemporada = (ctx) => ctx.format === 'liga' && ctx.liga_mode === 'temporada';
+const esTemporada = (ctx) => usaFechas(ctx);
+// La cancha con nombre tiene que ser del club del torneo; si no, queda sin cancha.
+const COURT_ID_SQL = `(SELECT cc.id FROM club_courts cc JOIN tournaments t ON t.club_id = cc.club_id WHERE cc.id = $1 AND t.id = $2)`;
 
 /**
  * En una liga por fechas, el programado pertenece a una fecha que existe y,
@@ -45,6 +48,21 @@ async function chequearTemporada(sql, ctx, { team1, team2, round, excluirId = nu
       SELECT 1 FROM tournament_fechas WHERE tournament_id = ${ctx.tournament_id} AND number = ${round}
     `;
     if (!fecha) return 'Esa fecha no existe';
+  }
+  if (team1 && esCopa(ctx)) {
+    const [pairs, jugados, programados] = await Promise.all([
+      sql`SELECT id, p1_id, p2_id, status, zona FROM pairs WHERE tournament_id = ${ctx.tournament_id}`,
+      sql`SELECT team1_p1, team1_p2, team2_p1, team2_p2 FROM matches WHERE tournament_id = ${ctx.tournament_id}`,
+      sql`SELECT id, team1_p1, team1_p2, team2_p1, team2_p2 FROM scheduled_matches WHERE tournament_id = ${ctx.tournament_id}`,
+    ]);
+    const idDe = (team) => pairs.find((p) => pairKey([p.p1_id, p.p2_id]) === pairKey(team))?.id;
+    const [a, b] = [idDe(team1), idDe(team2)];
+    if (!a || !b) return 'Los equipos tienen que ser parejas del torneo';
+    const v = validateCopaFecha({
+      pairs, rows: [...jugados, ...programados.filter((r) => r.id !== excluirId)],
+      proposed: [[a, b]], ruedas: ctx.copa_config?.ruedas ?? 1,
+    });
+    return v.errors[0] ?? null;
   }
   if (team1 && !ctx.allow_rematch) {
     const [jugados, programados] = await Promise.all([
@@ -84,7 +102,7 @@ async function chequearTopePrevia(sql, tournamentId, team1, team2, excluirId = n
 // POST /api/scheduled — programar un partido
 router.post('/', requireAuth, requireTournamentManage, async (req, res, next) => {
   try {
-    const { tournamentId, team1, team2, court, scheduled_at, position, round, scheduled_date } = req.body;
+    const { tournamentId, team1, team2, court, court_id, scheduled_at, position, round, scheduled_date } = req.body;
 
     const errEquipos = validarEquipos(team1, team2);
     if (errEquipos) return res.status(400).json({ error: errEquipos });
@@ -113,16 +131,15 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
       if (errFecha) return res.status(400).json({ error: errFecha });
     }
 
-    const [row] = await sql`
-      INSERT INTO scheduled_matches
+    const [row] = await sql.query(
+      `INSERT INTO scheduled_matches
         (id, tournament_id, team1_p1, team1_p2, team2_p1, team2_p2, court, scheduled_at, position,
-         round, scheduled_date)
-      VALUES
-        (${uid()}, ${tournamentId}, ${team1[0]}, ${team1[1]}, ${team2[0]}, ${team2[1]},
-         ${court ?? null}, ${hora}, ${Number.isInteger(position) ? position : 0},
-         ${temporada ? round : null}, ${dia}::date)
-      RETURNING *, scheduled_date::text AS scheduled_date
-    `;
+         round, scheduled_date, court_id)
+      VALUES ($3, $2, $4, $5, $6, $7, $8, $9, $10, $11, $12::date, ${COURT_ID_SQL})
+      RETURNING *, scheduled_date::text AS scheduled_date`,
+      [court_id ?? null, tournamentId, uid(), team1[0], team1[1], team2[0], team2[1],
+       court ?? null, hora, Number.isInteger(position) ? position : 0, temporada ? round : null, dia]
+    );
     res.status(201).json(row);
   } catch (err) { next(err); }
 });
@@ -131,7 +148,7 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
 // postergarlo (postponed) o, en la liga por fechas, pasarlo a otra fecha (round).
 router.patch('/:id', requireAuth, requireScheduledManage, async (req, res, next) => {
   try {
-    const { team1, team2, court, scheduled_at, position, scheduled_date, postponed, round } = req.body;
+    const { team1, team2, court, court_id, scheduled_at, position, scheduled_date, postponed, round } = req.body;
     const cambiaEquipos = team1 != null || team2 != null;
     if (cambiaEquipos) {
       const errEquipos = validarEquipos(team1, team2);
@@ -146,7 +163,7 @@ router.patch('/:id', requireAuth, requireScheduledManage, async (req, res, next)
     }
     const temporada = esTemporada(req.accessCtx);
     if (round !== undefined && !temporada) {
-      return res.status(400).json({ error: 'Solo las ligas en varios días tienen fechas' });
+      return res.status(400).json({ error: 'Solo las ligas en varios días y las copas con grupos tienen fechas' });
     }
 
     const sql = getDb();
@@ -172,6 +189,7 @@ router.patch('/:id', requireAuth, requireScheduledManage, async (req, res, next)
     const tocaCancha = Object.hasOwn(req.body, 'court');
     const tocaHora   = Object.hasOwn(req.body, 'scheduled_at');
     const tocaDia    = Object.hasOwn(req.body, 'scheduled_date');
+    const tocaCanchaId = Object.hasOwn(req.body, 'court_id');
     const [row] = await sql`
       UPDATE scheduled_matches SET
         team1_p1 = COALESCE(${cambiaEquipos ? team1[0] : null}, team1_p1),
@@ -179,6 +197,10 @@ router.patch('/:id', requireAuth, requireScheduledManage, async (req, res, next)
         team2_p1 = COALESCE(${cambiaEquipos ? team2[0] : null}, team2_p1),
         team2_p2 = COALESCE(${cambiaEquipos ? team2[1] : null}, team2_p2),
         court        = CASE WHEN ${tocaCancha}::boolean THEN ${court ?? null}::int  ELSE court        END,
+        court_id     = CASE WHEN ${tocaCanchaId}::boolean THEN (
+                         SELECT cc.id FROM club_courts cc JOIN tournaments t ON t.club_id = cc.club_id
+                         WHERE cc.id = ${court_id ?? null} AND t.id = scheduled_matches.tournament_id)
+                       ELSE court_id END,
         scheduled_at = CASE WHEN ${tocaHora}::boolean   THEN ${hora ?? null}::time  ELSE scheduled_at END,
         scheduled_date = CASE WHEN ${tocaDia}::boolean THEN ${dia ?? null}::date ELSE scheduled_date END,
         postponed    = COALESCE(${postponed ?? null}::boolean, postponed),

@@ -31,6 +31,8 @@ router.get('/:tournamentId', async (req, res, next) => {
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
              c.courts        AS club_courts,
+             (SELECT COALESCE(json_agg(json_build_object('id', cc.id, 'name', cc.name) ORDER BY cc.sort_order, cc.created_at), '[]'::json)
+              FROM club_courts cc WHERE cc.club_id = t.club_id AND cc.active) AS club_court_list,
              -- Inscripción: lo de la jornada pisa lo de la categoría, campo por campo.
              g.signup_open       AS group_signup_open,
              g.signup_price      AS group_signup_price,
@@ -111,6 +113,15 @@ router.get('/:tournamentId', async (req, res, next) => {
     // En la liga por fechas, armar una fecha publica el fixture.
     const rosterHidden = !hasStarted(tournament, matches.length) && fechas.length === 0;
 
+    // La copa suma sus opciones, la copa de plata y los premios. Nunca WhatsApp ni disponibilidad.
+    const copa = tournament.format === 'copa' ? {
+      copa_config:   tournament.copa_config ?? null,
+      bracket_plata: tournament.bracket_plata ?? null,
+      prizes: await sql`
+        SELECT id, kind, cup, place, title, description, winner_pair_id, winner_player_id, position
+        FROM tournament_prizes WHERE tournament_id = ${tournamentId} ORDER BY position, created_at`,
+    } : {};
+
     res.json({
       id:             tournament.id,
       name:           tournament.name,
@@ -137,6 +148,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       club_location_name:  tournament.club_location_name ?? null,
       // Las canchas mandan sobre number_of_courts, que es una copia vieja del club.
       club_courts:         tournament.club_courts ?? null,
+      club_court_list:     tournament.club_court_list ?? [],
       bracket:        tournament.bracket ?? null,
       liga_mode:      tournament.liga_mode ?? 'jornada',
       allow_rematch:  tournament.allow_rematch ?? false,
@@ -164,6 +176,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       scheduled_matches: rosterHidden ? [] : scheduled,
       fechas,
       roster_hidden:     rosterHidden,
+      ...copa,
     });
   } catch (err) { next(err); }
 });

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Express REST API backing PADELEANDO, a padel tournament platform. It serves categories (`groups`) and jornadas (`tournaments`) in two formats (Liga/Americano) and two modes (free players / fixed pairs), plus players, pairs, matches, knockout bracket, photo galleries, invitations, co-organizers, clubs, follows, notifications, public profiles, subscriptions and an admin dashboard.
+Express REST API backing PADELEANDO, a padel tournament platform. It serves categories (`groups`) and jornadas (`tournaments`) in three formats (Liga/Americano/Copa) and two modes (free players / fixed pairs), plus players, pairs, matches, knockout bracket, photo galleries, invitations, co-organizers, clubs, follows, notifications, public profiles, subscriptions and an admin dashboard.
 
 The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\padeliando`) — not a monorepo. That repo's `CLAUDE.md` documents the product and the client-side conventions; read it whenever a change crosses the wire.
 
@@ -73,6 +73,7 @@ src/
   middleware/       auth.js · access.js · requirePremium.js · upload.js
   lib/              access.js · plan.js · profileStats.js · signup.js · richText.js
                     tournamentLogic.js (previa, tabla de parejas, cuadro — pura, con tests)
+                    copa.js (opciones, sorteo de zonas, tabla, siembra y cuadro de hasta 32 — pura, con tests)
                     ligaFechas.js (armado de fechas de la liga por fechas — pura, con tests)
                     cloudinary.js · deleteUser.js
   emails/           React Email templates (Layout, Welcome, VerifyEmail, ResetPassword,
@@ -128,7 +129,7 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 
 - **Standings are never computed here.** They are derived client-side (`calcStandings` in the frontend). This API serves rows, not tables.
 - **A match never ends in a draw.** `score1 === score2` is rejected by `POST/PUT /matches` and by the bracket endpoints. Padel has no draws — this is invalid data, not a result.
-- **Americano knockout matches are not rows in `matches`** — they live inside `tournaments.bracket` (JSONB). Anything that counts matches must expand them; `lib/profileStats.js#expandBracketMatches` does it for the public profile. Forgetting this is why a profile once showed a championship whose matches didn't exist.
+- **Knockout matches are not rows in `matches`** — americano and copa keep them inside `tournaments.bracket` (JSONB), and the copa's consolation draw in `tournaments.bracket_plata`. Anything that counts matches must expand both, including `dieciseisavos` and `tercer`; `lib/profileStats.js#expandBracketMatches` does it for the public profile (plata ids carry a `plata:` prefix). Forgetting this is why a profile once showed a championship whose matches didn't exist.
 - **`linked_name` pattern**: when a user accepts an invitation, their player slot gains `players.user_id`. Every query that fetches players must `LEFT JOIN users u ON u.id = p.user_id` and return `u.name AS linked_name` — the frontend's `adaptTournament` resolves `linked_name ?? name`, so a missing join silently shows stale names.
 - **One account = one player slot per category**, enforced by the `assert_one_linked_player_per_group()` trigger in `schema.sql`.
 - **Signup info (`signup_*`) is inherited field by field** from category to jornada: `NULL` means inherit, a value overrides. `lib/signup.js#parseSignupFields` only touches keys present in the body, so `undefined` leaves the field alone while `null` restores inheritance.
@@ -139,6 +140,16 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - **The booking-payment webhook reads with the platform's token, not the club's.** `POST /clubs/mercadopago/webhook` doesn't know which club a payment belongs to until it fetches it, so it fetches with `platformMp` (the OAuth application can read payments made through the accounts it connected) and only afterward looks up the booking by `payment.external_reference` (= the booking's `group_id`).
 - **`auto_return` on the booking `Preference` needs a real https `FRONTEND_URL`.** Mercado Pago rejects the whole preference (`auto_return invalid. back_url.success must be defined`) when `back_urls.success` isn't a reachable https URL — it happens with a plain `http://localhost` `FRONTEND_URL`, same family of restriction as the OAuth Connect `redirect_uri`. `POST /:id/bookings` only sends `auto_return: 'approved'` when `FRONTEND_URL` starts with `https://`; on `http` it still creates the preference and returns `checkout_url`, the payer just doesn't get auto-redirected back after paying.
 - **A club without Mercado Pago linked is unaffected.** `POST /clubs/:id/bookings` only creates a `Preference` when `clubs.mp_access_token` is set AND the court has a price; otherwise it's the exact same manual pending → owner approves/rejects flow as before. A payment failure while creating the preference falls back to the manual flow instead of failing the booking.
+
+### Copa
+
+- `tournaments.copa_config` holds the options; `mode` is `zonas` (groups by fechas, then playoffs) or `cuadro` (direct elimination). Always fixed pairs, max 32. Validation and every pure rule live in `lib/copa.js` (`parseCopaSettings`, `copaConfigLockError`, `sortearZonas`, `zonaStandings`, `rankClasificados`, `seedCuadro`, `generateCupBracket`).
+- **Here the groups are `zonas`** (`pairs.zona` 1-8). The frontend calls them "grupos" in every user-facing string.
+- Playoffs: `POST /:id/copa/cuadro` only proposes (seeds, pending group matches, pairs without zona); `PUT /:id/copa/cuadro` arms `bracket` and `bracket_plata` in one transaction, accepting the organizer's order if it's the same set of pairs. After that, creating, editing or deleting a group match answers 409.
+- Bracket endpoints pick the consolation draw with `?copa=plata`. `PATCH /:id/bracket/:matchId/programar` stores `{ date, time, court, court_id }` in the match's `programado`; `court_id` must belong to the tournament's club.
+- Per-tournament player data (availability, WhatsApp, visibility) lives in `tournament_players`, because `players` is one row per category. `lib/copa.js#datosVisibles` filters it: managers see everything, a player of the tournament sees visible WhatsApps, anyone else nothing, and `/readonly` never returns it.
+- Titles: a copa champion (`bracket.final`) counts as `campeon_copa`; the copa de plata is not a title.
+- Quota: `FREE_COPAS_PER_MONTH = 1` per category, and a copa also counts toward the 2 monthly tournaments.
 
 ### HTTP behavior
 
@@ -181,7 +192,7 @@ When touching an endpoint, **diff the response against the previous code with ke
 - **Don't build SQL by interpolating fragments into a tagged template** — it parameterizes them into values. Use `sql.query(text, params)` for dynamic SQL.
 - **Don't compute standings server-side** — the client does it.
 - **Don't allow or model draws** — `score1 === score2` is rejected everywhere.
-- **Don't count matches without expanding the americano bracket** — knockout matches aren't rows in `matches`.
+- **Don't count matches without expanding the bracket** — americano and copa knockout matches, and `bracket_plata`, aren't rows in `matches`.
 - **Don't fetch players without `LEFT JOIN users … AS linked_name`** — the client resolves display names from it.
 - **Don't gate plan limits on the acting user** — always the category owner.
 - **Don't confuse `MP_ACCESS_TOKEN` (platform) with a club's own `mp_access_token`** — a club's Preference must be created with ITS OWN token, or the payment lands in the platform's account instead of the club's.

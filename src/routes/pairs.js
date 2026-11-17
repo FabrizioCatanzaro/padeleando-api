@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireTournamentManage, requirePairManage } from '../middleware/access.js';
 import { walkoverMatchesFor, applyBracketWalkovers } from '../lib/tournamentLogic.js';
 import { scheduledIdsToCancel } from '../lib/ligaFechas.js';
+import { usaFechas, esCopa, COPA_MAX_PAIRS } from '../lib/copa.js';
 
 const router = Router();
 
@@ -61,6 +62,16 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
         return res.status(400).json({ error: 'El modo Americano admite hasta 16 parejas' });
       }
     }
+    if (tournament.format === 'copa') {
+      if (tournament.bracket) {
+        return res.status(400).json({ error: 'El cuadro ya fue generado: no se pueden sumar parejas' });
+      }
+      const [{ count }] = await sql`
+        SELECT COUNT(*)::int AS count FROM pairs WHERE tournament_id = ${tournamentId} AND status = 'active'`;
+      if (count >= COPA_MAX_PAIRS) {
+        return res.status(400).json({ error: `La copa admite hasta ${COPA_MAX_PAIRS} parejas` });
+      }
+    }
 
     const invalid = await validatePairPlayers(sql, tournamentId, p1Id, p2Id);
     if (invalid) return res.status(400).json({ error: invalid });
@@ -88,7 +99,7 @@ router.put('/:id', requireAuth, requirePairManage, async (req, res, next) => {
     if (current.status === 'withdrawn') return res.status(400).json({ error: 'La pareja está retirada' });
 
     const changed = [p1Id, p2Id].sort().join('|') !== [current.p1_id, current.p2_id].sort().join('|');
-    if (changed && req.accessCtx.format === 'americano' && await countPairMatches(sql, current) > 0) {
+    if (changed && (req.accessCtx.format === 'americano' || esCopa(req.accessCtx)) && await countPairMatches(sql, current) > 0) {
       return res.status(409).json({
         error: 'Esta pareja ya jugó partidos. Para reemplazar a un jugador, retirá la pareja y armá una nueva.',
         code: 'pair_has_matches',
@@ -120,10 +131,16 @@ router.delete('/:id', requireAuth, requirePairManage, async (req, res, next) => 
       WHERE p.id = ${req.params.id}
     `;
     if (!pair) return res.status(404).json({ error: 'Pareja no encontrada' });
-    const temporada = req.accessCtx.format === 'liga' && req.accessCtx.liga_mode === 'temporada';
+    const temporada = usaFechas(req.accessCtx);
     if (temporada && await countPairMatches(sql, pair) > 0) {
       return res.status(409).json({
-        error: 'Esta pareja ya jugó en la liga. Dala de baja en lugar de eliminarla: sus partidos jugados se mantienen.',
+        error: `Esta pareja ya jugó en ${esCopa(req.accessCtx) ? 'la copa' : 'la liga'}. Dala de baja en lugar de eliminarla: sus partidos jugados se mantienen.`,
+        code: 'pair_has_matches',
+      });
+    }
+    if (esCopa(req.accessCtx) && pair.bracket) {
+      return res.status(409).json({
+        error: 'El cuadro ya está armado. Dala de baja en lugar de eliminarla: su rival pasa de ronda.',
         code: 'pair_has_matches',
       });
     }
@@ -154,15 +171,16 @@ router.delete('/:id', requireAuth, requirePairManage, async (req, res, next) => 
 // No se deshace. En la Liga de un día las parejas se editan o se borran.
 router.post('/:id/withdraw', requireAuth, requirePairManage, async (req, res, next) => {
   try {
-    const temporada = req.accessCtx.format === 'liga' && req.accessCtx.liga_mode === 'temporada';
+    const copa = esCopa(req.accessCtx);
+    const temporada = usaFechas(req.accessCtx) || copa;
     if (req.accessCtx.format !== 'americano' && !temporada) {
-      return res.status(400).json({ error: 'Retirar una pareja solo existe en el Americano y en la liga en varios días' });
+      return res.status(400).json({ error: 'Retirar una pareja solo existe en el Americano, en la liga en varios días y en la copa' });
     }
     const result = await withTransaction(async (client) => {
       const { rows: [pair] } = await client.query('SELECT * FROM pairs WHERE id = $1', [req.params.id]);
       if (!pair) return { status: 404, error: 'Pareja no encontrada' };
       const { rows: [tournament] } = await client.query(
-        'SELECT id, status, bracket FROM tournaments WHERE id = $1 FOR UPDATE', [pair.tournament_id]
+        'SELECT id, status, bracket, bracket_plata FROM tournaments WHERE id = $1 FOR UPDATE', [pair.tournament_id]
       );
       if (tournament.status === 'finished') return { status: 400, error: 'El torneo está finalizado' };
       if (pair.status === 'withdrawn') return { status: 409, error: 'La pareja ya está retirada' };
@@ -178,6 +196,15 @@ router.post('/:id/withdraw', requireAuth, requirePairManage, async (req, res, ne
         const cancelar = scheduledIdsToCancel(pair, scheduled);
         if (cancelar.length) {
           await client.query('DELETE FROM scheduled_matches WHERE id = ANY($1::text[])', [cancelar]);
+        }
+        // En la copa, si ya hay cuadro, sus cruces se resuelven por W.O.
+        if (copa) {
+          for (const col of ['bracket', 'bracket_plata']) {
+            if (!tournament[col]) continue;
+            const withdrawn = [...new Set([...(tournament[col].withdrawn_pair_ids ?? []), pair.id])];
+            const bracket = applyBracketWalkovers({ ...tournament[col], withdrawn_pair_ids: withdrawn });
+            await client.query(`UPDATE tournaments SET ${col} = $1::jsonb WHERE id = $2`, [JSON.stringify(bracket), tournament.id]);
+          }
         }
         return { walkovers: 0, cancelled: cancelar.length };
       }

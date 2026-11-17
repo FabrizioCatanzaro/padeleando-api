@@ -229,3 +229,16 @@ test('isIsoDate acepta solo días reales', () => {
   assert.equal(isIsoDate('14/11/2026'), false);
   assert.equal(isIsoDate(null), false);
 });
+
+test('con una baja, la fecha que cierra lo que falta no avisa que se rompe el todos contra todos', () => {
+  const pairs = makePairs(4);
+  const crosses = [
+    { a: 'pr00', b: 'pr01', round: 1 }, { a: 'pr02', b: 'pr03', round: 1 },
+    { a: 'pr00', b: 'pr03', round: 2 }, { a: 'pr01', b: 'pr02', round: 2 },
+  ];
+  pairs[0].status = 'withdrawn';
+  const f = generateFecha({ pairs, crosses, rng: seeded(3) });
+  assert.deepEqual(f.crosses.map(([a, b]) => key(a, b)), [key('pr01', 'pr03')]);
+  assert.deepEqual(f.libres, ['pr02']);
+  assert.equal(f.completable, true);
+});
