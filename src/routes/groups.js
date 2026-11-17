@@ -419,14 +419,14 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       ORDER BY m.played_at DESC, m.created_at DESC
     `,
 
-    // Campeón por cuadro = ganó la final (winner_id es un pair_id). En el
-    // americano y en la liga con playoffs; la liga suma a títulos de liga.
+    // Campeón por cuadro = ganó la final (winner_id es un pair_id): americano, copa y liga con playoffs.
     sql`
       WITH user_players AS (
         SELECT id FROM players WHERE user_id = ${owner.id}
       )
       SELECT COUNT(*) FILTER (WHERE t.format = 'americano')::int AS campeon_americano,
-             COUNT(*) FILTER (WHERE t.format <> 'americano')::int AS campeon_playoffs
+             COUNT(*) FILTER (WHERE t.format = 'copa')::int AS campeon_copa,
+             COUNT(*) FILTER (WHERE t.format = 'liga')::int AS campeon_playoffs
       FROM tournaments t
       JOIN pairs pr
         ON pr.tournament_id = t.id
@@ -608,7 +608,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         AND (m.team1_p1 = pl.id OR m.team1_p2 = pl.id
           OR m.team2_p1 = pl.id OR m.team2_p2 = pl.id)
       WHERE t.status = 'finished'
-        AND t.format <> 'americano'
+        AND t.format = 'liga'
         AND t.bracket IS NULL
         AND EXISTS (
           SELECT 1 FROM tournament_players tp2
@@ -786,6 +786,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     };
     const titulosLiga      = countLeagueTitles(leagueRows) + (americanoChamp?.campeon_playoffs ?? 0);
     const titulosAmericano = americanoChamp?.campeon_americano ?? 0;
+    const titulosCopa      = americanoChamp?.campeon_copa ?? 0;
     const baseStats = {
       ...base,
       partidos:     base.partidos     + bracketMatches.length,
@@ -840,7 +841,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         racha,
         campeon_americano: titulosAmericano,
         titulos_liga:      titulosLiga,
-        titulos:           titulosLiga + titulosAmericano,
+        campeon_copa:      titulosCopa,
+        titulos:           titulosLiga + titulosAmericano + titulosCopa,
         ...advancedStats,
       },
       monthly_stats:  showAdvanced ? merged.monthlyStats  : [],
