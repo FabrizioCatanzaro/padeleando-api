@@ -395,7 +395,9 @@ ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
   CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
                   'collab_invite','ownership_transfer','ownership_received','premium_claim',
                   'player_unlinked','new_tournament','club_claim','booking_decided','booking_requested',
-                  'booking_cancelled','registration_received','registration_decided','registration_partner'));
+                  'booking_cancelled','registration_received','registration_decided','registration_partner',
+                  'friendly_added','friendly_joined','friendly_left','friendly_removed','friendly_full',
+                  'friendly_updated','friendly_proposal','friendly_confirmed','friendly_cancelled','friendly_reminder'));
 
 -- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
 -- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
@@ -791,3 +793,60 @@ CREATE TABLE IF NOT EXISTS tournament_prizes (
 );
 CREATE INDEX IF NOT EXISTS idx_prizes_tournament ON tournament_prizes(tournament_id, position);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_prizes_place ON tournament_prizes(tournament_id, cup, place) WHERE kind = 'puesto';
+
+-- Amistosos (2026-11-17): partidos 2 vs 2 fuera de torneo. Ver lib/friendlies.js.
+CREATE TABLE IF NOT EXISTS friendly_matches (
+  id               TEXT PRIMARY KEY,
+  created_by       TEXT REFERENCES users(id) ON DELETE SET NULL,
+  status           TEXT NOT NULL DEFAULT 'programado'
+                   CHECK (status IN ('programado', 'por_confirmar', 'confirmado', 'cancelado')),
+  visibility       TEXT NOT NULL DEFAULT 'publico' CHECK (visibility IN ('publico', 'link')),
+  share_token      TEXT NOT NULL,
+  club_id          TEXT NOT NULL REFERENCES clubs(id),
+  court_label      TEXT,
+  date             DATE NOT NULL,
+  start_time       TIME NOT NULL,
+  duration_minutes INTEGER NOT NULL CHECK (duration_minutes BETWEEN 30 AND 300),
+  level            TEXT,
+  sets_format      SMALLINT NOT NULL CHECK (sets_format IN (1, 3)),
+  score1           INTEGER,
+  score2           INTEGER,
+  sets             JSONB,
+  confirmed_at     TIMESTAMPTZ,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (score1 IS NULL OR score1 <> score2),
+  CHECK ((status = 'confirmado') = (score1 IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_friendly_open ON friendly_matches(date) WHERE status = 'programado' AND visibility = 'publico';
+CREATE INDEX IF NOT EXISTS idx_friendly_club ON friendly_matches(club_id, date);
+
+CREATE TABLE IF NOT EXISTS friendly_match_players (
+  match_id     TEXT NOT NULL REFERENCES friendly_matches(id) ON DELETE CASCADE,
+  team         SMALLINT NOT NULL CHECK (team IN (1, 2)),
+  position     SMALLINT NOT NULL CHECK (position IN (1, 2)),
+  user_id      TEXT REFERENCES users(id) ON DELETE SET NULL,
+  guest_name   TEXT,
+  invite_token TEXT,
+  joined_at    TIMESTAMPTZ,
+  PRIMARY KEY (match_id, team, position),
+  CHECK (user_id IS NULL OR guest_name IS NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_friendly_player_user ON friendly_match_players(match_id, user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_friendly_player_user ON friendly_match_players(user_id) WHERE user_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_friendly_invite_token ON friendly_match_players(invite_token) WHERE invite_token IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS friendly_match_proposals (
+  id          TEXT PRIMARY KEY,
+  match_id    TEXT NOT NULL REFERENCES friendly_matches(id) ON DELETE CASCADE,
+  proposed_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  team        SMALLINT NOT NULL CHECK (team IN (1, 2)),
+  score1      INTEGER NOT NULL,
+  score2      INTEGER NOT NULL,
+  sets        JSONB NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pendiente' CHECK (status IN ('pendiente', 'aceptada', 'rechazada')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  decided_at  TIMESTAMPTZ,
+  CHECK (score1 <> score2)
+);
+CREATE INDEX IF NOT EXISTS idx_friendly_proposals_match ON friendly_match_proposals(match_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_friendly_pending ON friendly_match_proposals(match_id) WHERE status = 'pendiente';

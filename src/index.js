@@ -26,6 +26,7 @@ import adminRouter          from './routes/admin.js';
 import inboundRouter        from './routes/inbound.js';
 import homeRouter           from './routes/home.js';
 import bookingsRouter       from './routes/bookings.js';
+import friendliesRouter     from './routes/friendlies.js';
 import { getDb } from './db.js';
 
 const app  = express();
@@ -156,6 +157,7 @@ app.use('/api/subscriptions', subscriptionsRouter);
 app.use('/api/admin',         adminRouter);
 app.use('/api/emails',        inboundRouter);
 app.use('/api/bookings',      bookingsRouter);
+app.use('/api/friendlies',    friendliesRouter);
 // Rutas de co-organizadores y transferencia (paths absolutos: /groups/:id/..., /invites/...)
 app.use('/api',               collaboratorsRouter);
 

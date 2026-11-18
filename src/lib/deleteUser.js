@@ -93,6 +93,9 @@ export async function deleteUserAccount(userId) {
     sql`UPDATE tournament_photos  SET uploaded_by    = ${anonId} WHERE uploaded_by    = ${userId}`,
     sql`UPDATE admin_broadcasts   SET admin_id       = ${anonId} WHERE admin_id       = ${userId}`,
     sql`UPDATE admin_broadcasts   SET target_user_id = ${anonId} WHERE target_user_id = ${userId}`,
+    // En los amistosos su lugar queda con el nombre, para no dejar huecos en los partidos de los demás
+    sql`UPDATE friendly_match_players fp SET guest_name = u.name, user_id = NULL
+        FROM users u WHERE u.id = fp.user_id AND fp.user_id = ${userId}`,
     // Limpiar tokens de sesión / reset por las dudas (ON DELETE puede o no cubrirlos)
     sql`DELETE FROM refresh_tokens  WHERE user_id = ${userId}`,
     sql`DELETE FROM password_resets WHERE user_id = ${userId}`,
