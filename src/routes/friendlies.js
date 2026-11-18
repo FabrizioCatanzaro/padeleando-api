@@ -169,26 +169,60 @@ function notifyCte(matchId, actorId, entries, guard = q``) {
     ${guard}`;
 }
 
+const MAX_RADIUS_KM = 100;
+const isDay = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+const distanceSql = (lat, lon) => q`
+  (6371 * acos(LEAST(1, cos(radians(${lat}::float8)) * cos(radians(c.lat)) * cos(radians(c.lon) - radians(${lon}::float8))
+    + sin(radians(${lat}::float8)) * sin(radians(c.lat)))))`;
+
+const OPEN_PUBLIC = (now) => q`
+  fm.status = 'programado' AND fm.visibility = 'publico'
+  AND (fm.date > ${now.date}::date OR (fm.date = ${now.date}::date AND fm.start_time > ${now.time}::time))
+  AND EXISTS (
+    SELECT 1 FROM friendly_match_players p
+    WHERE p.match_id = fm.id AND p.user_id IS NULL AND p.guest_name IS NULL
+  )`;
+
 router.get('/', optionalAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const now = arNow();
+    const lat = Number.parseFloat(req.query.lat);
+    const lon = Number.parseFloat(req.query.lon);
+    const near = Number.isFinite(lat) && Number.isFinite(lon);
+    const radius = Math.min(Number.parseFloat(req.query.radius_km) || 15, MAX_RADIUS_KM);
     const clubId = typeof req.query.club_id === 'string' ? req.query.club_id : null;
-    const day = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date) ? req.query.date : null;
+    const locality = typeof req.query.locality === 'string' && req.query.locality.trim() ? req.query.locality.trim() : null;
+    const from = isDay(req.query.from) ? req.query.from : null;
+    const to = isDay(req.query.to) ? req.query.to : null;
+    const distance = near ? distanceSql(lat, lon) : q`NULL::float8`;
     const rows = await run(sql, q`
-      ${SELECT_MATCH}, NULL::json AS pending
+      ${SELECT_MATCH}, NULL::json AS pending, ROUND(${distance}::numeric, 1) AS distance_km
       ${FROM_MATCH}
-      WHERE fm.status = 'programado' AND fm.visibility = 'publico'
-        AND (fm.date > ${now.date}::date OR (fm.date = ${now.date}::date AND fm.start_time > ${now.time}::time))
+      WHERE ${OPEN_PUBLIC(now)}
         AND (${clubId}::text IS NULL OR fm.club_id = ${clubId}::text)
-        AND (${day}::date IS NULL OR fm.date = ${day}::date)
-        AND EXISTS (
-          SELECT 1 FROM friendly_match_players p
-          WHERE p.match_id = fm.id AND p.user_id IS NULL AND p.guest_name IS NULL
-        )
+        AND (${locality}::text IS NULL OR c.location_name ILIKE ${locality}::text)
+        AND (${from}::date IS NULL OR fm.date >= ${from}::date)
+        AND (${to}::date IS NULL OR fm.date <= ${to}::date)
+        ${near ? q`AND c.lat IS NOT NULL AND c.lon IS NOT NULL AND ${distance} <= ${radius}` : q``}
       ORDER BY fm.date, fm.start_time
       LIMIT ${LIST_LIMIT}`);
-    res.json(rows.map((r) => present(r, req.user?.id, now)));
+    res.json(rows.map((r) => ({ ...present(r, req.user?.id, now), distance_km: r.distance_km === null ? null : Number(r.distance_km) })));
+  } catch (err) { next(err); }
+});
+
+router.get('/localities', async (_req, res, next) => {
+  try {
+    const sql = getDb();
+    const rows = await run(sql, q`
+      SELECT c.location_name AS locality, COUNT(*)::int AS count
+      FROM friendly_matches fm
+      JOIN clubs c ON c.id = fm.club_id
+      WHERE ${OPEN_PUBLIC(arNow())} AND c.location_name IS NOT NULL AND c.location_name <> ''
+      GROUP BY c.location_name
+      ORDER BY c.location_name`);
+    res.json(rows);
   } catch (err) { next(err); }
 });
 
