@@ -3,6 +3,10 @@ import { LEVEL_RE } from './category.js';
 export const EXPIRY_DAYS = 30;
 export const VISIBILITIES = ['publico', 'link'];
 export const SLOTS = [[1, 1], [1, 2], [2, 1], [2, 2]];
+export const SIDES = ['drive', 'reves', 'cualquiera'];
+export const HANDS = ['diestro', 'zurdo'];
+export const STYLES = ['caballeros', 'damas', 'mixto'];
+const MAX_PRICE = 10_000_000;
 const MAX_GUEST_NAME = 40;
 const MAX_COURT_LABEL = 40;
 const MAX_GAMES = 99;
@@ -87,6 +91,40 @@ export function parseGuestName(value) {
   return v;
 }
 
+function parseEnum(value, options, message) {
+  if (value === null || value === undefined || value === '') return null;
+  const v = String(value).trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return options.includes(v) ? v : fail(message);
+}
+
+export const parseStyle = (value) => parseEnum(value, STYLES, 'El estilo debe ser caballeros, damas o mixto');
+
+export function parsePrice(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > MAX_PRICE) return fail('El alquiler debe ser un monto válido');
+  return Math.round(n * 100) / 100;
+}
+
+export function parseWhatsapp(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const v = String(value).trim().replace(/\s+/g, ' ');
+  const digits = v.replace(/\D/g, '');
+  if (!/^\+?[\d\s()-]+$/.test(v) || digits.length < 8 || digits.length > 15) return fail('El WhatsApp debe tener entre 8 y 15 números');
+  return v;
+}
+
+export function parseGameData(input = {}, { withWhatsapp = false } = {}) {
+  const out = {
+    side: parseEnum(input?.side, SIDES, 'El lado debe ser drive, revés o cualquiera'),
+    hand: parseEnum(input?.hand, HANDS, 'La mano hábil debe ser diestro o zurdo'),
+  };
+  if (withWhatsapp) out.whatsapp = parseWhatsapp(input?.whatsapp);
+  return out;
+}
+
+export const pricePerPerson = (total) => (total === null || total === undefined ? null : Math.round(Number(total) / 4));
+
 export function parseSlotRef(team, position) {
   const t = Number(team), p = Number(position);
   if (![1, 2].includes(t) || ![1, 2].includes(p)) return fail('El lugar debe ser equipo 1 o 2, posición 1 o 2');
@@ -101,7 +139,7 @@ export function parseSlotFill(input) {
     if (!u) return fail('Falta el usuario');
     return { username: u };
   }
-  return { guest_name: parseGuestName(input.guest_name) };
+  return { guest_name: parseGuestName(input.guest_name), ...parseGameData(input) };
 }
 
 function parseSlots(input = []) {
@@ -137,19 +175,22 @@ export function parseFriendlyInput(body, now) {
     visibility,
     level: parseLevel(body.level),
     sets_format: parseSetsFormat(body.sets_format),
+    court_price: parsePrice(body.court_price),
+    style: parseStyle(body.style),
   };
+  const me = parseGameData(body.me, { withWhatsapp: true });
   const slots = parseSlots(body.players);
   const started = hasStarted(match, now);
 
   if (mode === 'abierto') {
     if (started) return fail('Un partido abierto tiene que empezar más adelante');
     if (slots.length === 3) return fail('Un partido abierto necesita al menos un lugar libre');
-    return { mode, match, slots, result: null };
+    return { mode, match, me, slots, result: null };
   }
   if (!started) return fail('Un partido jugado no puede tener fecha futura');
   if (isExpired({ ...match, status: 'programado' }, now)) return fail(`Solo se cargan partidos de los últimos ${EXPIRY_DAYS} días`);
   if (slots.length !== 3) return fail('Cargá los 4 jugadores del partido');
-  return { mode, match, slots, result: parseResult(match.sets_format, body.sets) };
+  return { mode, match, me, slots, result: parseResult(match.sets_format, body.sets) };
 }
 
 export function parseFriendlyPatch(body, current, now) {
@@ -167,6 +208,8 @@ export function parseFriendlyPatch(body, current, now) {
   }
   if (body.level !== undefined) out.level = parseLevel(body.level);
   if (body.sets_format !== undefined) out.sets_format = parseSetsFormat(body.sets_format);
+  if (body.court_price !== undefined) out.court_price = parsePrice(body.court_price);
+  if (body.style !== undefined) out.style = parseStyle(body.style);
   if (body.club_id !== undefined) {
     if (!body.club_id || typeof body.club_id !== 'string') return fail('Elegí un club');
     out.club_id = body.club_id;

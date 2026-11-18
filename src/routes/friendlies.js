@@ -5,7 +5,7 @@ import { uid } from '../uid.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import {
   EXPIRY_DAYS, SLOTS, arNow, deriveStatus, isFilled, hasStarted, slotOf, otherTeam, teamUserIds,
-  parseFriendlyInput, parseFriendlyPatch, parseResult, parseSlotRef, parseSlotFill,
+  parseFriendlyInput, parseFriendlyPatch, parseResult, parseSlotRef, parseSlotFill, parseGameData, pricePerPerson,
   proposalError, acceptError, joinError, leaveError, lineupChangeError, viewerActions,
 } from '../lib/friendlies.js';
 
@@ -41,6 +41,7 @@ const PLAYERS_JSON = q`
   COALESCE((
     SELECT json_agg(json_build_object(
              'team', p.team, 'position', p.position, 'user_id', p.user_id, 'guest_name', p.guest_name,
+             'side', p.side, 'hand', p.hand, 'whatsapp', p.whatsapp,
              'username', u.username, 'name', u.name, 'avatar_url', u.avatar_url, 'category', u.category
            ) ORDER BY p.team, p.position)
     FROM friendly_match_players p
@@ -69,7 +70,7 @@ const HISTORY_JSON = q`
 
 const SELECT_MATCH = q`
   SELECT fm.id, fm.created_by, fm.status, fm.visibility, fm.share_token, fm.club_id, fm.court_label,
-         fm.date, fm.start_time, fm.duration_minutes, fm.level, fm.sets_format,
+         fm.date, fm.start_time, fm.duration_minutes, fm.level, fm.sets_format, fm.court_price, fm.style,
          fm.score1, fm.score2, fm.sets, fm.confirmed_at, fm.created_at,
          c.name AS club_name, c.location_name AS club_location,
          cu.username AS creator_username, cu.name AS creator_name,
@@ -99,6 +100,7 @@ function present(row, viewerId, now, { withHistory = false } = {}) {
   const pending = row.pending ?? null;
   const viewer = viewerActions({ match: row, players, pending, viewerId, now });
   const insider = viewer.is_creator || viewer.team !== null;
+  const price = row.court_price === null || row.court_price === undefined ? null : Number(row.court_price);
   return {
     id: row.id,
     status: deriveStatus(row, players, now),
@@ -110,6 +112,9 @@ function present(row, viewerId, now, { withHistory = false } = {}) {
     duration_minutes: row.duration_minutes,
     level: row.level,
     sets_format: row.sets_format,
+    style: row.style,
+    court_price: price,
+    price_per_person: pricePerPerson(price),
     result: row.status === 'confirmado' ? { score1: row.score1, score2: row.score2, sets: row.sets } : null,
     confirmed_at: row.confirmed_at,
     expires_on: expiresOn(row.date),
@@ -119,6 +124,9 @@ function present(row, viewerId, now, { withHistory = false } = {}) {
       position: p.position,
       user: p.user_id ? { id: p.user_id, username: p.username, name: p.name, avatar_url: p.avatar_url, category: p.category } : null,
       guest_name: p.guest_name,
+      side: p.side,
+      hand: p.hand,
+      whatsapp: viewer.team !== null ? p.whatsapp : undefined,
       is_creator: Boolean(p.user_id) && p.user_id === row.created_by,
     })),
     pending,
@@ -230,9 +238,16 @@ router.post('/', requireAuth, async (req, res, next) => {
 
     const filled = new Map(input.slots.map((s) => [`${s.team}-${s.position}`, s]));
     const lineup = SLOTS.map(([team, position]) => {
-      if (team === 1 && position === 1) return { team, position, user_id: req.user.id, guest_name: null };
+      if (team === 1 && position === 1) return { team, position, user_id: req.user.id, guest_name: null, ...input.me };
       const s = filled.get(`${team}-${position}`);
-      return { team, position, user_id: s?.username ? byUsername.get(s.username) : null, guest_name: s?.guest_name ?? null };
+      return {
+        team, position,
+        user_id: s?.username ? byUsername.get(s.username) : null,
+        guest_name: s?.guest_name ?? null,
+        side: s?.side ?? null,
+        hand: s?.hand ?? null,
+        whatsapp: null,
+      };
     });
 
     const id = uid();
@@ -248,19 +263,23 @@ router.post('/', requireAuth, async (req, res, next) => {
       WITH m AS (
         INSERT INTO friendly_matches
           (id, created_by, status, visibility, share_token, club_id, court_label, date, start_time,
-           duration_minutes, level, sets_format)
+           duration_minutes, level, sets_format, court_price, style)
         VALUES
           (${id}, ${req.user.id}, ${played ? 'por_confirmar' : 'programado'}, ${m.visibility}, ${newToken()},
-           ${m.club_id}, ${m.court_label}, ${m.date}::date, ${m.start_time}::time, ${m.duration_minutes}, ${m.level}, ${m.sets_format})
+           ${m.club_id}, ${m.court_label}, ${m.date}::date, ${m.start_time}::time, ${m.duration_minutes}, ${m.level}, ${m.sets_format},
+           ${m.court_price}::numeric, ${m.style}::text)
         RETURNING id
       ),
       p AS (
-        INSERT INTO friendly_match_players (match_id, team, position, user_id, guest_name, joined_at)
+        INSERT INTO friendly_match_players (match_id, team, position, user_id, guest_name, side, hand, whatsapp, joined_at)
         SELECT m.id, x.team, x.position, NULLIF(x.user_id, ''), NULLIF(x.guest_name, ''),
+               NULLIF(x.side, ''), NULLIF(x.hand, ''), NULLIF(x.whatsapp, ''),
                CASE WHEN x.user_id <> '' OR x.guest_name <> '' THEN NOW() END
         FROM m, unnest(${lineup.map((p) => p.team)}::smallint[], ${lineup.map((p) => p.position)}::smallint[],
-                       ${lineup.map((p) => p.user_id ?? '')}::text[], ${lineup.map((p) => p.guest_name ?? '')}::text[])
-             AS x(team, position, user_id, guest_name)
+                       ${lineup.map((p) => p.user_id ?? '')}::text[], ${lineup.map((p) => p.guest_name ?? '')}::text[],
+                       ${lineup.map((p) => p.side ?? '')}::text[], ${lineup.map((p) => p.hand ?? '')}::text[],
+                       ${lineup.map((p) => p.whatsapp ?? '')}::text[])
+             AS x(team, position, user_id, guest_name, side, hand, whatsapp)
       ),
       pr AS (
         INSERT INTO friendly_match_proposals (id, match_id, proposed_by, team, score1, score2, sets)
@@ -308,7 +327,9 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
           duration_minutes = CASE WHEN ${has('duration_minutes')}::boolean THEN ${patch.duration_minutes ?? null}::int ELSE duration_minutes END,
           visibility       = CASE WHEN ${has('visibility')}::boolean       THEN ${patch.visibility ?? null}::text      ELSE visibility END,
           level            = CASE WHEN ${has('level')}::boolean            THEN ${patch.level ?? null}::text           ELSE level END,
-          sets_format      = CASE WHEN ${has('sets_format')}::boolean      THEN ${patch.sets_format ?? null}::smallint ELSE sets_format END
+          sets_format      = CASE WHEN ${has('sets_format')}::boolean      THEN ${patch.sets_format ?? null}::smallint ELSE sets_format END,
+          court_price      = CASE WHEN ${has('court_price')}::boolean      THEN ${patch.court_price ?? null}::numeric  ELSE court_price END,
+          style            = CASE WHEN ${has('style')}::boolean            THEN ${patch.style ?? null}::text           ELSE style END
         WHERE id = ${row.id} AND status = 'programado'
         RETURNING id
       ),
@@ -365,8 +386,11 @@ router.post('/:id/join', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const now = arNow();
-    let slotRef;
-    try { slotRef = parseSlotRef(req.body?.team, req.body?.position); } catch (err) { return badRequest(res, err); }
+    let slotRef, data;
+    try {
+      slotRef = parseSlotRef(req.body?.team, req.body?.position);
+      data = parseGameData(req.body, { withWhatsapp: true });
+    } catch (err) { return badRequest(res, err); }
     const row = await loadOr404(sql, req, res);
     if (!row) return;
     const error = joinError({ match: row, players: row.players, slotRef, viewerId: req.user.id, now });
@@ -379,7 +403,8 @@ router.post('/:id/join', requireAuth, async (req, res, next) => {
     ], q`WHERE EXISTS (SELECT 1 FROM u)`);
     const [done] = await run(sql, q`
       WITH u AS (
-        UPDATE friendly_match_players SET user_id = ${req.user.id}, joined_at = NOW()
+        UPDATE friendly_match_players
+        SET user_id = ${req.user.id}, side = ${data.side}, hand = ${data.hand}, whatsapp = ${data.whatsapp}, joined_at = NOW()
         WHERE match_id = ${row.id} AND team = ${slotRef.team} AND position = ${slotRef.position}
           AND user_id IS NULL AND guest_name IS NULL
           AND EXISTS (SELECT 1 FROM friendly_matches WHERE id = ${row.id} AND status = 'programado')
@@ -397,7 +422,8 @@ router.post('/:id/join', requireAuth, async (req, res, next) => {
 
 const clearSlot = (sql, matchId, slotRef, notify) => run(sql, q`
   WITH s AS (
-    UPDATE friendly_match_players SET user_id = NULL, guest_name = NULL, joined_at = NULL
+    UPDATE friendly_match_players
+    SET user_id = NULL, guest_name = NULL, side = NULL, hand = NULL, whatsapp = NULL, joined_at = NULL
     WHERE match_id = ${matchId} AND team = ${slotRef.team} AND position = ${slotRef.position}
       AND (user_id IS NOT NULL OR guest_name IS NOT NULL)
     RETURNING match_id
@@ -460,7 +486,9 @@ router.post('/:id/players/:team/:position', requireAuth, async (req, res, next) 
     const notify = notifyCte(row.id, req.user.id, [{ user_id: userId, type: 'friendly_added' }], q`WHERE EXISTS (SELECT 1 FROM u)`);
     const [done] = await run(sql, q`
       WITH u AS (
-        UPDATE friendly_match_players SET user_id = ${userId}, guest_name = ${fill.guest_name ?? null}, joined_at = NOW()
+        UPDATE friendly_match_players
+        SET user_id = ${userId}, guest_name = ${fill.guest_name ?? null},
+            side = ${fill.side ?? null}, hand = ${fill.hand ?? null}, joined_at = NOW()
         WHERE match_id = ${row.id} AND team = ${slotRef.team} AND position = ${slotRef.position}
           AND user_id IS NULL AND guest_name IS NULL
         RETURNING match_id
@@ -492,6 +520,29 @@ router.delete('/:id/players/:team/:position', requireAuth, async (req, res, next
     const notify = notifyCte(row.id, req.user.id, [{ user_id: slot.user_id, type: 'friendly_removed' }], q`WHERE EXISTS (SELECT 1 FROM s)`);
     const [done] = await clearSlot(sql, row.id, slotRef, notify);
     if (!done) return res.status(409).json({ error: 'El partido cambió: recargá' });
+    res.json(present(await loadMatch(sql, row.id), req.user.id, now));
+  } catch (err) { next(err); }
+});
+
+router.patch('/:id/me', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const now = arNow();
+    let data;
+    try { data = parseGameData(req.body, { withWhatsapp: true }); } catch (err) { return badRequest(res, err); }
+    const row = await loadOr404(sql, req, res);
+    if (!row) return;
+    const slot = slotOf(row.players, req.user.id);
+    if (!slot) return res.status(403).json({ error: 'No estás en este partido' });
+    if (row.status === 'cancelado') return res.status(409).json({ error: 'El partido está cancelado' });
+
+    const has = (k) => Object.hasOwn(req.body ?? {}, k);
+    await run(sql, q`
+      UPDATE friendly_match_players SET
+        side     = CASE WHEN ${has('side')}::boolean     THEN ${data.side}::text     ELSE side END,
+        hand     = CASE WHEN ${has('hand')}::boolean     THEN ${data.hand}::text     ELSE hand END,
+        whatsapp = CASE WHEN ${has('whatsapp')}::boolean THEN ${data.whatsapp}::text ELSE whatsapp END
+      WHERE match_id = ${row.id} AND team = ${slot.team} AND position = ${slot.position} AND user_id = ${req.user.id}`);
     res.json(present(await loadMatch(sql, row.id), req.user.id, now));
   } catch (err) { next(err); }
 });

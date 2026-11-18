@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   arNow, deriveStatus, isExpired, parseLevel, parseResult, parseFriendlyInput, parseFriendlyPatch,
   proposalError, acceptError, joinError, leaveError, viewerActions, needsAction,
+  parseGameData, parseStyle, parsePrice, pricePerPerson,
 } from '../src/lib/friendlies.js';
 
 const NOW = { date: '2026-11-17', time: '20:00' };
@@ -140,4 +141,27 @@ test('viewerActions y needsAction', () => {
   assert.equal(stranger.can_join, true);
   assert.equal(needsAction({ status: 'falta_resultado', slot: { team: 2 }, pending: null }), true);
   assert.equal(needsAction({ status: 'falta_resultado', slot: null, pending: null }), false);
+});
+
+test('datos de juego, estilo y alquiler', () => {
+  assert.deepEqual(parseGameData({ side: 'Revés', hand: 'ZURDO', whatsapp: ' +54 9 11 5555-1234 ' }, { withWhatsapp: true }),
+    { side: 'reves', hand: 'zurdo', whatsapp: '+54 9 11 5555-1234' });
+  assert.deepEqual(parseGameData({}), { side: null, hand: null });
+  assert.throws(() => parseGameData({ side: 'medio' }), /lado/);
+  assert.throws(() => parseGameData({ whatsapp: '123' }, { withWhatsapp: true }), /WhatsApp/);
+  assert.equal(parseStyle('Mixto'), 'mixto');
+  assert.equal(parseStyle(''), null);
+  assert.throws(() => parseStyle('juvenil'), /estilo/);
+  assert.equal(parsePrice('32000'), 32000);
+  assert.throws(() => parsePrice(-1), /alquiler/);
+  assert.equal(pricePerPerson(32000), 8000);
+  assert.equal(pricePerPerson(null), null);
+  const out = parseFriendlyInput({
+    mode: 'abierto', club_id: 'c1', date: '2026-11-20', start_time: '19:00', court_price: 30000, style: 'damas',
+    me: { side: 'drive', whatsapp: '1155551234' }, players: [{ team: 2, position: 1, guest_name: 'Lu', hand: 'zurdo' }],
+  }, NOW);
+  assert.equal(out.match.court_price, 30000);
+  assert.equal(out.match.style, 'damas');
+  assert.deepEqual(out.me, { side: 'drive', hand: null, whatsapp: '1155551234' });
+  assert.deepEqual(out.slots[0], { team: 2, position: 1, guest_name: 'Lu', side: null, hand: 'zurdo' });
 });
