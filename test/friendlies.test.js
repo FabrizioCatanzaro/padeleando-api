@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { expandFriendlyMatches, addFriendlyStatsByUser } from '../src/lib/profileStats.js';
 import {
   arNow, deriveStatus, isExpired, parseLevel, parseResult, parseFriendlyInput, parseFriendlyPatch,
   proposalError, acceptError, joinError, leaveError, viewerActions, needsAction,
@@ -164,4 +165,45 @@ test('datos de juego, estilo y alquiler', () => {
   assert.equal(out.match.style, 'damas');
   assert.deepEqual(out.me, { side: 'drive', hand: null, whatsapp: '1155551234' });
   assert.deepEqual(out.slots[0], { team: 2, position: 1, guest_name: 'Lu', side: null, hand: 'zurdo' });
+});
+
+const row = (over = {}) => ({
+  id: 'f1', day: '2026-11-20', visibility: 'publico', score1: 4, score2: 6, sets_format: 1,
+  sets: [{ s1: 4, s2: 6 }], club_id: 'c1', club_name: 'Club',
+  players: [
+    { team: 1, position: 1, user_id: 'u2', name: 'Beto' },
+    { team: 1, position: 2, user_id: null, name: 'Invitado' },
+    { team: 2, position: 1, user_id: 'u1', name: 'Ana' },
+    { team: 2, position: 2, user_id: 'u3', name: 'Caro' },
+  ],
+  ...over,
+});
+
+test('expandFriendlyMatches orienta el resultado al dueño del perfil', () => {
+  const [m] = expandFriendlyMatches([row()], 'u1');
+  assert.equal(m.my_score, 6);
+  assert.equal(m.opp_score, 4);
+  assert.equal(m.won, true);
+  assert.deepEqual(m.sets, [{ s1: 6, s2: 4 }]);
+  assert.equal(m.partner_name, 'Caro');
+  assert.equal(m.partner_key, 'u3');
+  assert.deepEqual([m.opp1_name, m.opp2_name], ['Beto', 'Invitado']);
+  assert.equal(m.source, 'amistoso');
+});
+
+test('expandFriendlyMatches oculta un amistoso por link a quien no jugó', () => {
+  assert.equal(expandFriendlyMatches([row({ visibility: 'link' })], 'u1', 'u9')[0].private_friendly, true);
+  assert.equal(expandFriendlyMatches([row({ visibility: 'link' })], 'u1', 'u2')[0].private_friendly, false);
+  assert.equal(expandFriendlyMatches([row()], 'u1', null)[0].private_friendly, false);
+});
+
+test('expandFriendlyMatches ignora partidos donde el dueño no juega', () => {
+  assert.equal(expandFriendlyMatches([row()], 'u9').length, 0);
+});
+
+test('addFriendlyStatsByUser suma sobre lo del cuadro', () => {
+  const by = new Map([['u1', { partidos: 2, victorias: 1 }]]);
+  addFriendlyStatsByUser(by, [{ id: 'u1', partidos: 3, victorias: 2 }, { id: 'u2', partidos: 1, victorias: 0 }]);
+  assert.deepEqual(by.get('u1'), { partidos: 5, victorias: 3 });
+  assert.deepEqual(by.get('u2'), { partidos: 1, victorias: 0 });
 });
