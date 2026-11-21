@@ -855,3 +855,4 @@ CREATE TABLE IF NOT EXISTS friendly_match_proposals (
 );
 CREATE INDEX IF NOT EXISTS idx_friendly_proposals_match ON friendly_match_proposals(match_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_friendly_pending ON friendly_match_proposals(match_id) WHERE status = 'pendiente';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_friendly_reminder ON notifications(user_id, entity_id, body) WHERE type = 'friendly_reminder';

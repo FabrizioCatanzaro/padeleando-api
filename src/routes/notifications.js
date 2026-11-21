@@ -80,7 +80,37 @@ router.get('/count', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const [row] = await sql`
-      SELECT c.count,
+      WITH today AS (SELECT (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date AS d),
+      cand AS (
+        SELECT fm.id, fm.date, fm.status, p.team, pr.team AS pr_team, pr.created_at AS pr_at,
+               NOT EXISTS (SELECT 1 FROM friendly_match_players f
+                           WHERE f.match_id = fm.id AND f.user_id IS NULL AND f.guest_name IS NULL) AS full
+        FROM friendly_match_players p
+        JOIN friendly_matches fm ON fm.id = p.match_id
+        LEFT JOIN friendly_match_proposals pr ON pr.match_id = fm.id AND pr.status = 'pendiente'
+        CROSS JOIN today
+        WHERE p.user_id = ${req.user.id} AND fm.status IN ('programado', 'por_confirmar')
+          AND fm.date + 30 >= today.d
+      ),
+      due AS (
+        SELECT c.id, 'cargar' AS kind FROM cand c, today
+        WHERE c.status = 'programado' AND c.full AND c.date + 1 <= today.d AND c.date + 7 > today.d
+        UNION ALL
+        SELECT c.id, 'responder' FROM cand c, today
+        WHERE c.pr_team IS NOT NULL AND c.pr_team <> c.team AND c.pr_at <= NOW() - INTERVAL '2 days' AND c.date + 7 > today.d
+        UNION ALL
+        SELECT c.id, 'segundo' FROM cand c, today
+        WHERE c.date + 7 <= today.d
+          AND ((c.status = 'programado' AND c.full) OR (c.pr_team IS NOT NULL AND c.pr_team <> c.team))
+      ),
+      gen AS (
+        INSERT INTO notifications (id, user_id, type, entity_id, body)
+        SELECT substr(md5(random()::text || due.id || due.kind), 1, 7), ${req.user.id}, 'friendly_reminder', due.id, due.kind
+        FROM due
+        ON CONFLICT (user_id, entity_id, body) WHERE type = 'friendly_reminder' DO NOTHING
+        RETURNING 1
+      )
+      SELECT c.count + (SELECT COUNT(*)::int FROM gen) AS count,
              l.id, l.type, l.title, l.body, l.created_at,
              l.actor_username, l.actor_name, l.group_name, l.tournament_name, l.player_name,
              l.registration_reason, l.friendly_date, l.friendly_time, l.friendly_club_name

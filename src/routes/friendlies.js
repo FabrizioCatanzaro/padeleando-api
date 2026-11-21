@@ -457,7 +457,7 @@ router.post('/:id/join', requireAuth, async (req, res, next) => {
 const clearSlot = (sql, matchId, slotRef, notify) => run(sql, q`
   WITH s AS (
     UPDATE friendly_match_players
-    SET user_id = NULL, guest_name = NULL, side = NULL, hand = NULL, whatsapp = NULL, joined_at = NULL
+    SET user_id = NULL, guest_name = NULL, side = NULL, hand = NULL, whatsapp = NULL, joined_at = NULL, invite_token = NULL
     WHERE match_id = ${matchId} AND team = ${slotRef.team} AND position = ${slotRef.position}
       AND (user_id IS NOT NULL OR guest_name IS NOT NULL)
     RETURNING match_id
@@ -556,6 +556,77 @@ router.delete('/:id/players/:team/:position', requireAuth, async (req, res, next
     if (!done) return res.status(409).json({ error: 'El partido cambió: recargá' });
     res.json(present(await loadMatch(sql, row.id), req.user.id, now));
   } catch (err) { next(err); }
+});
+
+router.post('/:id/players/:team/:position/invite', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    let slotRef;
+    try { slotRef = parseSlotRef(req.params.team, req.params.position); } catch (err) { return badRequest(res, err); }
+    const [row] = await sql`
+      UPDATE friendly_match_players p
+      SET invite_token = COALESCE(p.invite_token, ${newToken()})
+      FROM friendly_matches fm
+      WHERE fm.id = p.match_id AND p.match_id = ${req.params.id} AND p.team = ${slotRef.team} AND p.position = ${slotRef.position}
+        AND fm.created_by = ${req.user.id} AND fm.status <> 'cancelado' AND p.guest_name IS NOT NULL
+      RETURNING p.invite_token`;
+    if (!row) return res.status(409).json({ error: 'Solo el creador invita, y solo a un lugar con nombre de invitado' });
+    res.json({ token: row.invite_token });
+  } catch (err) { next(err); }
+});
+
+async function loadByInvite(sql, token) {
+  const [row] = await run(sql, q`
+    ${SELECT_MATCH}, ${PENDING_JSON} AS pending, '[]'::json AS proposals,
+           ip.team AS invite_team, ip.position AS invite_position, ip.guest_name AS invite_guest
+    ${FROM_MATCH}
+    JOIN friendly_match_players ip ON ip.match_id = fm.id AND ip.invite_token = ${token}`);
+  return row ?? null;
+}
+
+const inviteError = (row, viewerId) => {
+  if (!row) return 'El link ya se usó o no existe';
+  if (row.status === 'cancelado') return 'El amistoso se canceló';
+  if (viewerId && slotOf(row.players, viewerId)) return 'Ya estás en este partido';
+  return null;
+};
+
+router.get('/invites/:token', optionalAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const row = await loadByInvite(sql, req.params.token);
+    if (!row) return res.status(404).json({ error: 'El link ya se usó o no existe' });
+    res.json({
+      match: present(row, req.user?.id, arNow()),
+      slot: { team: row.invite_team, position: row.invite_position, guest_name: row.invite_guest },
+      error: inviteError(row, req.user?.id),
+    });
+  } catch (err) { next(err); }
+});
+
+router.post('/invites/:token/accept', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const row = await loadByInvite(sql, req.params.token);
+    const error = inviteError(row, req.user.id);
+    if (error) return res.status(row ? 409 : 404).json({ error });
+    const notify = notifyCte(row.id, req.user.id, [{ user_id: row.created_by, type: 'friendly_joined' }], q`WHERE EXISTS (SELECT 1 FROM u)`);
+    const [done] = await run(sql, q`
+      WITH u AS (
+        UPDATE friendly_match_players
+        SET user_id = ${req.user.id}, guest_name = NULL, invite_token = NULL, joined_at = NOW()
+        WHERE invite_token = ${req.params.token} AND guest_name IS NOT NULL
+          AND EXISTS (SELECT 1 FROM friendly_matches WHERE id = ${row.id} AND status <> 'cancelado')
+        RETURNING match_id
+      ),
+      n AS (${notify})
+      SELECT match_id FROM u`);
+    if (!done) return res.status(409).json({ error: 'El link ya se usó o no existe' });
+    res.json({ id: row.id });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Ya estás en este partido' });
+    next(err);
+  }
 });
 
 router.patch('/:id/me', requireAuth, async (req, res, next) => {
