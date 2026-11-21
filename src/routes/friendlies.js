@@ -4,9 +4,9 @@ import { getDb } from '../db.js';
 import { uid } from '../uid.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import {
-  EXPIRY_DAYS, SLOTS, arNow, deriveStatus, isFilled, hasStarted, slotOf, otherTeam, teamUserIds,
+  EXPIRY_DAYS, SLOTS, arNow, deriveStatus, isFilled, slotOf, otherTeam, teamUserIds,
   parseFriendlyInput, parseFriendlyPatch, parseResult, parseSlotRef, parseSlotFill, parseGameData, pricePerPerson,
-  proposalError, acceptError, joinError, leaveError, lineupChangeError, viewerActions,
+  proposalError, acceptError, joinError, leaveError, lineupChangeError, viewerActions, editMode,
 } from '../lib/friendlies.js';
 
 const router = Router();
@@ -193,6 +193,8 @@ router.get('/', optionalAuth, async (req, res, next) => {
     const near = Number.isFinite(lat) && Number.isFinite(lon);
     const radius = Math.min(Number.parseFloat(req.query.radius_km) || 15, MAX_RADIUS_KM);
     const clubId = typeof req.query.club_id === 'string' ? req.query.club_id : null;
+    const clubName = typeof req.query.club === 'string' && req.query.club.trim()
+      ? `%${req.query.club.trim().slice(0, 60).replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
     const locality = typeof req.query.locality === 'string' && req.query.locality.trim() ? req.query.locality.trim() : null;
     const from = isDay(req.query.from) ? req.query.from : null;
     const to = isDay(req.query.to) ? req.query.to : null;
@@ -203,6 +205,7 @@ router.get('/', optionalAuth, async (req, res, next) => {
       WHERE ${OPEN_PUBLIC(now)}
         AND (${clubId}::text IS NULL OR fm.club_id = ${clubId}::text)
         AND (${locality}::text IS NULL OR c.location_name ILIKE ${locality}::text)
+        AND (${clubName}::text IS NULL OR c.name ILIKE ${clubName}::text)
         AND (${from}::date IS NULL OR fm.date >= ${from}::date)
         AND (${to}::date IS NULL OR fm.date <= ${to}::date)
         ${near ? q`AND c.lat IS NOT NULL AND c.lon IS NOT NULL AND ${distance} <= ${radius}` : q``}
@@ -338,10 +341,11 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
     const row = await loadOr404(sql, req, res);
     if (!row) return;
     if (row.created_by !== req.user.id) return res.status(403).json({ error: 'Solo el creador edita el partido' });
-    if (row.status !== 'programado' || hasStarted(row, now)) return res.status(409).json({ error: 'El partido ya empezó: no se puede editar' });
+    const mode = editMode(deriveStatus(row, row.players, now));
+    if (!mode) return res.status(409).json({ error: 'El partido está cerrado: no se puede editar' });
 
     let patch;
-    try { patch = parseFriendlyPatch(req.body ?? {}, row, now); } catch (err) { return badRequest(res, err); }
+    try { patch = parseFriendlyPatch(req.body ?? {}, row, now, mode); } catch (err) { return badRequest(res, err); }
     if (Object.keys(patch).length === 0) return res.json(present(row, req.user.id, now));
     if (patch.club_id) {
       const [club] = await sql`SELECT id FROM clubs WHERE id = ${patch.club_id}`;
@@ -364,7 +368,7 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
           sets_format      = CASE WHEN ${has('sets_format')}::boolean      THEN ${patch.sets_format ?? null}::smallint ELSE sets_format END,
           court_price      = CASE WHEN ${has('court_price')}::boolean      THEN ${patch.court_price ?? null}::numeric  ELSE court_price END,
           style            = CASE WHEN ${has('style')}::boolean            THEN ${patch.style ?? null}::text           ELSE style END
-        WHERE id = ${row.id} AND status = 'programado'
+        WHERE id = ${row.id} AND status IN ('programado', 'por_confirmar')
         RETURNING id
       ),
       n AS (${notify})

@@ -177,6 +177,9 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - A guest slot holds a name. The creator generates a per-slot `invite_token` (`POST /:id/players/:team/:position/invite`); `GET /invites/:token` previews and `POST /invites/:token/accept` links the slot to the account. A confirmed match then counts retroactively, because the profile reads by `user_id`. Clearing the slot drops the token.
 - **Profile**: `GET /groups/user/:username` adds confirmed friendlies in memory (`expandFriendlyMatches`), like bracket matches, and accepts `?source=todos|torneos|amistosos`. With `torneos` the payload is byte-identical to the pre-friendlies code. Friendlies never add titles or tournaments. The response carries `amistosos` (count) so the client knows when to show the filter.
 - **Reminders** (`friendly_reminder`, kind in `notifications.body`: `cargar`, `responder`, `segundo`) are generated inside `GET /notifications/count`, in the same statement (CTE with `INSERT … ON CONFLICT DO NOTHING` on `uq_friendly_reminder`). No cron, no extra round-trip.
+- **Editing** (`PATCH /:id`, creator only) follows `editMode(status)`: `abierto`/`completo` edit everything with a future date; `falta_resultado`/`por_confirmar` (played) edit club, court, a past date, time, duration, price, style and visibility, but never `sets_format`, and the pending proposal stays. Confirmed, cancelled or expired: 409.
+- Removing a player from a played match is allowed on purpose (Fabrizio, 2026-11-21): the slot frees, the pending proposal is rejected and the match goes back to `falta_resultado`.
+- `GET /` filters by club name with `?club=` (`ILIKE`, `%` and `_` escaped). `/localities` stays for a future locality filter; the client doesn't call it.
 - No plan limit: friendlies are free for everyone.
 
 ### HTTP behavior

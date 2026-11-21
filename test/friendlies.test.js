@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { expandFriendlyMatches, addFriendlyStatsByUser } from '../src/lib/profileStats.js';
 import {
   arNow, deriveStatus, isExpired, parseLevel, parseResult, parseFriendlyInput, parseFriendlyPatch,
-  proposalError, acceptError, joinError, leaveError, viewerActions, needsAction,
+  proposalError, acceptError, joinError, leaveError, viewerActions, needsAction, editMode,
   parseGameData, parseStyle, parsePrice, pricePerPerson,
 } from '../src/lib/friendlies.js';
 
@@ -92,6 +92,25 @@ test('parseFriendlyInput: lugares inválidos', () => {
 test('parseFriendlyPatch: solo campos presentes y fecha futura', () => {
   assert.deepEqual(parseFriendlyPatch({ court_label: ' Cancha 2 ' }, base, NOW), { court_label: 'Cancha 2' });
   assert.throws(() => parseFriendlyPatch({ date: '2026-11-17', start_time: '10:00' }, base, NOW), /futuras/);
+});
+
+test('parseFriendlyPatch en un partido jugado: fecha pasada y formato fijo', () => {
+  const p = { ...played, sets_format: 1 };
+  assert.deepEqual(parseFriendlyPatch({ date: '2026-11-15' }, p, NOW, 'jugado'), { date: '2026-11-15' });
+  assert.throws(() => parseFriendlyPatch({ date: '2026-11-20' }, p, NOW, 'jugado'), /fecha futura/);
+  assert.throws(() => parseFriendlyPatch({ sets_format: 3 }, p, NOW, 'jugado'), /formato/);
+  assert.deepEqual(parseFriendlyPatch({ sets_format: 1 }, p, NOW, 'jugado'), { sets_format: 1 });
+});
+
+test('editMode y can_edit siguen el estado', () => {
+  assert.equal(editMode('abierto'), 'abierto');
+  assert.equal(editMode('por_confirmar'), 'jugado');
+  assert.equal(editMode('confirmado'), null);
+  assert.equal(editMode('vencido'), null);
+  const v = (match, viewerId) => viewerActions({ match, players: lineup(4), pending: null, viewerId, now: NOW }).can_edit;
+  assert.equal(v(played, 'u1'), true);
+  assert.equal(v({ ...played, status: 'confirmado', score1: 6, score2: 3 }, 'u1'), false);
+  assert.equal(v(base, 'u2'), false);
 });
 
 test('proposalError: quién propone y cuándo', () => {

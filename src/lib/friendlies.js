@@ -193,7 +193,11 @@ export function parseFriendlyInput(body, now) {
   return { mode, match, me, slots, result: parseResult(match.sets_format, body.sets) };
 }
 
-export function parseFriendlyPatch(body, current, now) {
+export const editMode = (status) =>
+  status === 'abierto' || status === 'completo' ? 'abierto'
+    : status === 'falta_resultado' || status === 'por_confirmar' ? 'jugado' : null;
+
+export function parseFriendlyPatch(body, current, now, mode = 'abierto') {
   const out = {};
   if (body.court_label !== undefined) out.court_label = parseCourtLabel(body.court_label);
   if (body.date !== undefined) {
@@ -214,8 +218,13 @@ export function parseFriendlyPatch(body, current, now) {
     if (!body.club_id || typeof body.club_id !== 'string') return fail('Elegí un club');
     out.club_id = body.club_id;
   }
-  if ((out.date || out.start_time) && hasStarted({ ...current, ...out }, now)) {
-    return fail('La nueva fecha y hora tienen que ser futuras');
+  if (mode === 'jugado' && out.sets_format !== undefined && out.sets_format !== current.sets_format) {
+    return fail('El formato no cambia en un partido ya jugado');
+  }
+  if (out.date || out.start_time) {
+    const started = hasStarted({ ...current, ...out }, now);
+    if (mode === 'abierto' && started) return fail('La nueva fecha y hora tienen que ser futuras');
+    if (mode === 'jugado' && !started) return fail('Un partido ya jugado no puede tener fecha futura');
   }
   return out;
 }
@@ -308,7 +317,7 @@ export function viewerActions({ match, players, pending, viewerId, now }) {
     can_propose: Boolean(viewerId) && !proposalError({ match, players, pending, viewerId, now }),
     can_accept: Boolean(pending) && !acceptError({ match, players, proposal: pending, viewerId, now }),
     can_leave: Boolean(viewerId) && !leaveError({ match, players, viewerId, now }),
-    can_edit: isCreator && match.status === 'programado' && !hasStarted(match, now),
+    can_edit: isCreator && editMode(status) !== null,
     can_cancel: isCreator && (status === 'abierto' || status === 'completo' || status === 'falta_resultado'),
     needs_action: needsAction({ status, slot, pending }),
   };
