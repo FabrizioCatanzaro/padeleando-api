@@ -6,8 +6,9 @@ test('cupo en jugadores: parejas, jugadores y tope del americano', () => {
   assert.equal(capacityInPlayers({ capacity: 8, unit: 'pair', format: 'liga' }), 16);
   assert.equal(capacityInPlayers({ capacity: 10, unit: 'player', format: 'liga' }), 10);
   assert.equal(capacityInPlayers({ capacity: null, unit: 'pair', format: 'liga' }), null);
-  assert.equal(capacityInPlayers({ capacity: null, unit: 'pair', format: 'americano' }), 32);
-  assert.equal(capacityInPlayers({ capacity: 20, unit: 'pair', format: 'americano' }), 32);
+  assert.equal(capacityInPlayers({ capacity: null, unit: 'pair', format: 'americano' }), 64);
+  assert.equal(capacityInPlayers({ capacity: 20, unit: 'pair', format: 'americano' }), 40);
+  assert.equal(capacityInPlayers({ capacity: 40, unit: 'pair', format: 'americano' }), 64);
   assert.equal(capacityInPlayers({ capacity: 12, unit: 'pair', format: 'americano' }), 24);
 });
 

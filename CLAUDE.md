@@ -158,6 +158,12 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - **`auto_return` on the booking `Preference` needs a real https `FRONTEND_URL`.** Mercado Pago rejects the whole preference (`auto_return invalid. back_url.success must be defined`) when `back_urls.success` isn't a reachable https URL — it happens with a plain `http://localhost` `FRONTEND_URL`, same family of restriction as the OAuth Connect `redirect_uri`. `POST /:id/bookings` only sends `auto_return: 'approved'` when `FRONTEND_URL` starts with `https://`; on `http` it still creates the preference and returns `checkout_url`, the payer just doesn't get auto-redirected back after paying.
 - **A club without Mercado Pago linked is unaffected.** `POST /clubs/:id/bookings` only creates a `Preference` when `clubs.mp_access_token` is set AND the court has a price; otherwise it's the exact same manual pending → owner approves/rejects flow as before. A payment failure while creating the preference falls back to the manual flow instead of failing the booking.
 
+### Americano
+
+- 4 to 32 fixed pairs. Limits and the bracket choice live in `lib/americano.js` (`AMERICANO_MIN_PAIRS`, `AMERICANO_MAX_PAIRS`, `americanoPairsError`, `generateAmericanoBracket`), with tests. Below the minimum the jornada is a draft: no schedule, matches or bracket.
+- Every pair enters the bracket. With 8 to 16 pairs it is still `generateBracket`, byte-identical to before. With fewer than 8 or more than 16 it is `generateCupBracket` without `kind`: the best pairs of the previa get a bye to the second round (semis below 8, octavos above 16, with 16avos).
+- The frontend warns the organizer about those byes (`AvisoDirectas`) when creating, in Gestión and before generating the bracket.
+
 ### Copa
 
 - `tournaments.copa_config` holds the options; `mode` is `zonas` (groups by fechas, then playoffs) or `cuadro` (direct elimination). Always fixed pairs, max 32. Validation and every pure rule live in `lib/copa.js` (`parseCopaSettings`, `copaConfigLockError`, `sortearZonas`, `zonaStandings`, `rankClasificados`, `seedCuadro`, `generateCupBracket`).

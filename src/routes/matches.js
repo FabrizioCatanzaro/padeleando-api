@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireTournamentManage, requireMatchManage } from '../middleware/access.js';
 import { withdrawnTeamError } from '../lib/fixture.js';
 import { usaFechas, esCopa, esCopaZonas } from '../lib/copa.js';
+import { AMERICANO_MIN_PAIRS } from '../lib/americano.js';
 
 // Con los playoffs armados, la fase de grupos de la copa queda fija.
 const gruposCerrados = (ctx) => esCopaZonas(ctx) && ctx.has_bracket;
@@ -50,13 +51,13 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     const retirada = await withdrawnTeamError(sql, tournamentId, team1, team2);
     if (retirada) return res.status(400).json({ error: retirada });
 
-    // Un americano en borrador (menos de 8 parejas) todavía no se puede jugar.
+    // Un americano en borrador (debajo del mínimo de parejas) todavía no se puede jugar.
     // El format ya viene resuelto por requireTournamentManage: no hace falta
     // volver a consultar la misma fila.
     if (req.accessCtx.format === 'americano') {
       const [{ count }] = await sql`SELECT COUNT(*)::int AS count FROM pairs WHERE tournament_id = ${tournamentId}`;
-      if (count < 8) {
-        return res.status(400).json({ error: 'El americano necesita al menos 8 parejas para cargar partidos' });
+      if (count < AMERICANO_MIN_PAIRS) {
+        return res.status(400).json({ error: `El americano necesita al menos ${AMERICANO_MIN_PAIRS} parejas para cargar partidos` });
       }
     }
 

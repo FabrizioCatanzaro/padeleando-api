@@ -4,8 +4,8 @@
 /** Estados que ocupan al usuario: no puede tener otra inscripción en el torneo. */
 export const ACTIVE_STATUSES = ['pending', 'approved', 'waitlist'];
 
-/** Tope del americano: 16 parejas. */
-export const AMERICANO_MAX_PLAYERS = 32;
+/** Tope del americano: 32 parejas. */
+export const AMERICANO_MAX_PLAYERS = 64;
 /** Tope de la copa: 32 parejas. */
 export const COPA_MAX_PLAYERS = 64;
 
@@ -14,7 +14,7 @@ export const slotsFor = (kind) => (kind === 'pair' ? 2 : 1);
 
 /**
  * Cupo en jugadores. El organizador lo carga en parejas o en jugadores; en
- * americano nunca pasa de 16 parejas. null = sin cupo.
+ * americano nunca pasa de 32 parejas. null = sin cupo.
  */
 export function capacityInPlayers({ capacity, unit, format }) {
   let cap = capacity == null ? null : capacity * (unit === 'player' ? 1 : 2);

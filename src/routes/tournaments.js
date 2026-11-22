@@ -9,12 +9,13 @@ import { canManageGroup } from '../lib/access.js';
 import { parseSignupFields, resolveSignup, publicSocialLinks } from '../lib/signup.js';
 import { tournamentQuotaError } from '../lib/plan.js';
 import {
-  generatePreviaSchedule, computeStandings, generateBracket,
+  generatePreviaSchedule, computeStandings,
   applyBracketResult, clearBracketResult, findBracketMatch,
   isPreviaComplete, isBracketMatchReady, planScheduleRows, applyBracketWalkovers,
   generatePlayoffBracket, isWithdrawn,
 } from '../lib/tournamentLogic.js';
 import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations.js';
+import { AMERICANO_MAX_PAIRS, americanoPairsError, generateAmericanoBracket } from '../lib/americano.js';
 import {
   parseLigaSettings, LIGA_KEYS, generateFecha, validateFecha, crossesFromRows, fechaDatesError,
 } from '../lib/ligaFechas.js';
@@ -297,11 +298,9 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
       return res.status(400).json({ error: 'La liga en varios días se juega con parejas fijas' });
     }
 
-    // El americano se puede crear como "borrador" con menos de 8 parejas: recién al
-    // llegar al mínimo se habilitan el calendario, los partidos y el cuadro
-    // (validado en /schedule y /bracket). Acá sólo se controla el tope.
-    if (format === 'americano' && pairsInput.length > 16) {
-      return res.status(400).json({ error: 'El modo Americano admite hasta 16 parejas' });
+    // Por debajo del mínimo el americano queda en borrador: acá sólo se controla el tope.
+    if (format === 'americano' && pairsInput.length > AMERICANO_MAX_PAIRS) {
+      return res.status(400).json({ error: `El modo Americano admite hasta ${AMERICANO_MAX_PAIRS} parejas` });
     }
     if (copaNueva && pairsInput.length > COPA_MAX_PAIRS) {
       return res.status(400).json({ error: `La copa admite hasta ${COPA_MAX_PAIRS} parejas` });
@@ -1183,8 +1182,8 @@ router.post('/:id/schedule', requireAuth, requireTournamentManage, async (req, r
            FROM scheduled_matches WHERE tournament_id = $1 ORDER BY created_at`, [id]),
       ]);
 
-      if (pairsRaw.length < 8 || pairsRaw.length > 16) {
-        return { status: 400, error: 'Se necesitan entre 8 y 16 parejas para generar el calendario' };
+      if (americanoPairsError(pairsRaw.length)) {
+        return { status: 400, error: americanoPairsError(pairsRaw.length) };
       }
 
       const schedule = generatePreviaSchedule(pairsRaw, [...matches, ...scheduledPrevia]);
@@ -1375,8 +1374,8 @@ router.post('/:id/bracket', requireAuth, requireTournamentManage, async (req, re
       ORDER BY pr.id
     `;
 
-    if (pairsRaw.length < 8 || pairsRaw.length > 16) {
-      return res.status(400).json({ error: 'Se necesitan entre 8 y 16 parejas para generar el bracket' });
+    if (americanoPairsError(pairsRaw.length)) {
+      return res.status(400).json({ error: americanoPairsError(pairsRaw.length) });
     }
 
     // Traer partidos de la fase previa
@@ -1393,7 +1392,7 @@ router.post('/:id/bracket', requireAuth, requireTournamentManage, async (req, re
     const standings = computeStandings(pairsRaw, matches);
 
     // Generar bracket
-    const bracket = generateBracket(standings);
+    const bracket = generateAmericanoBracket(standings);
 
     // Persistir. El `bracket IS NULL` cierra la carrera entre dos pedidos
     // simultáneos: sólo el primero escribe.
