@@ -12,7 +12,7 @@ import { hasStarted } from '../lib/registrations.js';
 import {
   expandBracketMatches, countLeagueTitles, calcStreaks, mergeActivity, mergeFrequentPartners,
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
-  countBracketPlayed,
+  countBracketPlayed, expandFriendlyMatches, addFriendlyStatsByUser,
 } from '../lib/profileStats.js';
 
 // GET /api/groups — solo los del usuario autenticado
@@ -194,13 +194,15 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     // ya resuelta (getActiveSubscription puede expirarla contra Mercado Pago).
     // Preguntarle a getActiveSubscription acá costaría un round-trip en serie.
     const wantAdvanced = isOwner || (owner.advanced_stats_public === true && owner.has_premium_row === true);
+    const source = req.query.source === 'torneos' || req.query.source === 'amistosos' ? req.query.source : 'todos';
+    const withFriendlies = source !== 'torneos';
 
     // A partir de acá todo depende únicamente de owner.id (y del espectador),
     // nada de una consulta alimenta a la siguiente. Con el driver HTTP de Neon
     // cada `sql` es un round-trip propio a São Paulo, así que encadenarlas
     // costaba ~10 viajes en serie: 1,4-2,0 s medidos en producción. Van todas
     // en una sola tanda, y las tres de seguidores colapsadas en una consulta.
-    const [
+    let [
       [follows],
       groups,
       playedGroups,
@@ -220,6 +222,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       followBracketRows,
       sub,
       ownedClubs,
+      friendlyRows,
+      followFriendlyRows,
     ] = await Promise.all([
     sql`
       SELECT
@@ -717,10 +721,61 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       WHERE owner_id = ${owner.id} AND owner_visible = true
       ORDER BY created_at ASC
     `,
+
+    // Amistosos confirmados: se suman como los partidos del cuadro.
+    withFriendlies ? sql`
+      SELECT fm.id, fm.date::text AS day, fm.visibility, fm.score1, fm.score2, fm.sets_format, fm.sets, fm.club_id,
+             c.name AS club_name, c.location_name AS club_location, c.photo_url AS club_photo,
+             json_agg(json_build_object(
+               'team', p.team, 'position', p.position, 'user_id', p.user_id,
+               'name', COALESCE(u.name, p.guest_name), 'username', u.username, 'avatar_url', u.avatar_url
+             ) ORDER BY p.team, p.position) AS players
+      FROM friendly_matches fm
+      JOIN clubs c ON c.id = fm.club_id
+      JOIN friendly_match_players p ON p.match_id = fm.id
+      LEFT JOIN users u ON u.id = p.user_id
+      WHERE fm.status = 'confirmado'
+        AND EXISTS (SELECT 1 FROM friendly_match_players mp WHERE mp.match_id = fm.id AND mp.user_id = ${owner.id})
+      GROUP BY fm.id, c.name, c.location_name, c.photo_url
+      ORDER BY fm.date DESC
+    ` : [],
+
+    isOwner && withFriendlies ? sql`
+      WITH circle AS (
+        SELECT following_id AS uid FROM user_follows WHERE follower_id = ${owner.id}
+        UNION SELECT ${owner.id}
+      )
+      SELECT p.user_id AS id,
+             COUNT(*)::int AS partidos,
+             COUNT(*) FILTER (WHERE (p.team = 1 AND fm.score1 > fm.score2) OR (p.team = 2 AND fm.score2 > fm.score1))::int AS victorias
+      FROM friendly_matches fm
+      JOIN friendly_match_players p ON p.match_id = fm.id
+      WHERE fm.status = 'confirmado' AND p.user_id IN (SELECT uid FROM circle)
+      GROUP BY p.user_id
+    ` : [],
     ]);
+
+    // Filtro "Amistosos": lo de torneos queda en cero.
+    if (source === 'amistosos') {
+      playerStats = undefined;
+      americanoChamp = undefined;
+      dailyActivity = [];
+      monthlyStats = [];
+      matchResults = [];
+      recentMatches = [];
+      frequentPartners = [];
+      bracketRows = [];
+      leagueRows = [];
+      weekdayStats = [];
+      clubStats = [];
+      followRows = followRows.map((r) => ({ ...r, partidos: 0, victorias: 0 }));
+      followBracketRows = [];
+    }
+    const friendlyMatches = expandFriendlyMatches(friendlyRows, owner.id, req.user?.id);
 
     // Los partidos del cuadro se suman a todo lo calculado en SQL.
     const bracketMatches = expandBracketMatches(bracketRows);
+    const extraMatches   = [...bracketMatches, ...friendlyMatches];
     const bracketWins    = bracketMatches.filter((m) => m.result === 'win').length;
     const bracketGf      = bracketMatches.reduce((acc, m) => acc + m.my_score, 0);
     const bracketGc      = bracketMatches.reduce((acc, m) => acc + m.opp_score, 0);
@@ -729,11 +784,12 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const streakRows = [
       ...matchResults.map((r) => ({ won: r.won, day: dayKey(r.played_at), bracket: false })),
       ...bracketMatches.map((m) => ({ won: m.result === 'win', day: dayKey(m.played_at), bracket: true })),
+      ...friendlyMatches.map((m) => ({ won: m.won, day: dayKey(m.played_at), bracket: false })),
     ].sort((a, b) => (a.day === b.day ? (b.bracket ? 1 : 0) - (a.bracket ? 1 : 0) : (a.day > b.day ? -1 : 1)));
     const { racha, racha_max: rachaMax } = calcStreaks(streakRows);
 
     // Se intercalan por fecha y se recorta al mismo tope de 20.
-    const allRecent = [...recentMatches, ...bracketMatches]
+    const allRecent = [...recentMatches, ...bracketMatches, ...friendlyMatches]
       .sort((a, b) => {
         const da = dayKey(a.played_at), db = dayKey(b.played_at);
         if (da !== db) return da > db ? -1 : 1;
@@ -761,7 +817,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       ? mergeActivity(
           dailyActivity,
           monthlyStats,
-          bracketMatches.filter((m) => m.played_at && m.played_at >= dayLimit),
+          extraMatches.filter((m) => m.played_at && m.played_at >= dayLimit),
         )
       : { dailyActivity, monthlyStats };
     if (wantAdvanced) {
@@ -769,15 +825,18 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     }
 
     const { weekdayStats: weekdays, clubStats: clubs } =
-      mergeWeekdayAndClub(weekdayStats, clubStats, bracketMatches);
+      mergeWeekdayAndClub(weekdayStats, clubStats, extraMatches);
 
     const bracketSeconds = bracketMatches.reduce((acc, m) => acc + (m.duration_seconds ?? 0), 0);
     const bracketTimed   = bracketMatches.filter((m) => (m.duration_seconds ?? 0) > 0).length;
     const bracketTight   = bracketMatches.filter((m) => Math.abs(m.my_score - m.opp_score) === 1);
 
-    const blowouts = countBlowouts([...matchResults, ...bracketMatches]);
-    const setStats = countSetStats([...matchResults, ...bracketMatches]);
-    const followRanking = buildFollowRanking(followRows, bracketStatsByUser(followBracketRows), owner.id);
+    const blowouts = countBlowouts([...matchResults, ...extraMatches]);
+    const setStats = countSetStats([...matchResults, ...extraMatches]);
+    const followRanking = buildFollowRanking(
+      followRows, addFriendlyStatsByUser(bracketStatsByUser(followBracketRows), followFriendlyRows), owner.id);
+    const friendlyWins  = friendlyMatches.filter((m) => m.won).length;
+    const friendlyTight = friendlyMatches.filter((m) => Math.abs(m.my_score - m.opp_score) === 1);
 
     const base = playerStats ?? {
       torneos: 0, partidos: 0, victorias: 0, torneos_americanos: 0, games_favor: 0, games_contra: 0,
@@ -789,14 +848,15 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const titulosCopa      = americanoChamp?.campeon_copa ?? 0;
     const baseStats = {
       ...base,
-      partidos:     base.partidos     + bracketMatches.length,
-      victorias:    base.victorias    + bracketWins,
-      games_favor:  base.games_favor  + bracketGf,
-      games_contra: base.games_contra + bracketGc,
+      partidos:     base.partidos     + bracketMatches.length + friendlyMatches.length,
+      victorias:    base.victorias    + bracketWins + friendlyWins,
+      games_favor:  base.games_favor  + bracketGf + friendlyMatches.reduce((acc, m) => acc + m.my_score, 0),
+      games_contra: base.games_contra + bracketGc + friendlyMatches.reduce((acc, m) => acc + m.opp_score, 0),
       segundos_jugados:      base.segundos_jugados      + bracketSeconds,
       partidos_con_duracion: base.partidos_con_duracion + bracketTimed,
-      ajustados:         base.ajustados         + bracketTight.length,
-      ajustados_ganados: base.ajustados_ganados + bracketTight.filter((m) => m.result === 'win').length,
+      ajustados:         base.ajustados         + bracketTight.length + friendlyTight.length,
+      ajustados_ganados: base.ajustados_ganados + bracketTight.filter((m) => m.result === 'win').length
+        + friendlyTight.filter((m) => m.won).length,
     };
 
     // Veredicto final sobre las avanzadas, ya con la suscripción resuelta: si
@@ -851,7 +911,8 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       club_stats:     clubs,
       follow_ranking: followRanking,
       recent_matches: publicRecent,
-      frequent_partners: mergeFrequentPartners(frequentPartners, bracketMatches),
+      frequent_partners: mergeFrequentPartners(frequentPartners, extraMatches),
+      ...(withFriendlies && { amistosos: friendlyMatches.length }),
     });
   } catch (err) { next(err); }
 });

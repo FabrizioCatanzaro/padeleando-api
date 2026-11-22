@@ -164,8 +164,8 @@ export function mergeFrequentPartners(partners, bracketMatches, limit = 5) {
       byKey.set(key, {
         partner_key:     m.partner_key,
         name:            m.partner_name,
-        username:        null,
-        avatar_url:      null,
+        username:        m.partner_username ?? null,
+        avatar_url:      m.partner_avatar_url ?? null,
         is_premium:      false,
         partidos_juntos: 1,
       });
@@ -247,7 +247,11 @@ export function mergeWeekdayAndClub(weekdays, clubs, bracketMatches) {
       if (m.result === 'win') row.victorias++;
       byDow.set(dow, row);
     }
-    const club = m.club_id != null ? byClub.get(String(m.club_id)) : null;
+    let club = m.club_id != null ? byClub.get(String(m.club_id)) : null;
+    if (!club && m.club_id != null && m.club_name) {
+      club = { id: m.club_id, name: m.club_name, location_name: m.club_location ?? null, photo_url: m.club_photo ?? null, partidos: 0, victorias: 0, torneos: 0 };
+      byClub.set(String(m.club_id), club);
+    }
     if (club) {
       club.partidos++;
       if (m.result === 'win') club.victorias++;
@@ -256,7 +260,7 @@ export function mergeWeekdayAndClub(weekdays, clubs, bracketMatches) {
 
   return {
     weekdayStats: [...byDow.values()].sort((a, b) => a.dow - b.dow),
-    clubStats: [...byClub.values()].sort((a, b) => b.partidos - a.partidos),
+    clubStats: [...byClub.values()].sort((a, b) => b.partidos - a.partidos).slice(0, 5),
   };
 }
 
@@ -336,4 +340,70 @@ export function mergeActivity(dailyActivity, monthlyStats, bracketMatches) {
       .map(([month, v]) => ({ month, ...v }))
       .sort((a, b) => (a.month < b.month ? -1 : 1)),
   };
+}
+
+/**
+ * Amistosos confirmados con la misma forma que los partidos del cuadro, para
+ * sumarlos con las mismas funciones. Los sets salen orientados al jugador.
+ * @param {Array} rows { id, day, score1, score2, sets_format, sets, club_id, club_name, players }
+ */
+export function expandFriendlyMatches(rows, ownerId, viewerId = null) {
+  const out = [];
+  for (const row of rows) {
+    const players = row.players ?? [];
+    const me = players.find((p) => p.user_id === ownerId);
+    if (!me || row.score1 == null || row.score2 == null) continue;
+    const mine1 = me.team === 1;
+    const myScore = mine1 ? row.score1 : row.score2;
+    const oppScore = mine1 ? row.score2 : row.score1;
+    const partner = players.find((p) => p.team === me.team && p.position !== me.position) ?? null;
+    const rivals = players.filter((p) => p.team !== me.team);
+    // Por link: sólo lo abre quien jugó; el resto ve el resultado.
+    const hidden = row.visibility === 'link' && !players.some((p) => viewerId && p.user_id === viewerId);
+    out.push({
+      id:               `friendly:${row.id}`,
+      friendly_id:      row.id,
+      source:           'amistoso',
+      played_at:        row.day,
+      score1:           myScore,
+      score2:           oppScore,
+      tournament_id:    null,
+      group_id:         null,
+      tournament_name:  null,
+      group_name:       null,
+      club_name:        row.club_name ?? null,
+      club_location:    row.club_location ?? null,
+      club_photo:       row.club_photo ?? null,
+      visible:          true,
+      private_friendly: hidden,
+      result:           myScore > oppScore ? 'win' : 'loss',
+      my_score:         myScore,
+      opp_score:        oppScore,
+      partner_name:     partner?.name ?? null,
+      partner_key:      partner ? (partner.user_id ?? `amistoso:${String(partner.name ?? '').trim().toLowerCase()}`) : null,
+      partner_username: partner?.username ?? null,
+      partner_avatar_url: partner?.avatar_url ?? null,
+      duration_seconds: null,
+      sets_format:      row.sets_format ?? null,
+      sets:             Array.isArray(row.sets) ? (mine1 ? row.sets : row.sets.map((s) => ({ s1: s.s2, s2: s.s1 }))) : [],
+      is_team1:         true,
+      won:              myScore > oppScore,
+      club_id:          row.club_id ?? null,
+      opp1_name:        rivals[0]?.name ?? null,
+      opp2_name:        rivals[1]?.name ?? null,
+    });
+  }
+  return out;
+}
+
+/** Partidos y victorias de amistosos por usuario, en el formato de bracketStatsByUser. */
+export function addFriendlyStatsByUser(byUser, rows) {
+  for (const r of rows) {
+    const key = String(r.id);
+    const row = byUser.get(key) ?? { partidos: 0, victorias: 0 };
+    row.partidos += r.partidos;
+    row.victorias += r.victorias;
+    byUser.set(key, row);
+  }
+  return byUser;
 }

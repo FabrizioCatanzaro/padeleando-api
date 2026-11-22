@@ -8,6 +8,23 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 
 ---
 
+## Current Status (updated 2026-11-22)
+
+- **Last sprint: Amistosos** — on `staging`, PR `staging` → `main` pending. Friendly 2 vs 2 matches outside any tournament that count toward the profile once the rival team accepts the result: open matches people join from `/amistosos`, played matches loaded with their result, proposals and counter-proposals, guests who claim their slot by link, reminders generated on read, the profile filter Todos / Torneos / Amistosos, an edit screen and a club-name search. Design doc: https://claude.ai/artifact/2y4oNfCD6oWt2FewGrzHC1
+- **The friendly schema reaches production with the deploy of that PR**: `db:init` creates `friendly_matches`, `friendly_match_players` and `friendly_match_proposals`, widens `notifications_type_check` and adds `uq_friendly_reminder`. It was tested on a Neon branch that has been deleted.
+- **Previous sprint: Copa** — merged to `main` (front PR #44, API PR #37). It shipped the Copa format (groups + playoffs, or direct bracket, copa de plata, prizes, per-player WhatsApp/availability), the redesigned tournament setup (`Setup.jsx`: format cards with photos, config/info sub-steps, segmented `StepBar`, one-row pair loader, summary aside), WhatsApp for the multi-day liga, and the mail domain change to `soporte@padeleando.ar` (Resend now sends from `padeleando.ar`). Design doc: https://claude.ai/artifact/X8KtqZZQamuNXRxhBDqftw
+- **Production DB already has the Copa schema** (`copa_config`, `bracket_plata`, `pairs.zona`, `tournament_players` data columns, `court_id`, `tournament_prizes`). `db:init` re-applies it as a no-op.
+- **Local dev points at the production database** (`padeliando-api/.env`, backed up in `produccion.env`). For risky work, create a Neon branch of `production` (project `weathered-morning-55905272`), point `.env` at it, and delete the branch when done. Test data is named `TEST …` and deleted at the end.
+- **Git flow:** feature branch from `staging` → commits authored by Fabrizio Catanzaro → `merge --ff-only` into `staging` → Fabrizio pushes and opens the PR `staging` → `main`. Never commit `.claude/` or `.mcp.json`.
+- **Open items:**
+  - Amistosos follow-ups: playing data (dominant hand, preferred side) on the user's profile; a locality filter once clubs carry their locality (`GET /friendlies/localities` is kept for it); email reminders through a scheduled GitHub Actions workflow; linking a friendly to a club booking.
+  - Super tie-break as a match format (left out of the Copa sprint on purpose, "option b").
+  - TV mode (`TvOverlay`) shows the main bracket only, not the copa de plata.
+  - Fecha generation can still warn "ya no se completa el todos contra todos" mid-season after a withdrawal (the last fecha was fixed; the general case is a pessimistic warning, not a wrong fixture).
+  - Pre-existing test rows in production, not from the Copa sprint: players "Test Jugador Uno", "Test Jugador Dos", "Test Claude".
+
+---
+
 ## Tech Stack
 
 - Node + **Express 5**, ESM (`"type": "module"`), run through **`tsx`** (no build step, no TypeScript in `src/`)
@@ -151,6 +168,22 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - Titles: a copa champion (`bracket.final`) counts as `campeon_copa`; the copa de plata is not a title.
 - Quota: `FREE_COPAS_PER_MONTH = 1` per category, and a copa also counts toward the 2 monthly tournaments.
 
+### Amistosos
+
+- Three tables in `schema.sql`: `friendly_matches`, `friendly_match_players` (4 slots per match, PK `(match_id, team, position)`) and `friendly_match_proposals`. Router `routes/friendlies.js` at `/api/friendlies`; every pure rule (parsers, permissions, `deriveStatus`) lives in `lib/friendlies.js`, with tests.
+- **The UI says "amistoso"; the code says `friendly`.** A match is open (future, free slots) or played (goes straight to `por_confirmar`).
+- Stored status is `programado | por_confirmar | confirmado | cancelado`. `abierto`, `completo`, `falta_resultado` and `vencido` are **derived on read** with Argentina time (`arNow`). A match expires 30 days after its date without a confirmed result; there is no job.
+- A result counts only when the **rival team** accepts it. Rejecting means counter-proposing. One pending proposal per match (partial unique index). A confirmed result is never edited. No draws, no W.O.
+- Slot writes are single statements with a CTE (update + notifications via `unnest`). The local helper `q`/`run` composes fragments over `sql.query`; don't nest tagged templates.
+- Visibility `publico` or `link`; a `link` match needs `?t=share_token` unless you play in it. Players' WhatsApp is returned only to players of the match.
+- A guest slot holds a name. The creator generates a per-slot `invite_token` (`POST /:id/players/:team/:position/invite`); `GET /invites/:token` previews and `POST /invites/:token/accept` links the slot to the account. A confirmed match then counts retroactively, because the profile reads by `user_id`. Clearing the slot drops the token.
+- **Profile**: `GET /groups/user/:username` adds confirmed friendlies in memory (`expandFriendlyMatches`), like bracket matches, and accepts `?source=todos|torneos|amistosos`. With `torneos` the payload is byte-identical to the pre-friendlies code. Friendlies never add titles or tournaments. The response carries `amistosos` (count) so the client knows when to show the filter.
+- **Reminders** (`friendly_reminder`, kind in `notifications.body`: `cargar`, `responder`, `segundo`) are generated inside `GET /notifications/count`, in the same statement (CTE with `INSERT … ON CONFLICT DO NOTHING` on `uq_friendly_reminder`). No cron, no extra round-trip.
+- **Editing** (`PATCH /:id`, creator only) follows `editMode(status)`: `abierto`/`completo` edit everything with a future date; `falta_resultado`/`por_confirmar` (played) edit club, court, a past date, time, duration, price, style and visibility, but never `sets_format`, and the pending proposal stays. Confirmed, cancelled or expired: 409.
+- Removing a player from a played match is allowed on purpose (Fabrizio, 2026-11-21): the slot frees, the pending proposal is rejected and the match goes back to `falta_resultado`.
+- `GET /` filters by club name with `?club=` (`ILIKE`, `%` and `_` escaped). `/localities` stays for a future locality filter; the client doesn't call it.
+- No plan limit: friendlies are free for everyone.
+
 ### HTTP behavior
 
 - **Cache policy is centralized in `index.js`**, not per route. Public read surfaces (`/api/home`, `/api/readonly`, `/api/groups/search`, `/api/groups/nearby`, `/api/clubs`) get `public, max-age=10, stale-while-revalidate=60`; session/sensitive surfaces (`/api/auth`, `/api/subscriptions`, `/api/admin`, `/api/notifications`, `/api/invitations`, `/api/emails`) get `no-store`; everything else gets `private, no-cache` so Express's ETag can still answer 304 (the spectator view polls). Non-GET is always `no-store`. Adding a route means checking which list it belongs in.
@@ -160,7 +193,7 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 
 ### Notifications
 
-In-app notifications are plain `INSERT INTO notifications (id, user_id, type, actor_id, entity_id, …)` at the point of the event — there is no helper module. Follow the shape used by the nearest existing case (`collaborators.js`, `join-requests.js`, `follows.js`). Admin broadcasts carry a Markdown subset rendered identically in the bell and in the email (`lib/richText.js`).
+In-app notifications are plain `INSERT INTO notifications (id, user_id, type, actor_id, entity_id, …)` at the point of the event — there is no helper module. Follow the shape used by the nearest existing case (`collaborators.js`, `join-requests.js`, `follows.js`). The one exception is `friendly_reminder`, generated on read in `GET /notifications/count` (see Amistosos). Admin broadcasts carry a Markdown subset rendered identically in the bell and in the email (`lib/richText.js`).
 
 ---
 
