@@ -1,0 +1,107 @@
+import { Router } from 'express';
+import { getDb } from '../db.js';
+import { requireAuth } from '../middleware/auth.js';
+import { bracketStatsByUser, countLeagueTitles } from '../lib/profileStats.js';
+import { championCountsQuery, leagueTitleRowsQuery } from '../lib/profileQueries.js';
+
+const router = Router();
+
+// Resumen del usuario logueado: números del perfil y contadores de la navegación, en una sola tanda.
+router.get('/summary', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const me = req.user.id;
+    const [[base], bracketRows, [champ], leagueRows, [friendly], [counts]] = await Promise.all([
+      sql`
+        SELECT
+          COUNT(m.id)::int AS partidos,
+          COALESCE(SUM(CASE
+            WHEN m.score1 > m.score2 AND (m.team1_p1 = p.id OR m.team1_p2 = p.id) THEN 1
+            WHEN m.score2 > m.score1 AND (m.team2_p1 = p.id OR m.team2_p2 = p.id) THEN 1
+            ELSE 0 END), 0)::int AS victorias
+        FROM players p
+        JOIN tournament_players tp ON tp.player_id = p.id
+        LEFT JOIN matches m ON m.tournament_id = tp.tournament_id
+          AND m.score1 <> m.score2 AND NOT m.walkover
+          AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
+            OR m.team2_p1 = p.id OR m.team2_p2 = p.id)
+        WHERE p.user_id = ${me}
+      `,
+      sql`
+        SELECT
+          t.bracket,
+          t.bracket_plata,
+          (SELECT json_agg(json_build_object(
+              'id',       pr.id,
+              'user_ids', json_build_array(p1.user_id, p2.user_id)))
+           FROM pairs pr
+           JOIN players p1 ON p1.id = pr.p1_id
+           JOIN players p2 ON p2.id = pr.p2_id
+           WHERE pr.tournament_id = t.id) AS pairs
+        FROM tournaments t
+        WHERE t.bracket IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM pairs pr
+            JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
+            WHERE pr.tournament_id = t.id AND p.user_id = ${me}
+          )
+      `,
+      championCountsQuery(sql, me),
+      leagueTitleRowsQuery(sql, me),
+      sql`
+        SELECT
+          COUNT(*)::int AS partidos,
+          COUNT(*) FILTER (WHERE (p.team = 1 AND fm.score1 > fm.score2) OR (p.team = 2 AND fm.score2 > fm.score1))::int AS victorias
+        FROM friendly_matches fm
+        JOIN friendly_match_players p ON p.match_id = fm.id
+        WHERE fm.status = 'confirmado' AND p.user_id = ${me}
+      `,
+      // Misma regla que needsAction: falta el resultado, o el otro equipo propuso uno. Sin vencidos (30 días).
+      sql`
+        WITH ar AS (SELECT (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') AS ts)
+        SELECT
+          (SELECT COUNT(*)::int
+           FROM friendly_match_players p
+           JOIN friendly_matches fm ON fm.id = p.match_id
+           LEFT JOIN friendly_match_proposals pr ON pr.match_id = fm.id AND pr.status = 'pendiente'
+           CROSS JOIN ar
+           WHERE p.user_id = ${me}
+             AND fm.date + 30 >= ar.ts::date
+             AND ((fm.status = 'programado'
+                   AND fm.date + fm.start_time + fm.duration_minutes * INTERVAL '1 minute' <= ar.ts)
+               OR (fm.status = 'por_confirmar' AND pr.team IS NOT NULL AND pr.team <> p.team))
+          ) AS friendlies,
+          (SELECT COUNT(*)::int
+           FROM tournament_registrations r
+           JOIN tournaments t ON t.id = r.tournament_id
+           JOIN groups g ON g.id = t.group_id
+           WHERE r.status = 'pending' AND t.status <> 'finished'
+             AND (g.user_id = ${me}
+               OR EXISTS (SELECT 1 FROM group_collaborators gc WHERE gc.group_id = g.id AND gc.user_id = ${me}))
+          ) AS registrations,
+          (SELECT COUNT(*)::int
+           FROM tournaments t
+           JOIN groups g ON g.id = t.group_id
+           WHERE t.status = 'active'
+             AND (g.user_id = ${me}
+               OR EXISTS (SELECT 1 FROM group_collaborators gc WHERE gc.group_id = g.id AND gc.user_id = ${me})
+               OR EXISTS (SELECT 1 FROM tournament_players tp JOIN players p ON p.id = tp.player_id
+                          WHERE tp.tournament_id = t.id AND p.user_id = ${me}))
+          ) AS tournaments_active
+      `,
+    ]);
+
+    const bracket = bracketStatsByUser(bracketRows).get(String(me)) ?? { partidos: 0, victorias: 0 };
+    const partidos = base.partidos + bracket.partidos + friendly.partidos;
+    const victorias = base.victorias + bracket.victorias + friendly.victorias;
+    const titulos = countLeagueTitles(leagueRows) + champ.campeon_playoffs + champ.campeon_americano + champ.campeon_copa;
+
+    res.json({
+      stats: { partidos, victorias, win_pct: partidos > 0 ? Math.round((victorias / partidos) * 100) : null, titulos },
+      pending: { friendlies: counts.friendlies, registrations: counts.registrations },
+      tournaments_active: counts.tournaments_active,
+    });
+  } catch (err) { next(err); }
+});
+
+export default router;
