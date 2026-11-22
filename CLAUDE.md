@@ -8,14 +8,16 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 
 ---
 
-## Current Status (updated 2026-11-21)
+## Current Status (updated 2026-11-22)
 
-- **Last sprint: Copa** — merged to `main` (front PR #44, API PR #37). It shipped the Copa format (groups + playoffs, or direct bracket, copa de plata, prizes, per-player WhatsApp/availability), the redesigned tournament setup (`Setup.jsx`: format cards with photos, config/info sub-steps, segmented `StepBar`, one-row pair loader, summary aside), WhatsApp for the multi-day liga, and the mail domain change to `soporte@padeleando.ar` (Resend now sends from `padeleando.ar`). Design doc: https://claude.ai/artifact/X8KtqZZQamuNXRxhBDqftw
+- **Last sprint: Amistosos** — on `staging`, PR `staging` → `main` pending. Friendly 2 vs 2 matches outside any tournament that count toward the profile once the rival team accepts the result: open matches people join from `/amistosos`, played matches loaded with their result, proposals and counter-proposals, guests who claim their slot by link, reminders generated on read, the profile filter Todos / Torneos / Amistosos, an edit screen and a club-name search. Design doc: https://claude.ai/artifact/2y4oNfCD6oWt2FewGrzHC1
+- **The friendly schema reaches production with the deploy of that PR**: `db:init` creates `friendly_matches`, `friendly_match_players` and `friendly_match_proposals`, widens `notifications_type_check` and adds `uq_friendly_reminder`. It was tested on a Neon branch that has been deleted.
+- **Previous sprint: Copa** — merged to `main` (front PR #44, API PR #37). It shipped the Copa format (groups + playoffs, or direct bracket, copa de plata, prizes, per-player WhatsApp/availability), the redesigned tournament setup (`Setup.jsx`: format cards with photos, config/info sub-steps, segmented `StepBar`, one-row pair loader, summary aside), WhatsApp for the multi-day liga, and the mail domain change to `soporte@padeleando.ar` (Resend now sends from `padeleando.ar`). Design doc: https://claude.ai/artifact/X8KtqZZQamuNXRxhBDqftw
 - **Production DB already has the Copa schema** (`copa_config`, `bracket_plata`, `pairs.zona`, `tournament_players` data columns, `court_id`, `tournament_prizes`). `db:init` re-applies it as a no-op.
 - **Local dev points at the production database** (`padeliando-api/.env`, backed up in `produccion.env`). For risky work, create a Neon branch of `production` (project `weathered-morning-55905272`), point `.env` at it, and delete the branch when done. Test data is named `TEST …` and deleted at the end.
 - **Git flow:** feature branch from `staging` → commits authored by Fabrizio Catanzaro → `merge --ff-only` into `staging` → Fabrizio pushes and opens the PR `staging` → `main`. Never commit `.claude/` or `.mcp.json`.
-- **In progress: Amistosos** on `feat/amistosos` in both repos (not merged yet). Friendly 2 vs 2 matches outside any tournament that count toward the profile. Design doc: https://claude.ai/artifact/2y4oNfCD6oWt2FewGrzHC1. Tested against the Neon branch `amistosos` (`br-patient-hill-acqg8px5`); `.env` points there while the branch lives, `produccion.env` is the backup.
 - **Open items:**
+  - Amistosos follow-ups: playing data (dominant hand, preferred side) on the user's profile; a locality filter once clubs carry their locality (`GET /friendlies/localities` is kept for it); email reminders through a scheduled GitHub Actions workflow; linking a friendly to a club booking.
   - Super tie-break as a match format (left out of the Copa sprint on purpose, "option b").
   - TV mode (`TvOverlay`) shows the main bracket only, not the copa de plata.
   - Fecha generation can still warn "ya no se completa el todos contra todos" mid-season after a withdrawal (the last fecha was fixed; the general case is a pessimistic warning, not a wrong fixture).
