@@ -3,6 +3,8 @@ import { getDb } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { bracketStatsByUser, countLeagueTitles } from '../lib/profileStats.js';
 import { championCountsQuery, leagueTitleRowsQuery } from '../lib/profileQueries.js';
+import { parseAgendaRange, buildAgenda } from '../lib/agenda.js';
+import { arNow } from '../lib/friendlies.js';
 
 const router = Router();
 
@@ -100,6 +102,118 @@ router.get('/summary', requireAuth, async (req, res, next) => {
       stats: { partidos, victorias, win_pct: partidos > 0 ? Math.round((victorias / partidos) * 100) : null, titulos },
       pending: { friendlies: counts.friendlies, registrations: counts.registrations },
       tournaments_active: counts.tournaments_active,
+    });
+  } catch (err) { next(err); }
+});
+
+// Agenda del usuario: partidos de torneo programados, partidos del cuadro con día, amistosos por jugar y torneos
+// con fecha donde juega. Suma lo pendiente que se resuelve desde Inicio. Una sola tanda.
+router.get('/agenda', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const me = req.user.id;
+    const { from, to } = parseAgendaRange(req.query, arNow().date);
+    const [scheduled, brackets, friendlies, tournaments, pendingFriendlies, pendingRegistrations] = await Promise.all([
+      sql`
+        SELECT sm.id, sm.court, to_char(sm.scheduled_at, 'HH24:MI') AS time,
+               COALESCE(sm.scheduled_date, t.event_date)::text AS day,
+               t.id AS tournament_id, t.name AS tournament_name, t.format, t.group_id, g.name AS group_name,
+               c.name AS club_name,
+               COALESCE(${me} IN (p1.user_id, p2.user_id), false) AS mine_is_team1,
+               COALESCE(u1.name, p1.name) AS n1, COALESCE(u2.name, p2.name) AS n2,
+               COALESCE(u3.name, p3.name) AS n3, COALESCE(u4.name, p4.name) AS n4
+        FROM scheduled_matches sm
+        JOIN tournaments t ON t.id = sm.tournament_id
+        JOIN groups g ON g.id = t.group_id
+        LEFT JOIN clubs c ON c.id = t.club_id
+        JOIN players p1 ON p1.id = sm.team1_p1 LEFT JOIN users u1 ON u1.id = p1.user_id
+        JOIN players p2 ON p2.id = sm.team1_p2 LEFT JOIN users u2 ON u2.id = p2.user_id
+        JOIN players p3 ON p3.id = sm.team2_p1 LEFT JOIN users u3 ON u3.id = p3.user_id
+        JOIN players p4 ON p4.id = sm.team2_p2 LEFT JOIN users u4 ON u4.id = p4.user_id
+        WHERE t.status = 'active' AND NOT sm.postponed
+          AND ${me} IN (p1.user_id, p2.user_id, p3.user_id, p4.user_id)
+          AND COALESCE(sm.scheduled_date, t.event_date) BETWEEN ${from}::date AND ${to}::date
+      `,
+      sql`
+        SELECT t.id, t.name, t.format, t.group_id, g.name AS group_name, c.name AS club_name,
+               t.bracket, t.bracket_plata,
+               (SELECT json_agg(json_build_object(
+                   'id',   pr.id,
+                   'mine', COALESCE(p1.user_id = ${me} OR p2.user_id = ${me}, false),
+                   'name', COALESCE(u1.name, p1.name) || ' / ' || COALESCE(u2.name, p2.name)))
+                FROM pairs pr
+                JOIN players p1 ON p1.id = pr.p1_id LEFT JOIN users u1 ON u1.id = p1.user_id
+                JOIN players p2 ON p2.id = pr.p2_id LEFT JOIN users u2 ON u2.id = p2.user_id
+                WHERE pr.tournament_id = t.id) AS pairs
+        FROM tournaments t
+        JOIN groups g ON g.id = t.group_id
+        LEFT JOIN clubs c ON c.id = t.club_id
+        WHERE t.status = 'active' AND t.bracket IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM pairs pr
+            JOIN players p ON p.id = pr.p1_id OR p.id = pr.p2_id
+            WHERE pr.tournament_id = t.id AND p.user_id = ${me}
+          )
+      `,
+      sql`
+        WITH ar AS (SELECT (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') AS ts)
+        SELECT fm.id, fm.date::text AS day, to_char(fm.start_time, 'HH24:MI') AS time, c.name AS club_name,
+               (SELECT COUNT(*)::int FROM friendly_match_players x
+                WHERE x.match_id = fm.id AND (x.user_id IS NOT NULL OR x.guest_name IS NOT NULL)) AS filled
+        FROM friendly_matches fm
+        JOIN friendly_match_players p ON p.match_id = fm.id AND p.user_id = ${me}
+        LEFT JOIN clubs c ON c.id = fm.club_id
+        CROSS JOIN ar
+        WHERE fm.status = 'programado'
+          AND fm.date BETWEEN ${from}::date AND ${to}::date
+          AND fm.date + fm.start_time + fm.duration_minutes * INTERVAL '1 minute' > ar.ts
+      `,
+      sql`
+        SELECT t.id, t.name, t.format, t.group_id, g.name AS group_name, c.name AS club_name,
+               t.event_date::text AS day, to_char(t.event_time, 'HH24:MI') AS time
+        FROM tournaments t
+        JOIN groups g ON g.id = t.group_id
+        LEFT JOIN clubs c ON c.id = t.club_id
+        WHERE t.status = 'active'
+          AND t.event_date BETWEEN ${from}::date AND ${to}::date
+          AND EXISTS (SELECT 1 FROM tournament_players tp JOIN players p ON p.id = tp.player_id
+                      WHERE tp.tournament_id = t.id AND p.user_id = ${me})
+      `,
+      // Misma regla que el contador de /summary.
+      sql`
+        WITH ar AS (SELECT (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') AS ts)
+        SELECT fm.id, fm.date::text AS day, to_char(fm.start_time, 'HH24:MI') AS time, c.name AS club_name,
+               CASE WHEN fm.status = 'programado' THEN 'cargar' ELSE 'confirmar' END AS kind,
+               pr.sets AS proposed_sets
+        FROM friendly_match_players p
+        JOIN friendly_matches fm ON fm.id = p.match_id
+        LEFT JOIN clubs c ON c.id = fm.club_id
+        LEFT JOIN friendly_match_proposals pr ON pr.match_id = fm.id AND pr.status = 'pendiente'
+        CROSS JOIN ar
+        WHERE p.user_id = ${me}
+          AND fm.date + 30 >= ar.ts::date
+          AND ((fm.status = 'programado'
+                AND fm.date + fm.start_time + fm.duration_minutes * INTERVAL '1 minute' <= ar.ts)
+            OR (fm.status = 'por_confirmar' AND pr.team IS NOT NULL AND pr.team <> p.team))
+        ORDER BY fm.date, fm.start_time
+      `,
+      sql`
+        SELECT t.id, t.name, t.group_id, COUNT(*)::int AS count
+        FROM tournament_registrations r
+        JOIN tournaments t ON t.id = r.tournament_id
+        JOIN groups g ON g.id = t.group_id
+        WHERE r.status = 'pending' AND t.status <> 'finished'
+          AND (g.user_id = ${me}
+            OR EXISTS (SELECT 1 FROM group_collaborators gc WHERE gc.group_id = g.id AND gc.user_id = ${me}))
+        GROUP BY t.id, t.name, t.group_id
+        ORDER BY MIN(r.created_at)
+      `,
+    ]);
+
+    res.json({
+      from, to,
+      items: buildAgenda({ scheduled, brackets, friendlies, tournaments, from, to }),
+      pending: { friendlies: pendingFriendlies, registrations: pendingRegistrations },
     });
   } catch (err) { next(err); }
 });
