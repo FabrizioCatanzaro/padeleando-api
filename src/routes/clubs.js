@@ -8,6 +8,7 @@ import { requireClubManage, requireClubBookingManage } from '../middleware/acces
 import { uploadClubPhoto, uploadClubHeader, uploadClubClaimPhotos } from '../middleware/upload.js';
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
+import { arNow } from '../lib/friendlies.js';
 
 const router = Router();
 
@@ -40,6 +41,31 @@ function clubFields(body = {}) {
   };
 }
 
+// Con ?stats=1 (pestaña Clubes de Padeleros) suma amistosos abiertos y si el club toma reservas en la app.
+function clubStatsSql(sql) {
+  const now = arNow();
+  return sql`
+    SELECT c.id, c.header_url, c.contact_whatsapp,
+      (SELECT COUNT(*)::int FROM friendly_matches fm
+        WHERE fm.club_id = c.id AND fm.status = 'programado' AND fm.visibility = 'publico'
+          AND (fm.date > ${now.date}::date OR (fm.date = ${now.date}::date AND fm.start_time > ${now.time}::time))
+          AND EXISTS (SELECT 1 FROM friendly_match_players p
+                      WHERE p.match_id = fm.id AND p.user_id IS NULL AND p.guest_name IS NULL)) AS open_friendlies,
+      (c.owner_id IS NOT NULL AND EXISTS (SELECT 1 FROM club_courts cc WHERE cc.club_id = c.id AND cc.active)) AS bookable,
+      (SELECT COUNT(*)::int FROM club_courts cc WHERE cc.club_id = c.id AND cc.active) AS active_courts
+    FROM clubs c
+  `;
+}
+
+function withStats(clubs, stats) {
+  const byId = new Map(stats.map((r) => [r.id, r]));
+  return clubs.map((c) => {
+    const st = byId.get(c.id);
+    return { ...c, header_url: st?.header_url ?? null, contact_whatsapp: st?.contact_whatsapp ?? null,
+      open_friendlies: st?.open_friendlies ?? 0, bookable: !!st?.bookable, active_courts: st?.active_courts ?? 0 };
+  });
+}
+
 // ── GET /api/clubs ───────────────────────────────────────────────────────────
 // Listado/búsqueda público. Query params: q (string), limit (default 50, máx 100)
 router.get('/', async (req, res, next) => {
@@ -49,15 +75,19 @@ router.get('/', async (req, res, next) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit ?? '50', 10) || 50));
     const pat   = q ? `%${q}%` : null;
 
-    const clubs = await sql`
-      SELECT id, name, photo_url, social_links, contact_phone, contact_whatsapp,
-      location_name, lat, lon, courts, schedule, created_at
-      FROM clubs
-      WHERE ${pat}::text IS NULL OR name ILIKE ${pat} OR location_name ILIKE ${pat}
-      ORDER BY name ASC
-      LIMIT ${limit}
-    `;
-    res.json(clubs);
+    const stats = req.query.stats === '1';
+    const [clubs, extra] = await Promise.all([
+      sql`
+        SELECT id, name, photo_url, social_links, contact_phone, contact_whatsapp,
+        location_name, lat, lon, courts, schedule, created_at
+        FROM clubs
+        WHERE ${pat}::text IS NULL OR name ILIKE ${pat} OR location_name ILIKE ${pat}
+        ORDER BY name ASC
+        LIMIT ${limit}
+      `,
+      stats ? clubStatsSql(sql) : [],
+    ]);
+    res.json(stats ? withStats(clubs, extra) : clubs);
   } catch (err) { next(err); }
 });
 
@@ -351,7 +381,8 @@ router.get('/nearby', async (req, res, next) => {
     if (isNaN(lat) || isNaN(lon)) return res.status(400).json({ error: 'lat y lon requeridos' });
 
     const sql = getDb();
-    const clubs = await sql`
+    const stats = req.query.stats === '1';
+    const [clubs, extra] = await Promise.all([sql`
       SELECT c.id, c.name, c.photo_url, c.location_name, c.lat, c.lon, c.courts,
              ROUND(
                (6371 * acos(
@@ -370,8 +401,8 @@ router.get('/nearby', async (req, res, next) => {
         )) <= ${radius}
       ORDER BY distance_km ASC
       LIMIT 20
-    `;
-    res.json(clubs);
+    `, stats ? clubStatsSql(sql) : []]);
+    res.json(stats ? withStats(clubs, extra) : clubs);
   } catch (err) { next(err); }
 });
 
