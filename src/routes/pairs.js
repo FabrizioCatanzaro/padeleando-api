@@ -6,6 +6,7 @@ import { requireTournamentManage, requirePairManage } from '../middleware/access
 import { walkoverMatchesFor, applyBracketWalkovers } from '../lib/tournamentLogic.js';
 import { scheduledIdsToCancel } from '../lib/ligaFechas.js';
 import { usaFechas, esCopa, COPA_MAX_PAIRS } from '../lib/copa.js';
+import { AMERICANO_MAX_PAIRS } from '../lib/americano.js';
 
 const router = Router();
 
@@ -50,7 +51,7 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
     }
     const sql = getDb();
 
-    // Tope del formato americano: 16 parejas.
+    // Tope del formato americano.
     const [tournament] = await sql`SELECT format, bracket FROM tournaments WHERE id = ${tournamentId}`;
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
     if (tournament.format === 'americano') {
@@ -58,8 +59,8 @@ router.post('/', requireAuth, requireTournamentManage, async (req, res, next) =>
         return res.status(400).json({ error: 'El cuadro ya fue generado: no se pueden sumar parejas' });
       }
       const [{ count }] = await sql`SELECT COUNT(*)::int AS count FROM pairs WHERE tournament_id = ${tournamentId}`;
-      if (count >= 16) {
-        return res.status(400).json({ error: 'El modo Americano admite hasta 16 parejas' });
+      if (count >= AMERICANO_MAX_PAIRS) {
+        return res.status(400).json({ error: `El modo Americano admite hasta ${AMERICANO_MAX_PAIRS} parejas` });
       }
     }
     if (tournament.format === 'copa') {
