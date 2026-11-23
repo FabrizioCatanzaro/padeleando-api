@@ -8,15 +8,17 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 
 ---
 
-## Current Status (updated 2026-11-22)
+## Current Status (updated 2026-11-23)
 
-- **Last sprint: Amistosos** — on `staging`, PR `staging` → `main` pending. Friendly 2 vs 2 matches outside any tournament that count toward the profile once the rival team accepts the result: open matches people join from `/amistosos`, played matches loaded with their result, proposals and counter-proposals, guests who claim their slot by link, reminders generated on read, the profile filter Todos / Torneos / Amistosos, an edit screen and a club-name search. Design doc: https://claude.ai/artifact/2y4oNfCD6oWt2FewGrzHC1
+- **Last sprint: Navegación por módulos** — on `staging`, PR `staging` → `main` pending (it goes together with Amistosos). Read-only endpoints for the new logged-in navigation: `/api/me/*`, `/api/padeleros/*` and `?stats=1` on clubs. No schema change. See [Me y Padeleros](#me-y-padeleros). Plan: https://claude.ai/artifact/GC9aYGdjAfUNyqHRokNKKT
+- **Previous sprint: Amistosos** — on `staging`, PR `staging` → `main` pending. Friendly 2 vs 2 matches outside any tournament that count toward the profile once the rival team accepts the result: open matches people join from `/amistosos`, played matches loaded with their result, proposals and counter-proposals, guests who claim their slot by link, reminders generated on read, the profile filter Todos / Torneos / Amistosos, an edit screen and a club-name search. Design doc: https://claude.ai/artifact/2y4oNfCD6oWt2FewGrzHC1
 - **The friendly schema reaches production with the deploy of that PR**: `db:init` creates `friendly_matches`, `friendly_match_players` and `friendly_match_proposals`, widens `notifications_type_check` and adds `uq_friendly_reminder`. It was tested on a Neon branch that has been deleted.
-- **Previous sprint: Copa** — merged to `main` (front PR #44, API PR #37). It shipped the Copa format (groups + playoffs, or direct bracket, copa de plata, prizes, per-player WhatsApp/availability), the redesigned tournament setup (`Setup.jsx`: format cards with photos, config/info sub-steps, segmented `StepBar`, one-row pair loader, summary aside), WhatsApp for the multi-day liga, and the mail domain change to `soporte@padeleando.ar` (Resend now sends from `padeleando.ar`). Design doc: https://claude.ai/artifact/X8KtqZZQamuNXRxhBDqftw
+- **Sprint before: Copa** — merged to `main` (front PR #44, API PR #37). It shipped the Copa format (groups + playoffs, or direct bracket, copa de plata, prizes, per-player WhatsApp/availability), the redesigned tournament setup (`Setup.jsx`: format cards with photos, config/info sub-steps, segmented `StepBar`, one-row pair loader, summary aside), WhatsApp for the multi-day liga, and the mail domain change to `soporte@padeleando.ar` (Resend now sends from `padeleando.ar`). Design doc: https://claude.ai/artifact/X8KtqZZQamuNXRxhBDqftw
 - **Production DB already has the Copa schema** (`copa_config`, `bracket_plata`, `pairs.zona`, `tournament_players` data columns, `court_id`, `tournament_prizes`). `db:init` re-applies it as a no-op.
 - **Local dev points at the production database** (`padeliando-api/.env`, backed up in `produccion.env`). For risky work, create a Neon branch of `production` (project `weathered-morning-55905272`), point `.env` at it, and delete the branch when done. Test data is named `TEST …` and deleted at the end.
 - **Git flow:** feature branch from `staging` → commits authored by Fabrizio Catanzaro → `merge --ff-only` into `staging` → Fabrizio pushes and opens the PR `staging` → `main`. Never commit `.claude/` or `.mcp.json`.
 - **Open items:**
+  - Navegación follow-ups: Feed and Ranking in Padeleros; unconfirmed club bookings in `/me/agenda`'s pending list once bookings ship; a player directory endpoint with a category filter.
   - Amistosos follow-ups: playing data (dominant hand, preferred side) on the user's profile; a locality filter once clubs carry their locality (`GET /friendlies/localities` is kept for it); email reminders through a scheduled GitHub Actions workflow; linking a friendly to a club booking.
   - Super tie-break as a match format (left out of the Copa sprint on purpose, "option b").
   - TV mode (`TvOverlay`) shows the main bracket only, not the copa de plata.
@@ -49,7 +51,7 @@ npm run db:migrate -- src/migration_x.sql  # apply a single loose .sql file
 npm run email                            # React Email preview server (also port 3001 — stop the API first)
 ```
 
-There is **no linter** in this repo. `npm test` runs the unit tests in `test/` (`node:test`, no dependencies); today they cover `src/lib/tournamentLogic.js` — the previa schedule, the pair standings and the americano bracket. Everything else is verified by running the API and driving the real frontend (the `run-app` skill in the frontend repo boots both).
+There is **no linter** in this repo. `npm test` runs the unit tests in `test/` (`node:test`, no dependencies); they cover the pure modules in `src/lib/` (tournament logic, americano, copa, liga, friendlies, registrations, agenda, padeleros and more). Everything else is verified by running the API and driving the real frontend (the `run-app` skill in the frontend repo boots both).
 
 ---
 
@@ -92,6 +94,9 @@ src/
                     tournamentLogic.js (previa, tabla de parejas, cuadro — pura, con tests)
                     copa.js (opciones, sorteo de zonas, tabla, siembra y cuadro de hasta 32 — pura, con tests)
                     ligaFechas.js (armado de fechas de la liga por fechas — pura, con tests)
+                    agenda.js (rango y armado de /me/agenda — pura, con tests)
+                    padeleros.js ("Jugaste con": compañeros y rivales — pura, con tests)
+                    profileQueries.js (consultas de títulos compartidas por el perfil y /me/summary)
                     cloudinary.js · deleteUser.js
   emails/           React Email templates (Layout, Welcome, VerifyEmail, ResetPassword,
                     Goodbye, AdminBroadcast)
@@ -189,6 +194,13 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - Removing a player from a played match is allowed on purpose (Fabrizio, 2026-11-21): the slot frees, the pending proposal is rejected and the match goes back to `falta_resultado`.
 - `GET /` filters by club name with `?club=` (`ILIKE`, `%` and `_` escaped). `/localities` stays for a future locality filter; the client doesn't call it.
 - No plan limit: friendlies are free for everyone.
+
+### Me y Padeleros
+
+- `routes/me.js` (all `requireAuth`) feeds the logged-in navigation. `GET /summary`: profile numbers (matches, win %, titles, counted like the profile, brackets and friendlies included) and the pending counters. `GET /agenda?from&to` (14 days by default, 62 at most): scheduled tournament matches, bracket matches with `programado`, friendlies and tournament days, plus the pending items. `GET /tournaments`: flat list of the tournaments where the user plays, manages or has a registration. `GET /organize`: managed categories with this month's quota, pending registrations per tournament and the plan. Each one is a single `Promise.all`.
+- The quota in `/organize` is the category **owner's**, like every plan gate; a co-organizer sees the owner's limits.
+- `routes/padeleros.js`: `GET /players` (`requireAuth`) returns the network counts, "Jugaste con" (top 4 by matches as partner or rival: `matches`, brackets and confirmed friendlies; a player without an account is keyed by normalized name), up to 6 suggested users (shared public tournaments, not followed yet; stats counted like the profile; "Juega en" = most frequent club of the last 6 months) and the 3 most active organizers. The suggested set is a CTE repeated in the three queries that need it, so the whole endpoint is one round of 8 queries. `GET /organizers` (`optionalAuth`): owners of public categories with a tournament in the last 90 days; with `lat`/`lon` it sorts by the closest club.
+- `GET /clubs` and `GET /clubs/nearby` accept `?stats=1`: open friendlies, `bookable` (owner + active courts), active courts, header and WhatsApp, from one extra query run in parallel. Without the flag the response is unchanged.
 
 ### HTTP behavior
 
