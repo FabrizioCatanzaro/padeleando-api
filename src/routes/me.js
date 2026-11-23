@@ -5,8 +5,24 @@ import { bracketStatsByUser, countLeagueTitles } from '../lib/profileStats.js';
 import { championCountsQuery, leagueTitleRowsQuery } from '../lib/profileQueries.js';
 import { parseAgendaRange, buildAgenda } from '../lib/agenda.js';
 import { arNow } from '../lib/friendlies.js';
+import { FREE_MAX_GROUPS, FREE_TOURNAMENTS_PER_MONTH, FREE_COPAS_PER_MONTH } from '../lib/plan.js';
 
 const router = Router();
+
+// Inscripciones pendientes de los torneos no finalizados que el usuario gestiona, agrupadas por torneo.
+function pendingRegistrationsQuery(sql, me) {
+  return sql`
+    SELECT t.id, t.name, t.group_id, COUNT(*)::int AS count
+    FROM tournament_registrations r
+    JOIN tournaments t ON t.id = r.tournament_id
+    JOIN groups g ON g.id = t.group_id
+    WHERE r.status = 'pending' AND t.status <> 'finished'
+      AND (g.user_id = ${me}
+        OR EXISTS (SELECT 1 FROM group_collaborators gc WHERE gc.group_id = g.id AND gc.user_id = ${me}))
+    GROUP BY t.id, t.name, t.group_id
+    ORDER BY MIN(r.created_at)
+  `;
+}
 
 // Resumen del usuario logueado: números del perfil y contadores de la navegación, en una sola tanda.
 router.get('/summary', requireAuth, async (req, res, next) => {
@@ -197,23 +213,113 @@ router.get('/agenda', requireAuth, async (req, res, next) => {
             OR (fm.status = 'por_confirmar' AND pr.team IS NOT NULL AND pr.team <> p.team))
         ORDER BY fm.date, fm.start_time
       `,
-      sql`
-        SELECT t.id, t.name, t.group_id, COUNT(*)::int AS count
-        FROM tournament_registrations r
-        JOIN tournaments t ON t.id = r.tournament_id
-        JOIN groups g ON g.id = t.group_id
-        WHERE r.status = 'pending' AND t.status <> 'finished'
-          AND (g.user_id = ${me}
-            OR EXISTS (SELECT 1 FROM group_collaborators gc WHERE gc.group_id = g.id AND gc.user_id = ${me}))
-        GROUP BY t.id, t.name, t.group_id
-        ORDER BY MIN(r.created_at)
-      `,
+      pendingRegistrationsQuery(sql, me),
     ]);
 
     res.json({
       from, to,
       items: buildAgenda({ scheduled, brackets, friendlies, tournaments, from, to }),
       pending: { friendlies: pendingFriendlies, registrations: pendingRegistrations },
+    });
+  } catch (err) { next(err); }
+});
+
+// Mis torneos: lista plana de los torneos donde el usuario juega, gestiona o tiene una inscripción viva.
+router.get('/tournaments', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const me = req.user.id;
+    const rows = await sql`
+      WITH mine AS (
+        SELECT t.id,
+          EXISTS (SELECT 1 FROM tournament_players tp JOIN players p ON p.id = tp.player_id
+                  WHERE tp.tournament_id = t.id AND p.user_id = ${me}) AS plays,
+          (g.user_id = ${me} OR EXISTS (SELECT 1 FROM group_collaborators gc
+                                        WHERE gc.group_id = g.id AND gc.user_id = ${me})) AS manages,
+          (SELECT r.status FROM tournament_registrations r
+           WHERE r.tournament_id = t.id AND ${me} IN (r.p1_user_id, r.p2_user_id)
+             AND r.status IN ('pending', 'approved', 'waitlist')
+           ORDER BY r.created_at DESC LIMIT 1) AS my_registration
+        FROM tournaments t
+        JOIN groups g ON g.id = t.group_id
+      )
+      SELECT t.id, t.name, t.format, t.status, t.event_date::text AS event_date,
+             to_char(t.event_time, 'HH24:MI') AS event_time, t.created_at,
+             t.group_id, g.name AS group_name, g.emojis AS group_emojis, c.name AS club_name,
+             mine.plays, mine.manages, mine.my_registration,
+             COALESCE(jsonb_typeof(t.live_match) = 'array' AND jsonb_array_length(t.live_match) > 0, false) AS live,
+             (SELECT COUNT(*)::int FROM tournament_players tp WHERE tp.tournament_id = t.id) AS player_count,
+             (SELECT COUNT(*)::int FROM matches m WHERE m.tournament_id = t.id) AS match_count,
+             EXISTS (
+               SELECT 1 FROM pairs pr
+               JOIN players p1 ON p1.id = pr.p1_id
+               JOIN players p2 ON p2.id = pr.p2_id
+               WHERE pr.tournament_id = t.id AND pr.id = (t.bracket->'final'->>'winner_id')
+                 AND ${me} IN (p1.user_id, p2.user_id)
+             ) AS won_final
+      FROM mine
+      JOIN tournaments t ON t.id = mine.id
+      JOIN groups g ON g.id = t.group_id
+      LEFT JOIN clubs c ON c.id = t.club_id
+      WHERE mine.plays OR mine.manages OR mine.my_registration IS NOT NULL
+      ORDER BY COALESCE(t.event_date, t.created_at::date) DESC, t.created_at DESC
+      LIMIT 200
+    `;
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+// Organizar: categorías que el usuario gestiona con su cupo del mes, inscripciones por aprobar y su plan.
+router.get('/organize', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const me = req.user.id;
+    const [categories, registrations, [plan]] = await Promise.all([
+      sql`
+        SELECT g.id, g.name, g.emojis, g.is_public, (g.user_id = ${me}) AS is_owner,
+               ou.username AS owner_username, ou.name AS owner_name,
+               gclub.name AS club_name, gclub.photo_url AS club_photo_url,
+               EXISTS (SELECT 1 FROM subscriptions s
+                       WHERE s.user_id = g.user_id AND s.status = 'active' AND s.plan = 'premium') AS owner_is_premium,
+               (SELECT COUNT(DISTINCT tp.player_id)::int FROM tournament_players tp
+                JOIN tournaments t ON t.id = tp.tournament_id WHERE t.group_id = g.id) AS player_count,
+               (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+               (SELECT COUNT(*)::int FROM tournaments t
+                WHERE t.group_id = g.id AND t.created_at >= date_trunc('month', now())) AS month_count,
+               (SELECT COUNT(*)::int FROM tournaments t
+                WHERE t.group_id = g.id AND t.format = 'copa' AND t.created_at >= date_trunc('month', now())) AS month_copas,
+               (SELECT COUNT(*)::int FROM group_collaborators gc WHERE gc.group_id = g.id) AS collaborator_count,
+               (SELECT json_build_object('id', t.id, 'name', t.name) FROM tournaments t
+                WHERE t.group_id = g.id AND t.status = 'active'
+                  AND jsonb_typeof(t.live_match) = 'array' AND jsonb_array_length(t.live_match) > 0
+                LIMIT 1) AS live,
+               (SELECT json_build_object('id', t.id, 'name', t.name, 'event_date', t.event_date) FROM tournaments t
+                WHERE t.group_id = g.id AND t.status = 'active'
+                ORDER BY t.event_date ASC NULLS LAST, t.created_at DESC
+                LIMIT 1) AS next
+        FROM groups g
+        JOIN users ou ON ou.id = g.user_id
+        LEFT JOIN clubs gclub ON gclub.id = g.club_id
+        WHERE g.user_id = ${me}
+           OR EXISTS (SELECT 1 FROM group_collaborators gc WHERE gc.group_id = g.id AND gc.user_id = ${me})
+        ORDER BY (g.user_id = ${me}) DESC, g.created_at DESC
+      `,
+      pendingRegistrationsQuery(sql, me),
+      sql`
+        SELECT EXISTS (SELECT 1 FROM subscriptions s
+                       WHERE s.user_id = ${me} AND s.status = 'active' AND s.plan = 'premium') AS premium,
+               (SELECT COUNT(*)::int FROM groups WHERE user_id = ${me}) AS groups_owned
+      `,
+    ]);
+    res.json({
+      categories,
+      registrations,
+      plan: {
+        ...plan,
+        max_groups: FREE_MAX_GROUPS,
+        tournaments_per_month: FREE_TOURNAMENTS_PER_MONTH,
+        copas_per_month: FREE_COPAS_PER_MONTH,
+      },
     });
   } catch (err) { next(err); }
 });
