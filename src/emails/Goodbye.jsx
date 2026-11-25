@@ -1,95 +1,49 @@
-import { Button, Heading, Section, Text } from 'react-email';
+import { Link, Text } from 'react-email';
 import Layout from './Layout.jsx';
+import { Callout, Cta, Eyebrow, Note, Title } from './parts.jsx';
+import { color, font, text } from './theme.js';
 
 export default function Goodbye({
-  name = 'jugador',
+  name = 'Alex',
   appUrl = 'https://padeleando.ar',
   surveyUrl = 'https://padeleando.ar',
 }) {
   return (
-    <Layout preview="Te vamos a extrañar 💚 Tu cuenta de Padeleando fue eliminada">
-      <Heading style={h1}>Te vamos a extrañar, {name} 💚</Heading>
+    <Layout preview="Tu cuenta de Padeleando fue eliminada. Gracias por jugar con nosotros">
+      <Eyebrow tone={color.secondary}>Cuenta eliminada</Eyebrow>
+      <Title>Te vamos a extrañar, {name}</Title>
 
-      <Text style={p}>
-        Tu cuenta de Padeleando fue eliminada y con ella tus datos personales.
-        Nos pone un poco tristes verte partir, pero queríamos despedirnos como
-        corresponde: gracias por haber sido parte de la comunidad.
+      <Text style={text.p}>
+        Tu cuenta de Padeleando fue eliminada y con ella tus datos personales. Gracias por haber
+        sido parte de la comunidad.
+      </Text>
+      <Text style={text.p}>
+        Las canchas siguen abiertas y <strong style={text.strong}>siempre hay lugar para volver</strong>.
+        El día que quieras armar otro torneo, te esperamos con la red puesta. 🎾
       </Text>
 
-      <Text style={p}>
-        Las canchas siempre están abiertas y <strong>siempre hay lugar para
-        volver</strong>. El día que quieras armar otro torneo, acá te vamos a
-        estar esperando con la red puesta. 🎾
-      </Text>
-
-      <Section style={surveyBox}>
-        <Text style={surveyLead}>
-          ¿Nos regalás un minuto? Contanos por qué te vas y qué podríamos hacer
-          mejor. Tu opinión nos ayuda a mejorar Padeleando para todos.
+      <Callout>
+        <Text style={calloutTitle}>¿Nos regalás un minuto?</Text>
+        <Text style={{ ...text.p, fontSize: '15px', lineHeight: '22px', margin: '0 0 20px' }}>
+          Contanos por qué te vas y qué podríamos mejorar. Tu opinión nos ayuda a hacer un
+          Padeleando mejor para todos.
         </Text>
-        <Button href={surveyUrl} style={button}>
-          Responder la encuesta
-        </Button>
-      </Section>
+        <Cta href={surveyUrl} style={{ margin: 0 }}>Responder encuesta</Cta>
+      </Callout>
 
-      <Text style={pMuted}>
-        Si cambiás de opinión, podés crear una cuenta nueva cuando quieras en{' '}
-        <a href={appUrl} style={link}>padeleando.ar</a>. ¡Nos vemos en la cancha!
-      </Text>
+      <Note>
+        Si cambiás de opinión, creá una cuenta nueva cuando quieras en{' '}
+        <Link href={appUrl} style={text.link}>padeleando.ar</Link>. ¡Nos vemos en la cancha!
+      </Note>
     </Layout>
   );
 }
 
-const h1 = {
-  color: '#0f172a',
-  fontSize: '22px',
-  fontWeight: 700,
-  margin: '0 0 16px',
-};
-
-const p = {
-  color: '#334155',
-  fontSize: '16px',
-  lineHeight: '24px',
-  margin: '0 0 20px',
-};
-
-const surveyBox = {
-  backgroundColor: '#f0fdf4',
-  border: '1px solid #bbf7d0',
-  borderRadius: '12px',
-  padding: '24px',
-  margin: '4px 0 8px',
-  textAlign: 'center',
-};
-
-const surveyLead = {
-  color: '#334155',
+const calloutTitle = {
+  color: color.white,
+  fontFamily: font.display,
   fontSize: '15px',
   lineHeight: '22px',
-  margin: '0 0 20px',
-};
-
-const button = {
-  backgroundColor: '#0f766e',
-  color: '#ffffff',
-  fontSize: '15px',
-  fontWeight: 600,
-  padding: '12px 24px',
-  borderRadius: '8px',
-  textDecoration: 'none',
-  display: 'inline-block',
-};
-
-const link = {
-  color: '#0f766e',
-  fontWeight: 600,
-  textDecoration: 'none',
-};
-
-const pMuted = {
-  color: '#94a3b8',
-  fontSize: '12px',
-  margin: '24px 0 0',
-  lineHeight: '18px',
+  fontWeight: 700,
+  margin: '0 0 8px',
 };

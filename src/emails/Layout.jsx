@@ -1,48 +1,48 @@
-import {
-  Body,
-  Container,
-  Head,
-  Hr,
-  Html,
-  Img,
-  Preview,
-  Section,
-  Text,
-} from 'react-email';
+import { Body, Container, Head, Html, Img, Link, Preview, Section, Text } from 'react-email';
+import { ASSETS_URL, SITE_URL, SUPPORT_EMAIL, color, font } from './theme.js';
 
-const LOGO_TEXTO = 'https://res.cloudinary.com/dm80qflwa/image/upload/v1777082473/padeleando-txt_rokifd.png';
-const LOGO_ICONO = 'https://res.cloudinary.com/dm80qflwa/image/upload/v1777081413/padeleando_lnbtop.png'
+const HEAD_CSS = `
+  :root { color-scheme: dark; supported-color-schemes: dark; }
+  @font-face { font-family: 'Albert Sans'; font-style: normal; font-weight: 400 900; src: url(${ASSETS_URL}/fonts/albert-sans-latin.woff2) format('woff2'); }
+  @font-face { font-family: 'Unbounded'; font-style: normal; font-weight: 400 900; src: url(${ASSETS_URL}/fonts/unbounded-latin.woff2) format('woff2'); }
+  .pl-rich strong { color: ${color.white}; }
+  @media (max-width: 600px) {
+    .pl-card { padding: 28px 20px !important; }
+    .pl-callout { padding: 18px !important; }
+    .pl-h1 { font-size: 21px !important; line-height: 28px !important; }
+    .pl-cta { padding: 14px 20px !important; }
+  }
+`;
 
 export default function Layout({ preview, children }) {
   return (
     <Html lang="es">
-      <Head />
+      <Head>
+        <meta name="color-scheme" content="dark" />
+        <meta name="supported-color-schemes" content="dark" />
+        <style dangerouslySetInnerHTML={{ __html: HEAD_CSS }} />
+      </Head>
       {preview ? <Preview>{preview}</Preview> : null}
       <Body style={body}>
         <Container style={container}>
           <Section style={header}>
-            <Img
-              src={LOGO_TEXTO}
-              alt="Padeleando"
-              width="160"
-              style={logo}
-            />
+            <Link href={SITE_URL}>
+              <Img src={`${ASSETS_URL}/logo-wordmark.png`} alt="Padeleando" width="200" height="31" style={wordmark} />
+            </Link>
           </Section>
-          <Section style={card}>{children}</Section>
-          <Hr style={hr} />
-          <Section style={footerSection}>
-            <Img
-              src={LOGO_ICONO}
-              alt="Padeleando"
-              width="100"
-              style={logoFooter}
-            />
-            <Text style={footer}>
-              Padeleando — tu compañero de pádel.
+
+          <Section style={accent} />
+          <Section className="pl-card" style={card}>{children}</Section>
+
+          <Section style={footer}>
+            <Img src={`${ASSETS_URL}/logo-mark.png`} alt="" width="40" height="40" style={mark} />
+            <Text style={tagline}>Tu compañero de pádel</Text>
+            <Text style={footerLinks}>
+              <Link href={SITE_URL} style={footerLink}>padeleando.ar</Link>
+              <span style={sep}>·</span>
+              <Link href={`mailto:${SUPPORT_EMAIL}`} style={footerLink}>{SUPPORT_EMAIL}</Link>
             </Text>
-            <Text style={footerSmall}>
-              Si no tenes nada que ver con el contenido de este mail, solo ignoralo.
-            </Text>
+            <Text style={footerSmall}>Si no esperabas este correo, podés ignorarlo.</Text>
           </Section>
         </Container>
       </Body>
@@ -51,11 +51,10 @@ export default function Layout({ preview, children }) {
 }
 
 const body = {
-  backgroundColor: '#f4f6f8',
-  fontFamily:
-    "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif",
+  backgroundColor: color.base,
+  fontFamily: font.body,
   margin: 0,
-  padding: '24px 0',
+  padding: '32px 0',
 };
 
 const container = {
@@ -66,48 +65,75 @@ const container = {
 
 const header = {
   textAlign: 'center',
-  padding: '16px 0',
+  padding: '0 0 28px',
 };
 
-const logo = {
+const wordmark = {
   display: 'block',
   margin: '0 auto',
-  height: 'auto',
+  border: 0,
 };
 
-const logoFooter = {
-  display: 'block',
-  margin: '0 auto 12px',
-  height: 'auto',
-  opacity: 0.7,
-};
-
-const footerSection = {
-  textAlign: 'center',
+const accent = {
+  backgroundColor: color.brand,
+  height: '4px',
+  lineHeight: '4px',
+  fontSize: '4px',
+  borderRadius: '16px 16px 0 0',
 };
 
 const card = {
-  backgroundColor: '#ffffff',
-  borderRadius: '12px',
-  padding: '32px',
-  boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
-};
-
-const hr = {
-  borderColor: '#e2e8f0',
-  margin: '24px 0 12px',
+  backgroundColor: color.surface,
+  border: `1px solid ${color.border}`,
+  borderTop: 0,
+  borderRadius: '0 0 16px 16px',
+  padding: '36px 32px',
 };
 
 const footer = {
-  color: '#64748b',
-  fontSize: '13px',
   textAlign: 'center',
-  margin: '0 0 4px',
+  padding: '32px 0 0',
+};
+
+const mark = {
+  display: 'block',
+  margin: '0 auto 12px',
+  border: 0,
+};
+
+const tagline = {
+  color: color.secondary,
+  fontFamily: font.display,
+  fontSize: '10px',
+  lineHeight: '14px',
+  fontWeight: 700,
+  letterSpacing: '2px',
+  textTransform: 'uppercase',
+  margin: '0 0 12px',
+};
+
+const footerLinks = {
+  color: color.muted,
+  fontFamily: font.body,
+  fontSize: '13px',
+  lineHeight: '20px',
+  margin: '0 0 8px',
+};
+
+const footerLink = {
+  color: color.content,
+  textDecoration: 'none',
+};
+
+const sep = {
+  color: color.muted,
+  padding: '0 8px',
 };
 
 const footerSmall = {
-  color: '#94a3b8',
+  color: color.muted,
+  fontFamily: font.body,
   fontSize: '12px',
-  textAlign: 'center',
+  lineHeight: '18px',
   margin: 0,
 };

@@ -1,32 +1,63 @@
-import { Button, Heading, Text } from 'react-email';
+import { Text } from 'react-email';
 import Layout from './Layout.jsx';
+import { Callout, Cta, Eyebrow, Title } from './parts.jsx';
+import { color, font, text } from './theme.js';
 
-const TITLE = {
-  approved: 'Inscripción aprobada',
-  waitlist: 'Inscripción en lista de espera',
-  rejected: 'Inscripción no aprobada',
+const STATUS = {
+  approved: { title: 'Inscripción aprobada', label: 'Aprobada', tone: color.green },
+  waitlist: { title: 'Estás en lista de espera', label: 'Lista de espera', tone: color.amber },
+  rejected: { title: 'Inscripción no aprobada', label: 'No aprobada', tone: color.danger },
 };
 
 export default function RegistrationDecision({
-  name = 'jugador',
-  tournamentName = 'el torneo',
+  name = 'Alex',
+  tournamentName = 'Fecha 3 (7ma Caballeros)',
   status = 'approved',
-  line = '',
+  line = 'Ya tenés un lugar en el torneo.',
   url = 'https://padeleando.ar',
 }) {
+  const s = STATUS[status] ?? { title: 'Inscripción', label: 'Inscripción', tone: color.brand };
   return (
-    <Layout preview={`${TITLE[status] ?? 'Inscripción'}: ${tournamentName}`}>
-      <Heading style={h1}>{TITLE[status] ?? 'Inscripción'}</Heading>
-      <Text style={p}>Hola {name}. Novedades de tu inscripción a <strong>{tournamentName}</strong>.</Text>
-      <Text style={p}>{line}</Text>
-      <Button href={url} style={button}>Ver el torneo</Button>
+    <Layout preview={`${s.title}: ${tournamentName}`}>
+      <Eyebrow tone={s.tone}>{s.label}</Eyebrow>
+      <Title>{s.title}</Title>
+      <Text style={text.p}>Hola, {name}. Hay novedades sobre tu inscripción.</Text>
+
+      <Callout style={{ borderLeft: `4px solid ${s.tone}` }}>
+        <Text style={kicker}>Torneo</Text>
+        <Text style={tournament}>{tournamentName}</Text>
+        {line ? <Text style={detail}>{line}</Text> : null}
+      </Callout>
+
+      <Cta href={url} style={{ margin: 0 }}>Ver el torneo</Cta>
     </Layout>
   );
 }
 
-const h1 = { color: '#0f172a', fontSize: '22px', fontWeight: 700, margin: '0 0 16px' };
-const p = { color: '#334155', fontSize: '16px', lineHeight: '24px', margin: '0 0 20px' };
-const button = {
-  backgroundColor: '#0f766e', color: '#ffffff', fontSize: '15px', fontWeight: 600,
-  padding: '12px 24px', borderRadius: '8px', textDecoration: 'none', display: 'inline-block',
+const kicker = {
+  color: color.muted,
+  fontFamily: font.display,
+  fontSize: '10px',
+  lineHeight: '14px',
+  fontWeight: 700,
+  letterSpacing: '2px',
+  textTransform: 'uppercase',
+  margin: '0 0 6px',
+};
+
+const tournament = {
+  color: color.white,
+  fontFamily: font.display,
+  fontSize: '17px',
+  lineHeight: '24px',
+  fontWeight: 700,
+  margin: 0,
+};
+
+const detail = {
+  color: color.content,
+  fontFamily: font.body,
+  fontSize: '15px',
+  lineHeight: '22px',
+  margin: '10px 0 0',
 };

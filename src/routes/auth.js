@@ -332,7 +332,7 @@ async function sendWelcomeEmail(user) {
     await resend.emails.send({
       from:    MAIL_FROM,
       to:      user.email,
-      subject: '¡Bienvenido a Padeleando! 🎾',
+      subject: '¡Te damos la bienvenida a Padeleando! 🎾',
       react:   createElement(WelcomeTemplate, { name: user.name, appUrl: process.env.FRONTEND_URL }),
     });
   } catch (err) {

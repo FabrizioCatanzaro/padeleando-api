@@ -8,6 +8,7 @@ import { deleteUserAccount } from '../lib/deleteUser.js';
 import { linkPreapprovalToUser } from './subscriptions.js';
 import { mdToHtml, personalize } from '../lib/richText.js';
 import AdminBroadcastTemplate from '../emails/AdminBroadcast.jsx';
+import { color as mailColor } from '../emails/theme.js';
 
 const resend    = new Resend(process.env.RESEND_API_KEY);
 const MAIL_FROM = process.env.MAIL_FROM || 'Padeleando <onboarding@resend.dev>';
@@ -351,7 +352,7 @@ router.post('/broadcast', async (req, res, next) => {
             subject: t,
             react:   createElement(AdminBroadcastTemplate, {
               title:    t,
-              bodyHtml: mdToHtml(personalize(b, u)),
+              bodyHtml: mdToHtml(personalize(b, u), { linkColor: mailColor.brand }),
             }),
           })
         ));
