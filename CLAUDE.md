@@ -209,6 +209,13 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - The Resend inbound webhook needs the raw body for its svix signature, so its `express.raw()` parser is mounted **before** the global `express.json()`.
 - The error handler at the bottom of `index.js` logs and returns `500 { error }`. Route handlers should `next(err)` rather than swallowing.
 
+### Emails
+
+- Every template goes through `emails/Layout.jsx`: dark brand frame, wordmark header, lime accent bar, footer with the "P" mark and support links.
+- Colors, fonts and text styles live in `emails/theme.js` (mirror of the app's dark theme). Shared pieces (`Eyebrow`, `Title`, `Cta`, `Callout`, `LinkFallback`, `Note`) live in `emails/parts.jsx`. Don't hardcode colors in a template.
+- Logos and fonts are served by the frontend from `public/email/` (`https://padeleando.ar/email/...`), PNG because Outlook and Gmail don't render WebP. Deploy the frontend before the API when they change. `vercel.json` gives `/email/*` CORS for the fonts.
+- `npm run email` previews them (stop the API first, same port).
+
 ### Notifications
 
 In-app notifications are plain `INSERT INTO notifications (id, user_id, type, actor_id, entity_id, …)` at the point of the event — there is no helper module. Follow the shape used by the nearest existing case (`collaborators.js`, `join-requests.js`, `follows.js`). The one exception is `friendly_reminder`, generated on read in `GET /notifications/count` (see Amistosos). Admin broadcasts carry a Markdown subset rendered identically in the bell and in the email (`lib/richText.js`).
