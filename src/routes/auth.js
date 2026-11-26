@@ -202,7 +202,7 @@ const PROFILE_COLUMNS = `id, email, email_verified_at, name, first_name, last_na
   nationality, birth_date, gender, doc_type, doc_number, whatsapp, whatsapp_public,
   instagram, twitter, facebook, website, hand, side,
   country, province, locality, street, street_number, postal_code, emergency_contacts,
-  (password_hash IS NOT NULL) AS has_password, (google_id IS NOT NULL) AS has_google`;
+  (password_hash IS NOT NULL) AS has_password, (google_id IS NOT NULL) AS has_google, google_email`;
 
 const withUsernameStatus = (row) => ({ ...row, username_next_change_at: usernameChangeStatus(row.username_changed_at).next_at });
 
@@ -527,6 +527,7 @@ router.post('/google', async (req, res, next) => {
         [user] = await sql`
           UPDATE users
           SET google_id = ${google_id},
+              google_email = LOWER(${email}),
               email_verified_at = COALESCE(email_verified_at, NOW())
           WHERE id = ${byEmail.id}
           RETURNING *
@@ -535,8 +536,8 @@ router.post('/google', async (req, res, next) => {
         const names = googleNames({ given_name, family_name, name });
         const username = await generateUsername(sql, `${names.first_name} ${names.last_name}`);
         [user] = await sql`
-          INSERT INTO users (id, email, google_id, first_name, last_name, username, email_verified_at)
-          VALUES (${uid()}, LOWER(${email}), ${google_id}, ${names.first_name}, ${names.last_name}, ${username}, NOW())
+          INSERT INTO users (id, email, google_id, google_email, first_name, last_name, username, email_verified_at)
+          VALUES (${uid()}, LOWER(${email}), ${google_id}, LOWER(${email}), ${names.first_name}, ${names.last_name}, ${username}, NOW())
           RETURNING *
         `;
         isNewUser = true;
@@ -811,7 +812,7 @@ router.post('/reset-password', async (req, res, next) => {
 router.patch('/me', requireAuth, async (req, res, next) => {
   try {
     const body = req.body;
-    const { username, current_password, new_password, advanced_stats_public, onboarding_role, category, level_score } = body;
+    const { username, advanced_stats_public, onboarding_role, category, level_score } = body;
     const sql = getDb();
 
     const [user] = await sql`SELECT * FROM users WHERE id = ${req.user.id}`;
@@ -887,17 +888,6 @@ router.patch('/me', requireAuth, async (req, res, next) => {
       updates.level_score = level_score === null ? null : Math.round(level_score * 10) / 10;
     }
 
-    if (new_password !== undefined) {
-      if (!current_password)
-        return res.status(400).json({ error: 'Ingresá tu contraseña actual' });
-      const valid = await bcrypt.compare(current_password, user.password_hash);
-      if (!valid)
-        return res.status(400).json({ error: 'La contraseña actual es incorrecta' });
-      const pwError = validatePassword(new_password);
-      if (pwError) return res.status(400).json({ error: pwError });
-      updates.password_hash = await bcrypt.hash(new_password, 10);
-    }
-
     if ('emergency_contacts' in updates) updates.emergency_contacts = JSON.stringify(updates.emergency_contacts);
 
     const keys = Object.keys(updates);
@@ -925,6 +915,42 @@ router.patch('/me', requireAuth, async (req, res, next) => {
     );
 
     res.json(withUsernameStatus(updated));
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/auth/me/google ─────────────────────────────────────────────────
+// Conecta una cuenta de Google a la sesión; puede tener otro email si nadie más la usa.
+router.post('/me/google', requireAuth, async (req, res, next) => {
+  try {
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({ idToken: req.body?.credential, audience: process.env.GOOGLE_CLIENT_ID });
+      payload = ticket.getPayload();
+    } catch {
+      return res.status(400).json({ error: 'No pudimos validar la cuenta de Google' });
+    }
+    const sql = getDb();
+    const [updated] = await sql`
+      UPDATE users SET google_id = ${payload.sub}, google_email = LOWER(${payload.email})
+      WHERE id = ${req.user.id}
+        AND NOT EXISTS (SELECT 1 FROM users o WHERE o.google_id = ${payload.sub} AND o.id <> ${req.user.id})
+      RETURNING google_email
+    `;
+    if (!updated) return res.status(409).json({ error: 'Esa cuenta de Google ya está conectada a otro usuario' });
+    res.json({ has_google: true, google_email: updated.google_email });
+  } catch (err) { next(err); }
+});
+
+// ── DELETE /api/auth/me/google ───────────────────────────────────────────────
+router.delete('/me/google', requireAuth, async (req, res, next) => {
+  try {
+    const [updated] = await getDb()`
+      UPDATE users SET google_id = NULL, google_email = NULL
+      WHERE id = ${req.user.id} AND password_hash IS NOT NULL
+      RETURNING id
+    `;
+    if (!updated) return res.status(409).json({ error: 'Creá una contraseña antes de desconectar Google: si no, no vas a poder entrar' });
+    res.json({ has_google: false, google_email: null });
   } catch (err) { next(err); }
 });
 

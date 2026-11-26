@@ -926,6 +926,10 @@ BEGIN
 END $$;
 ALTER TABLE users DROP COLUMN IF EXISTS bio;
 
+-- Email de la cuenta de Google conectada; las vinculadas antes se conectaron por coincidencia de email.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS google_email TEXT;
+UPDATE users SET google_email = email WHERE google_id IS NOT NULL AND google_email IS NULL;
+
 -- Un @username dejado queda reservado 90 días para su dueño y redirige al nuevo.
 CREATE TABLE IF NOT EXISTS username_history (
   username    TEXT PRIMARY KEY,
