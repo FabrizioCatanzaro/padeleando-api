@@ -15,7 +15,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       SELECT t.*, u.username AS owner_username,
              u.name          AS owner_name,
              u.avatar_url    AS owner_avatar_url,
-             u.social_links  AS owner_social_links,
+             json_build_object('whatsapp', CASE WHEN u.whatsapp_public THEN u.whatsapp END, 'instagram', u.instagram) AS owner_profile,
              g.name          AS group_name,
              -- La vista de espectador pedía esto en una segunda llamada a
              -- /groups/:id/meta que sólo podía salir cuando ya había respondido
@@ -168,7 +168,7 @@ router.get('/:tournamentId', async (req, res, next) => {
         signup_capacity_unit: tournament.group_signup_capacity_unit,
         signup_closes_at:     tournament.group_signup_closes_at,
         rules:                tournament.group_rules,
-      }, tournament.owner_social_links), { format: tournament.format, used: await countUsedPlayers(sql, tournamentId) }),
+      }, tournament.owner_profile), { format: tournament.format, used: await countUsedPlayers(sql, tournamentId) }),
       // El plantel queda oculto hasta que empieza el torneo (Fabri, 2026-11-09).
       players:           rosterHidden ? [] : players,
       pairs:             rosterHidden ? [] : pairs,

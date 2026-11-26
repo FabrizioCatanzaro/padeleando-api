@@ -65,7 +65,7 @@ router.get('/', async (req, res, next) => {
         SELECT t.id, t.name, t.status, t.format, t.mode, t.event_date, t.event_time,
                g.id AS group_id, g.name AS group_name, g.emojis AS group_emojis,
                u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
-               u.social_links AS owner_social_links,
+               json_build_object('whatsapp', CASE WHEN u.whatsapp_public THEN u.whatsapp END, 'instagram', u.instagram) AS owner_profile,
                c.id AS club_id, c.name AS club_name, c.photo_url AS club_photo_url, c.location_name AS club_location_name,
                t.signup_price, t.signup_price_unit, t.signup_contacts,
                g.signup_price      AS group_signup_price,
@@ -137,7 +137,7 @@ router.get('/', async (req, res, next) => {
         signup: resolveSignup(
           { signup_open: true, signup_price: t.signup_price, signup_price_unit: t.signup_price_unit, signup_contacts: t.signup_contacts },
           { signup_price: t.group_signup_price, signup_price_unit: t.group_signup_price_unit, signup_contacts: t.group_signup_contacts },
-          t.owner_social_links,
+          t.owner_profile,
         ),
       })),
       featured,

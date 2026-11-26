@@ -2,6 +2,7 @@
 // `level` (categoría del torneo, ver lib/category.js) viaja con la inscripción
 // porque se configura en el mismo lugar y se hereda igual.
 import { parseLevel } from './category.js';
+import { profileContacts } from './profile.js';
 
 export const CONTACT_TYPES = ['whatsapp', 'phone', 'email', 'instagram'];
 
@@ -115,29 +116,6 @@ export function parseSignupFields(body) {
   return out;
 }
 
-/** Redes del perfil que puede ver otra persona: sin las marcadas como privadas. */
-export function publicSocialLinks(socialLinks) {
-  return Array.isArray(socialLinks) ? socialLinks.filter((l) => l?.private !== true) : socialLinks;
-}
-
-// El perfil guarda la url en formatos irregulares; no se inventa el país que falte.
-export function profileContacts(socialLinks) {
-  if (!Array.isArray(socialLinks)) return [];
-  const out = [];
-  for (const link of publicSocialLinks(socialLinks)) {
-    const url = String(link?.url ?? '').trim();
-    if (!url) continue;
-    if (link.network === 'whatsapp') {
-      const digits = (url.match(/wa\.me\/(\d+)/)?.[1] ?? url).replace(/\D/g, '');
-      if (digits) out.push({ type: 'whatsapp', value: `+${digits}`, from_profile: true });
-    } else if (link.network === 'instagram') {
-      const handle = url.replace(/^https?:\/\/(www\.)?instagram\.com\//i, '').replace(/[/?#].*$/, '').replace(/^@/, '');
-      if (handle) out.push({ type: 'instagram', value: `@${handle}`, from_profile: true });
-    }
-  }
-  return out;
-}
-
 // Los del perfil primero, y los cargados a mano pisan su canal.
 export function mergeContacts(profile, own) {
   const ownTypes = new Set((own ?? []).map((c) => c.type));
@@ -145,13 +123,13 @@ export function mergeContacts(profile, own) {
 }
 
 // Lo de la jornada, o lo de la categoría; los contactos suman los del perfil.
-export function resolveSignup(tournament, group, ownerSocialLinks = null) {
+export function resolveSignup(tournament, group, ownerProfile = null) {
   const pick = (k) => (tournament?.[k] ?? group?.[k] ?? null);
   return {
     open:     pick('signup_open') ?? false,
     price:    pick('signup_price'),
     unit:     pick('signup_price_unit') ?? 'player',
-    contacts: mergeContacts(profileContacts(ownerSocialLinks), pick('signup_contacts') ?? []),
+    contacts: mergeContacts(profileContacts(ownerProfile), pick('signup_contacts') ?? []),
     level:    pick('level'),
     capacity:      pick('signup_capacity'),
     capacity_unit: pick('signup_capacity_unit') ?? 'pair',

@@ -8,7 +8,8 @@ import { uid }              from '../uid.js';
 export const ANON_ID       = 'deleted-account';
 export const ANON_USERNAME = 'cuenta_eliminada';
 const ANON_EMAIL    = 'cuenta-eliminada@padeleando.local';
-const ANON_NAME     = 'Cuenta eliminada';
+const ANON_FIRST    = 'Cuenta';
+const ANON_LAST     = 'eliminada';
 
 // get-or-create de la cuenta anónima. Idempotente.
 async function getAnonUserId(sql) {
@@ -18,8 +19,8 @@ async function getAnonUserId(sql) {
   if (existing) return existing.id;
 
   const [created] = await sql`
-    INSERT INTO users (id, email, name, username, role, email_verified_at)
-    VALUES (${ANON_ID}, ${ANON_EMAIL}, ${ANON_NAME}, ${ANON_USERNAME}, 'user', NOW())
+    INSERT INTO users (id, email, first_name, last_name, username, role, email_verified_at)
+    VALUES (${ANON_ID}, ${ANON_EMAIL}, ${ANON_FIRST}, ${ANON_LAST}, ${ANON_USERNAME}, 'user', NOW())
     ON CONFLICT (id) DO NOTHING
     RETURNING id
   `;

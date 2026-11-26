@@ -8,8 +8,9 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 
 ---
 
-## Current Status (updated 2026-11-23)
+## Current Status (updated 2026-11-26)
 
+- **In progress: Perfil** — branch `feat/perfil` (both repos). Stage 2 of 5 (schema + API) done; the profile page and its edit page come next. See [Perfil](#perfil). Spec: Project doc `claude/perfil-rediseno-spec.md`, mockups: https://claude.ai/artifact/3EXHdQ9P3uexvEc99tTa8U
 - **Last sprint: Navegación por módulos** — on `staging`, PR `staging` → `main` pending. The same PR carries the americano from 4 to 32 pairs. Read-only endpoints for the new logged-in navigation: `/api/me/*`, `/api/padeleros/*` and `?stats=1` on clubs. No schema change. See [Me y Padeleros](#me-y-padeleros). Plan: https://claude.ai/artifact/GC9aYGdjAfUNyqHRokNKKT
 - **Previous sprint: Amistosos** — merged to `main` (front PR #45, API PR #38). Friendly 2 vs 2 matches outside any tournament that count toward the profile once the rival team accepts the result: open matches people join from `/amistosos`, played matches loaded with their result, proposals and counter-proposals, guests who claim their slot by link, reminders generated on read, the profile filter Todos / Torneos / Amistosos, an edit screen and a club-name search. Design doc: https://claude.ai/artifact/2y4oNfCD6oWt2FewGrzHC1
 - **The friendly schema is in production since that deploy**: `db:init` creates `friendly_matches`, `friendly_match_players` and `friendly_match_proposals`, widens `notifications_type_check` and adds `uq_friendly_reminder`. It was tested on a Neon branch that has been deleted.
@@ -194,6 +195,15 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - Removing a player from a played match is allowed on purpose (Fabrizio, 2026-11-21): the slot frees, the pending proposal is rejected and the match goes back to `falta_resultado`.
 - `GET /` filters by club name with `?club=` (`ILIKE`, `%` and `_` escaped). `/localities` stays for a future locality filter; the client doesn't call it.
 - No plan limit: friendlies are free for everyone.
+
+### Perfil
+
+- `users.name` is a **generated column** (`first_name || ' ' || last_name`): never write it. Every INSERT/UPDATE writes `first_name` and `last_name`; reads keep using `name`.
+- Personal data lives in `users`: `nationality`, `birth_date`, `gender`, `doc_type`/`doc_number`, `whatsapp` + `whatsapp_public`, `instagram`/`twitter`/`facebook`/`website` (handles without @), `hand`, `side`, the address (`country` … `postal_code`) and `emergency_contacts` (JSONB, up to 2). `bio` and `social_links` are gone. Every rule lives in `lib/profile.js`, with tests.
+- **Who sees what.** The public profile (`publicProfileFields`) shows age, never the birth date; WhatsApp only when public and the viewer has a session. Document, gender, birth date, address, contacts and WhatsApp go to managers of a category where the user has a linked slot or a pending/approved/waitlist registration: `GET /api/groups/:groupId/players/:userId/ficha`, one query, `no-store`.
+- The session (`/auth/me`, login, refresh, Google) carries `sessionUser`: no document, address or contacts, because the client keeps it in localStorage. The edit page reads `GET /auth/me/profile`; `PATCH /auth/me` answers with the same full shape.
+- Gender locks on the first save (409 after); `PATCH /api/admin/users/:id/gender` corrects it. Username: one change every 90 days, the first free (`username_changed_at`); the old one stays in `username_history` for 90 days, reserved for its owner, and `GET /groups/user/:old` answers 404 with `moved_to`. `POST /api/admin/users/:id/allow-username-change` clears the wait.
+- Organizer contacts for signups come from `owner_profile` (`{ whatsapp, instagram }`, WhatsApp only when public), built in SQL wherever `owner_social_links` used to be.
 
 ### Me y Padeleros
 

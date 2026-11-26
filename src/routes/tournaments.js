@@ -6,7 +6,7 @@ import { requireGroupManage, requireTournamentManage } from '../middleware/acces
 import { uploadTournamentPhoto } from '../middleware/upload.js';
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { canManageGroup } from '../lib/access.js';
-import { parseSignupFields, resolveSignup, publicSocialLinks } from '../lib/signup.js';
+import { parseSignupFields, resolveSignup } from '../lib/signup.js';
 import { tournamentQuotaError } from '../lib/plan.js';
 import {
   generatePreviaSchedule, computeStandings,
@@ -83,7 +83,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              g.signup_capacity_unit AS group_signup_capacity_unit,
              g.signup_closes_at     AS group_signup_closes_at,
              g.rules                AS group_rules,
-             ow.social_links     AS owner_social_links,
+             json_build_object('whatsapp', CASE WHEN ow.whatsapp_public THEN ow.whatsapp END, 'instagram', ow.instagram) AS owner_profile,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
@@ -104,7 +104,6 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       WHERE t.id = ${id}
     `;
     if (!tournament) return res.status(404).json({ error: 'Torneo no encontrado' });
-    tournament.owner_social_links = publicSocialLinks(tournament.owner_social_links);
 
     const pairs = await sql`SELECT * FROM pairs WHERE tournament_id = ${id} ORDER BY id`;
 
@@ -195,7 +194,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       signup_capacity_unit: tournament.group_signup_capacity_unit,
       signup_closes_at:     tournament.group_signup_closes_at,
       rules:                tournament.group_rules,
-    }, tournament.owner_social_links);
+    }, tournament.owner_profile);
 
     // Datos por jugador y premios: los agregan la copa y la liga por fechas.
     const conDatos = usaFechas(tournament) || esCopa(tournament);

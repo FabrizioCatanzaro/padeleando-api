@@ -6,7 +6,8 @@ import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { ANON_ID } from '../lib/deleteUser.js';
 import { championCountsQuery, leagueTitleRowsQuery } from '../lib/profileQueries.js';
-import { publicSocialLinks, parseSignupFields } from '../lib/signup.js';
+import { parseSignupFields } from '../lib/signup.js';
+import { publicProfileFields, ageFrom } from '../lib/profile.js';
 import { groupQuotaError } from '../lib/plan.js';
 import { comparePairRows } from '../lib/tournamentLogic.js';
 import { hasStarted } from '../lib/registrations.js';
@@ -170,7 +171,9 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const [owner] = await sql`
-      SELECT u.id, u.name, u.username, u.avatar_url, u.created_at, u.social_links, u.bio,
+      SELECT u.id, u.name, u.first_name, u.last_name, u.username, u.avatar_url, u.created_at,
+             u.nationality, u.birth_date, u.hand, u.side, u.instagram, u.twitter, u.facebook, u.website,
+             u.whatsapp, u.whatsapp_public,
              u.advanced_stats_public, u.category,
              EXISTS (
                SELECT 1 FROM subscriptions s
@@ -179,12 +182,17 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
       FROM users u
       WHERE u.username = ${req.params.username}
     `;
-    if (!owner) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (!owner) {
+      const [moved] = await sql`
+        SELECT u.username FROM username_history h JOIN users u ON u.id = h.user_id
+        WHERE h.username = ${req.params.username} AND h.released_at > NOW() - INTERVAL '90 days'
+      `;
+      return res.status(404).json({ error: 'Usuario no encontrado', ...(moved && { moved_to: moved.username }) });
+    }
     // La cuenta anónima que hereda torneos huérfanos no tiene perfil público.
     if (owner.id === ANON_ID) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     const isOwner  = req.user?.id === owner.id;
-    if (!isOwner) owner.social_links = publicSocialLinks(owner.social_links);
     const viewerId = req.user?.id ?? null;
     // Sólo tiene sentido preguntar por el seguimiento si mira otra persona.
     const followerId = isOwner ? null : viewerId;
@@ -812,7 +820,10 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     const showAdvanced = isOwner || (owner.advanced_stats_public === true && isPremium);
 
     // `has_premium_row` es un detalle interno de la decisión de arriba.
-    const { has_premium_row: _hasPremiumRow, ...ownerFields } = owner;
+    const {
+      has_premium_row: _hasPremiumRow, birth_date: _birthDate, whatsapp: _whatsapp, whatsapp_public: _whatsappPublic,
+      instagram: _instagram, twitter: _twitter, facebook: _facebook, website: _website, ...ownerFields
+    } = owner;
 
     // Lo que queda fuera del perfil cuando las avanzadas son privadas. El resto
     // de baseStats (torneos, partidos, victorias, torneos_este_mes...) es lo que
@@ -834,6 +845,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
     res.json({
       owner: {
         ...ownerFields,
+        ...publicProfileFields(owner, { viewerId, isOwner }),
         is_premium:      isPremium,
         followers_count: follows.followers_count,
         following_count: follows.following_count,
@@ -1032,6 +1044,34 @@ router.get('/:groupId/history', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /api/groups/:groupId/players/:userId/ficha — datos del jugador para quien organiza la categoría.
+router.get('/:groupId/players/:userId/ficha', requireAuth, async (req, res, next) => {
+  try {
+    const { groupId, userId } = req.params;
+    const sql = getDb();
+    const [row] = await sql`
+      SELECT (g.user_id = ${req.user.id} OR EXISTS (
+                SELECT 1 FROM group_collaborators gc WHERE gc.group_id = g.id AND gc.user_id = ${req.user.id})) AS can_manage,
+             u.id, u.name, u.first_name, u.last_name, u.username, u.avatar_url, u.category, u.hand, u.side,
+             u.nationality, u.birth_date, u.gender, u.doc_type, u.doc_number, u.whatsapp,
+             u.country, u.province, u.locality, u.street, u.street_number, u.postal_code, u.emergency_contacts,
+             (EXISTS (SELECT 1 FROM players p JOIN group_players gp ON gp.player_id = p.id
+                       WHERE gp.group_id = g.id AND p.user_id = u.id)
+              OR EXISTS (SELECT 1 FROM tournament_registrations r JOIN tournaments t ON t.id = r.tournament_id
+                          WHERE t.group_id = g.id AND r.status IN ('pending', 'approved', 'waitlist')
+                            AND (r.p1_user_id = u.id OR r.p2_user_id = u.id))) AS in_group
+      FROM groups g
+      LEFT JOIN users u ON u.id = ${userId}
+      WHERE g.id = ${groupId}
+    `;
+    if (!row) return res.status(404).json({ error: 'Categoría no encontrada' });
+    if (!row.can_manage) return res.status(403).json({ error: 'Sin permiso' });
+    if (!row.id || !row.in_group) return res.status(404).json({ error: 'Ese jugador no está en la categoría' });
+    const { can_manage: _canManage, in_group: _inGroup, ...ficha } = row;
+    res.json({ ...ficha, age: ageFrom(ficha.birth_date) });
+  } catch (err) { next(err); }
+});
+
 // GET /api/groups/:groupId
 router.get('/:groupId', optionalAuth, async (req, res, next) => {
   try {
@@ -1044,7 +1084,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     const [[group], tournaments, collaborators] = await Promise.all([
     sql`
       SELECT g.*, u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
-             u.social_links AS owner_social_links,
+             json_build_object('whatsapp', CASE WHEN u.whatsapp_public THEN u.whatsapp END, 'instagram', u.instagram) AS owner_profile,
              c.name AS club_name, c.location_name AS club_location_name, c.photo_url AS club_photo_url,
              c.courts AS club_courts,
              cr.name AS pending_club_name,
@@ -1090,7 +1130,6 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     ]);
 
     if (!group) return res.status(404).json({ error: 'Grupo no encontrado' });
-    group.owner_social_links = publicSocialLinks(group.owner_social_links);
     // Los partidos del cuadro no están en `matches`: se suman para que coincida con el torneo.
     for (const t of tournaments) {
       t.match_count += countBracketPlayed(t.bracket) + countBracketPlayed(t.bracket_plata);

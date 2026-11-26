@@ -5,6 +5,7 @@ import { getDb }    from '../db.js';
 import { uid }      from '../uid.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
 import { deleteUserAccount } from '../lib/deleteUser.js';
+import { GENDERS } from '../lib/profile.js';
 import { linkPreapprovalToUser } from './subscriptions.js';
 import { mdToHtml, personalize } from '../lib/richText.js';
 import AdminBroadcastTemplate from '../emails/AdminBroadcast.jsx';
@@ -65,7 +66,7 @@ router.get('/users', async (req, res, next) => {
     const users = await sql`
       SELECT
         u.id, u.email, u.name, u.username, u.avatar_url, u.role,
-        u.email_verified_at, u.created_at,
+        u.email_verified_at, u.created_at, u.gender, u.username_changed_at,
         sub.plan           AS plan,
         sub.billing_period AS billing_period,
         sub.ends_at        AS plan_ends_at,
@@ -250,6 +251,27 @@ router.post('/users/:id/revoke-premium', async (req, res, next) => {
     `;
 
     res.json({ ok: true, cancelled: result.length ?? result.count ?? 0 });
+  } catch (err) { next(err); }
+});
+
+// ── PATCH /api/admin/users/:id/gender ───────────────────────────────────────
+// El usuario no puede cambiarlo después de guardarlo; lo corrige el admin.
+router.patch('/users/:id/gender', async (req, res, next) => {
+  try {
+    const gender = req.body.gender || null;
+    if (gender !== null && !GENDERS.includes(gender)) return res.status(400).json({ error: 'Género inválido' });
+    const [u] = await getDb()`UPDATE users SET gender = ${gender} WHERE id = ${req.params.id} RETURNING id, gender`;
+    if (!u) return res.status(404).json({ error: 'Usuario no encontrado' });
+    res.json(u);
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/admin/users/:id/allow-username-change ─────────────────────────
+router.post('/users/:id/allow-username-change', async (req, res, next) => {
+  try {
+    const [u] = await getDb()`UPDATE users SET username_changed_at = NULL WHERE id = ${req.params.id} RETURNING id`;
+    if (!u) return res.status(404).json({ error: 'Usuario no encontrado' });
+    res.json({ ok: true });
   } catch (err) { next(err); }
 });
 

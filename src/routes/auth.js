@@ -12,12 +12,13 @@ import WelcomeTemplate       from '../emails/Welcome.jsx';
 import GoodbyeTemplate       from '../emails/Goodbye.jsx';
 import { getDb }         from '../db.js';
 import { uid }           from '../uid.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { uploadAvatar } from '../middleware/upload.js';
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { deleteUserAccount, ANON_ID } from '../lib/deleteUser.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { parseCategory } from '../lib/category.js';
+import { parseNamePart, parseProfileUpdate, ProfileError, usernameChangeStatus, splitLegacyName, googleNames } from '../lib/profile.js';
 
 const router       = Router();
 const SECRET       = process.env.JWT_SECRET;
@@ -106,20 +107,14 @@ async function generateUsername(sql, name, excludeId = null) {
   // El nombre admite hasta NAME_MAX pero el username tope 20, así que hay que
   // recortar la base. Se reservan 4 chars para el sufijo `_2`, `_10`… que se
   // agrega cuando el candidato ya está tomado.
-  const base = name.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+  const base = name.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
     .slice(0, 16).replace(/_+$/, '');
   let candidate = base || 'user';
   let i = 2;
   while (true) {
     // Un @username ocupado por una cuenta fantasma cuenta como libre: el registro
     // la va a reclamar. Si no, se sugeriría `fabri_2` teniendo `fabri` muerto.
-    const [ex] = excludeId
-      ? await sql.query(
-          `SELECT u.id FROM users u WHERE u.username = $1 AND u.id != $2 AND ${ACCOUNT_REACHABLE}`,
-          [candidate, excludeId])
-      : await sql.query(
-          `SELECT u.id FROM users u WHERE u.username = $1 AND ${ACCOUNT_REACHABLE}`,
-          [candidate]);
+    const [ex] = await sql.query(USERNAME_TAKEN, [candidate, excludeId]);
     if (!ex) return candidate;
     candidate = `${base}_${i++}`;
   }
@@ -186,6 +181,39 @@ const ACCOUNT_REACHABLE = `(
     OR EXISTS (SELECT 1 FROM email_verifications ev
                 WHERE ev.user_id = u.id AND ev.used = false AND ev.expires_at > NOW())
   )`;
+
+// Ocupado por una cuenta alcanzable o reservado 90 días por quien lo dejó. $2 = cuenta que no cuenta (o null).
+const USERNAME_TAKEN = `
+  SELECT 1 FROM users u WHERE u.username = $1 AND u.id IS DISTINCT FROM $2 AND ${ACCOUNT_REACHABLE}
+  UNION ALL
+  SELECT 1 FROM username_history h
+   WHERE h.username = $1 AND h.user_id IS DISTINCT FROM $2 AND h.released_at > NOW() - INTERVAL '90 days'
+  LIMIT 1`;
+
+const SESSION_FIELDS = [
+  'id', 'email', 'name', 'first_name', 'last_name', 'username', 'avatar_url', 'role', 'created_at',
+  'onboarding_role', 'category', 'whatsapp', 'whatsapp_public', 'instagram', 'hand', 'side',
+];
+// Lo que viaja en la sesión y queda en localStorage: sin documento, domicilio ni contactos.
+const sessionUser = (row) => Object.fromEntries(SESSION_FIELDS.map((k) => [k, row[k] ?? null]));
+
+const PROFILE_COLUMNS = `id, email, email_verified_at, name, first_name, last_name, username, username_changed_at,
+  avatar_url, role, created_at, onboarding_role, category, level_score, advanced_stats_public,
+  nationality, birth_date, gender, doc_type, doc_number, whatsapp, whatsapp_public,
+  instagram, twitter, facebook, website, hand, side,
+  country, province, locality, street, street_number, postal_code, emergency_contacts,
+  (password_hash IS NOT NULL) AS has_password, (google_id IS NOT NULL) AS has_google`;
+
+const withUsernameStatus = (row) => ({ ...row, username_next_change_at: usernameChangeStatus(row.username_changed_at).next_at });
+
+function readNames(body) {
+  if (body.first_name !== undefined || body.last_name !== undefined) {
+    return { first_name: parseNamePart(body.first_name, 'El nombre'), last_name: parseNamePart(body.last_name, 'El apellido') };
+  }
+  const err = validateUser(body.name);
+  if (err) throw new ProfileError(err);
+  return splitLegacyName(body.name);
+}
 
 // ── Bloqueo por intentos fallidos ────────────────────────────────────────────
 // Se bloquea a los 5 fallos dentro de una ventana deslizante de 15 min,
@@ -362,9 +390,9 @@ async function sendGoodbyeEmail(user) {
 // ── POST /api/auth/register ───────────────────────────────────────────────────
 router.post('/register', async (req, res, next) => {
   try {
-    const { email, password, name } = req.body;
-    if (!email || !password || !name)
-      return res.status(400).json({ error: 'Email, Contraseña y Nombre son requeridos' });
+    const { email, password } = req.body;
+    if (!email || !password || (!req.body.name && !req.body.first_name))
+      return res.status(400).json({ error: 'Email, contraseña, nombre y apellido son requeridos' });
 
     // Todas las validaciones sincrónicas van antes de tocar la base: más abajo el
     // alta puede borrar una cuenta fantasma, y eso no debe pasar si el registro
@@ -372,8 +400,9 @@ router.post('/register', async (req, res, next) => {
     const pwError = validatePassword(password);
     if (pwError) return res.status(400).json({ error: pwError });
 
-    const userError = validateUser(name);
-    if (userError) return res.status(400).json({ error: userError });
+    let names;
+    try { names = readNames(req.body); }
+    catch (e) { if (e instanceof ProfileError) return res.status(e.status).json({ error: e.message }); throw e; }
 
     // Username: el elegido por el usuario (si lo envió) o uno generado del nombre
     let wantedUsername = null;
@@ -388,19 +417,24 @@ router.post('/register', async (req, res, next) => {
 
     // Email y @username se consultan juntos: son independientes y cada tagged
     // template es una ida a São Paulo.
-    const conflicts = await sql.query(
-      `SELECT u.id, u.email, u.username, ${ACCOUNT_REACHABLE} AS reachable
-         FROM users u
-        WHERE u.email = $1 OR u.username = $2`,
-      [emailLc, wantedUsername ?? '']
-    );
+    const [conflicts, reserved] = await Promise.all([
+      sql.query(
+        `SELECT u.id, u.email, u.username, ${ACCOUNT_REACHABLE} AS reachable
+           FROM users u
+          WHERE u.email = $1 OR u.username = $2`,
+        [emailLc, wantedUsername ?? '']
+      ),
+      wantedUsername
+        ? sql.query(`SELECT 1 FROM username_history WHERE username = $1 AND released_at > NOW() - INTERVAL '90 days'`, [wantedUsername])
+        : [],
+    ]);
 
     const byEmail = conflicts.find(u => u.email === emailLc);
     const byName  = wantedUsername ? conflicts.find(u => u.username === wantedUsername) : null;
 
     if (byEmail?.reachable)
       return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Intente recuperar la contraseña si no la recuerda.' });
-    if (byName?.reachable)
+    if (byName?.reachable || reserved.length)
       return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso' });
 
     const password_hash = await bcrypt.hash(password, 10);
@@ -415,11 +449,11 @@ router.post('/register', async (req, res, next) => {
 
     // Después del borrado: si el fantasma ocupaba el username derivado del nombre,
     // recién ahora está libre y generateUsername lo puede devolver limpio.
-    const username = wantedUsername ?? await generateUsername(sql, name);
+    const username = wantedUsername ?? await generateUsername(sql, `${names.first_name} ${names.last_name}`);
 
     const [user] = await sql`
-      INSERT INTO users (id, email, password_hash, name, username)
-      VALUES (${uid()}, ${emailLc}, ${password_hash}, ${name.trim()}, ${username})
+      INSERT INTO users (id, email, password_hash, first_name, last_name, username)
+      VALUES (${uid()}, ${emailLc}, ${password_hash}, ${names.first_name}, ${names.last_name}, ${username})
       RETURNING id, email, name, username, avatar_url, created_at
     `;
 
@@ -461,7 +495,7 @@ router.post('/login', loginLimiter, async (req, res, next) => {
 
     await clearLoginAttempts(sql, email);
 
-    const { password_hash, ...safeUser } = user;
+    const safeUser = sessionUser(user);
     const refreshToken = setAuthCookies(res, safeUser);
     await saveRefreshToken(sql, user.id, refreshToken);
 
@@ -481,7 +515,7 @@ router.post('/google', async (req, res, next) => {
       idToken:  credential,
       audience: process.env.GOOGLE_CLIENT_ID,
     });
-    const { sub: google_id, email, name } = ticket.getPayload();
+    const { sub: google_id, email, name, given_name, family_name } = ticket.getPayload();
 
     const sql = getDb();
     let [user] = await sql`SELECT * FROM users WHERE google_id = ${google_id}`;
@@ -495,20 +529,21 @@ router.post('/google', async (req, res, next) => {
           SET google_id = ${google_id},
               email_verified_at = COALESCE(email_verified_at, NOW())
           WHERE id = ${byEmail.id}
-          RETURNING id, email, name, username, avatar_url, created_at
+          RETURNING *
         `;
       } else {
-        const username = await generateUsername(sql, name);
+        const names = googleNames({ given_name, family_name, name });
+        const username = await generateUsername(sql, `${names.first_name} ${names.last_name}`);
         [user] = await sql`
-          INSERT INTO users (id, email, google_id, name, username, email_verified_at)
-          VALUES (${uid()}, LOWER(${email}), ${google_id}, ${name}, ${username}, NOW())
-          RETURNING id, email, name, username, avatar_url, created_at
+          INSERT INTO users (id, email, google_id, first_name, last_name, username, email_verified_at)
+          VALUES (${uid()}, LOWER(${email}), ${google_id}, ${names.first_name}, ${names.last_name}, ${username}, NOW())
+          RETURNING *
         `;
         isNewUser = true;
       }
     }
 
-    const { password_hash, ...safeUser } = user;
+    const safeUser = sessionUser(user);
     const refreshToken = setAuthCookies(res, safeUser);
     await saveRefreshToken(sql, user.id, refreshToken);
 
@@ -540,10 +575,9 @@ router.post('/refresh', async (req, res, next) => {
     // Rotar — borrar el viejo, crear uno nuevo
     await sql`DELETE FROM refresh_tokens WHERE id = ${stored.id}`;
 
-    const [user] = await sql`
-      SELECT id, email, name, username, avatar_url, role FROM users WHERE id = ${stored.user_id}
-    `;
-    if (!user) return res.status(401).json({ error: 'Usuario no encontrado' });
+    const [row] = await sql`SELECT * FROM users WHERE id = ${stored.user_id}`;
+    if (!row) return res.status(401).json({ error: 'Usuario no encontrado' });
+    const user = sessionUser(row);
 
     const newRefreshToken = setAuthCookies(res, user);
     await saveRefreshToken(sql, user.id, newRefreshToken);
@@ -579,16 +613,23 @@ router.get('/me', async (req, res, next) => {
     const { id } = jwt.verify(token, SECRET);
     const sql = getDb();
     const [[user], subscription, ownedClubs] = await Promise.all([
-      sql`
-        SELECT id, email, name, username, avatar_url, role, created_at, social_links, bio, onboarding_role, category
-        FROM users WHERE id = ${id}
-      `,
+      sql`SELECT * FROM users WHERE id = ${id}`,
       getActiveSubscription(sql, id),
       getOwnedClubs(sql, id),
     ]);
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
-    res.json({ ...user, subscription, owned_clubs: ownedClubs });
+    res.json({ ...sessionUser(user), subscription, owned_clubs: ownedClubs });
   } catch { res.status(401).json({ error: 'Token inválido' }); }
+});
+
+// ── GET /api/auth/me/profile ──────────────────────────────────────────────────
+// Perfil completo del dueño, para Editar perfil. No va a la sesión.
+router.get('/me/profile', requireAuth, async (req, res, next) => {
+  try {
+    const [user] = await getDb().query(`SELECT ${PROFILE_COLUMNS} FROM users WHERE id = $1`, [req.user.id]);
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    res.json(withUsernameStatus(user));
+  } catch (err) { next(err); }
 });
 
 // ── GET /api/auth/search?q= ───────────────────────────────────────────────────
@@ -620,7 +661,7 @@ router.get('/suggest-username', usernameLimiter, async (req, res, next) => {
 
 // ── GET /api/auth/username-available?username= ───────────────────────────────
 // Valida formato y verifica que el nombre de usuario no esté en uso.
-router.get('/username-available', usernameLimiter, async (req, res, next) => {
+router.get('/username-available', usernameLimiter, optionalAuth, async (req, res, next) => {
   try {
     const username = (req.query.username || '').toString().trim().toLowerCase();
     const error = validateUsername(username);
@@ -629,8 +670,7 @@ router.get('/username-available', usernameLimiter, async (req, res, next) => {
     // Mismo criterio que el registro: si lo ocupa una cuenta fantasma está libre,
     // porque el alta la va a reclamar. Si no, el formulario marcaría "ya está en
     // uso" un username que el registro sí acepta.
-    const [taken] = await sql.query(
-      `SELECT u.id FROM users u WHERE u.username = $1 AND ${ACCOUNT_REACHABLE}`, [username]);
+    const [taken] = await sql.query(USERNAME_TAKEN, [username, req.user?.id ?? null]);
     res.json({ available: !taken, error: taken ? 'Ese nombre de usuario ya está en uso' : null });
   } catch (err) { next(err); }
 });
@@ -770,50 +810,51 @@ router.post('/reset-password', async (req, res, next) => {
 // ── PATCH /api/auth/me ────────────────────────────────────────────
 router.patch('/me', requireAuth, async (req, res, next) => {
   try {
-    const { name, username, current_password, new_password, social_links, bio, advanced_stats_public, onboarding_role, category, level_score } = req.body;
+    const body = req.body;
+    const { username, current_password, new_password, advanced_stats_public, onboarding_role, category, level_score } = body;
     const sql = getDb();
 
     const [user] = await sql`SELECT * FROM users WHERE id = ${req.user.id}`;
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-    const updates = {};
-
-    // Cambio de nombre (no regenera el username)
-    if (name !== undefined) {
-      const trimmed = name.trim();
-      const userError = validateUser(trimmed);
-      if (userError) return res.status(400).json({ error: userError });
-      if (!trimmed) return res.status(400).json({ error: 'El nombre no puede estar vacío' });
-      updates.name = trimmed;
+    let updates;
+    try {
+      updates = parseProfileUpdate(body, user);
+      if (body.name !== undefined && body.first_name === undefined && body.last_name === undefined) {
+        Object.assign(updates, readNames({ name: body.name }));
+      }
+    } catch (e) {
+      if (e instanceof ProfileError) return res.status(e.status).json({ error: e.message });
+      throw e;
     }
 
-    // Cambio de username independiente
+    let oldUsername = null;
     if (username !== undefined) {
-      const trimmed = username.trim().toLowerCase();
-      if (!trimmed) return res.status(400).json({ error: 'El nombre de usuario no puede estar vacío' });
-      if (trimmed.length < 3) return res.status(400).json({ error: 'El nombre de usuario debe tener al menos 3 caracteres' });
-      if (trimmed.length > 20) return res.status(400).json({ error: 'El nombre de usuario tiene un límite de 20 caracteres' });
-      if (!/^[a-z0-9_]+$/.test(trimmed)) return res.status(400).json({ error: 'El nombre de usuario solo puede contener letras, números y guiones bajos' });
-      // Mismo criterio que el registro y que /username-available: una cuenta
-      // fantasma no bloquea el @username, se la reclama. Hay que borrarla igual
-      // aunque no bloquee, o el UPDATE choca contra el UNIQUE de username.
-      const [existing] = await sql.query(
-        `SELECT u.id, ${ACCOUNT_REACHABLE} AS reachable
-           FROM users u WHERE u.username = $1 AND u.id != $2`,
-        [trimmed, req.user.id]);
-      if (existing?.reachable) return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso' });
-      if (existing) await deleteUserAccount(existing.id);
-      updates.username = trimmed;
+      const trimmed = String(username).trim().toLowerCase();
+      const unameError = validateUsername(trimmed);
+      if (unameError) return res.status(400).json({ error: unameError });
+      if (trimmed !== user.username) {
+        const status = usernameChangeStatus(user.username_changed_at);
+        if (!status.allowed) {
+          const fecha = new Date(status.next_at).toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });
+          return res.status(409).json({ error: `Podés volver a cambiar tu usuario el ${fecha}`, next_at: status.next_at });
+        }
+        const [[existing], [reserved]] = await Promise.all([
+          sql.query(
+            `SELECT u.id, ${ACCOUNT_REACHABLE} AS reachable FROM users u WHERE u.username = $1 AND u.id != $2`,
+            [trimmed, req.user.id]),
+          sql.query(
+            `SELECT 1 FROM username_history WHERE username = $1 AND user_id != $2 AND released_at > NOW() - INTERVAL '90 days'`,
+            [trimmed, req.user.id]),
+        ]);
+        if (existing?.reachable || reserved) return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso' });
+        if (existing) await deleteUserAccount(existing.id);
+        updates.username = trimmed;
+        updates.username_changed_at = new Date();
+        oldUsername = user.username;
+      }
     }
 
-    // Bio
-    if (bio !== undefined) {
-      updates.bio = bio.trim().slice(0, 200) || null;
-    }
-
-    // Visibilidad de las estadísticas avanzadas del perfil (sólo premium).
-    // Apagarlo siempre se permite: si la cuenta dejó de ser premium igual tiene
-    // que poder volver a privado.
     if (advanced_stats_public !== undefined) {
       if (typeof advanced_stats_public !== 'boolean')
         return res.status(400).json({ error: 'advanced_stats_public debe ser booleano' });
@@ -828,22 +869,17 @@ router.patch('/me', requireAuth, async (req, res, next) => {
       updates.advanced_stats_public = advanced_stats_public;
     }
 
-    // A qué vino: sólo decide qué le muestra la portada, así que no hay nada que
-    // proteger. Se puede cambiar las veces que quiera.
     if (onboarding_role !== undefined) {
       if (onboarding_role !== 'organizer' && onboarding_role !== 'player')
         return res.status(400).json({ error: 'onboarding_role debe ser organizer o player' });
       updates.onboarding_role = onboarding_role;
     }
 
-    // Redes sociales
-    // Categoría declarada (C/D + 1..10). null la borra.
     if (category !== undefined) {
       try { updates.category = parseCategory(category); }
       catch (e) { return res.status(400).json({ error: e.message }); }
     }
 
-    // Puntaje del cuestionario de nivel. null lo borra (eligió la categoría directo).
     if (level_score !== undefined) {
       if (level_score !== null && (typeof level_score !== 'number' || level_score < 1 || level_score > 8)) {
         return res.status(400).json({ error: 'level_score debe ser un número entre 1.0 y 8.0' });
@@ -851,38 +887,44 @@ router.patch('/me', requireAuth, async (req, res, next) => {
       updates.level_score = level_score === null ? null : Math.round(level_score * 10) / 10;
     }
 
-    if (social_links !== undefined) {
-      if (!Array.isArray(social_links)) return res.status(400).json({ error: 'social_links debe ser un arreglo' });
-      updates.social_links = JSON.stringify(social_links.filter(l => l.url?.trim()));
-    }
-
-    // Cambio de contraseña
     if (new_password !== undefined) {
       if (!current_password)
         return res.status(400).json({ error: 'Ingresá tu contraseña actual' });
-
       const valid = await bcrypt.compare(current_password, user.password_hash);
       if (!valid)
         return res.status(400).json({ error: 'La contraseña actual es incorrecta' });
-
       const pwError = validatePassword(new_password);
       if (pwError) return res.status(400).json({ error: pwError });
-
       updates.password_hash = await bcrypt.hash(new_password, 10);
     }
 
-    if (Object.keys(updates).length === 0)
-      return res.json({ id: user.id, name: user.name, username: user.username });
+    if ('emergency_contacts' in updates) updates.emergency_contacts = JSON.stringify(updates.emergency_contacts);
 
     const keys = Object.keys(updates);
+    if (keys.length === 0) {
+      const [current] = await sql.query(`SELECT ${PROFILE_COLUMNS} FROM users WHERE id = $1`, [req.user.id]);
+      return res.json(withUsernameStatus(current));
+    }
+
     const values = Object.values(updates);
     const setClauses = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
+    const n = keys.length;
+    const history = oldUsername
+      ? `, released AS (
+           INSERT INTO username_history (username, user_id, released_at) VALUES ($${n + 2}, $${n + 1}, NOW())
+           ON CONFLICT (username) DO UPDATE SET user_id = EXCLUDED.user_id, released_at = NOW()
+         ), reclaimed AS (
+           DELETE FROM username_history WHERE username = $${n + 3} AND user_id = $${n + 1}
+         )`
+      : '';
+    const params = oldUsername ? [...values, req.user.id, oldUsername, updates.username] : [...values, req.user.id];
     const [updated] = await sql.query(
-      `UPDATE users SET ${setClauses} WHERE id = $${keys.length + 1} RETURNING id, name, username, avatar_url, social_links, bio, advanced_stats_public, onboarding_role, category, level_score`,
-      [...values, req.user.id]
+      `WITH upd AS (UPDATE users SET ${setClauses} WHERE id = $${n + 1} RETURNING ${PROFILE_COLUMNS})${history}
+       SELECT * FROM upd`,
+      params,
     );
 
-    res.json(updated);
+    res.json(withUsernameStatus(updated));
   } catch (err) { next(err); }
 });
 
