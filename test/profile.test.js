@@ -52,8 +52,8 @@ test('documento: DNI de 7 u 8 números, sin puntos', () => {
   assert.deepEqual(parseDocument('dni', '40.123.456'), { doc_type: 'dni', doc_number: '40123456' });
   assert.deepEqual(parseDocument('pasaporte', 'aab123456'), { doc_type: 'pasaporte', doc_number: 'AAB123456' });
   assert.deepEqual(parseDocument('', ''), { doc_type: null, doc_number: null });
+  assert.deepEqual(parseDocument('dni', ''), { doc_type: null, doc_number: null });
   assert.throws(() => parseDocument('dni', '123456'), ProfileError);
-  assert.throws(() => parseDocument('dni', ''), ProfileError);
   assert.throws(() => parseDocument('cedula', '123'), ProfileError);
   assert.throws(() => parseDocument('', '40123456'), ProfileError);
 });

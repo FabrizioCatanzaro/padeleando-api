@@ -91,9 +91,8 @@ export function parseWhatsapp(value) {
 export function parseDocument(type, number) {
   const t = blankToNull(type);
   const n = text(number).replace(/[.\s]/g, '');
-  if (!t && !n) return { doc_type: null, doc_number: null };
+  if (!n) return { doc_type: null, doc_number: null };
   if (!t || !DOC_TYPES.includes(t)) throw new ProfileError('Elegí el tipo de documento: DNI, pasaporte u otro');
-  if (!n) throw new ProfileError('Ingresá el número de documento');
   if (t === 'dni' && !/^\d{7,8}$/.test(n)) throw new ProfileError('El DNI debe tener 7 u 8 números');
   if (t !== 'dni' && !/^[A-Za-z0-9-]{3,20}$/.test(n)) throw new ProfileError('El número de documento no es válido');
   return { doc_type: t, doc_number: t === 'dni' ? n : n.toUpperCase() };
