@@ -49,7 +49,7 @@ const TOURNAMENT_SQL = `
          g.level AS g_level, g.signup_capacity AS g_signup_capacity,
          g.signup_capacity_unit AS g_signup_capacity_unit, g.signup_closes_at AS g_signup_closes_at,
          g.rules AS g_rules,
-         u.social_links AS owner_social_links, g.name AS group_name
+         json_build_object('whatsapp', CASE WHEN u.whatsapp_public THEN u.whatsapp END, 'instagram', u.instagram) AS owner_profile, g.name AS group_name
   FROM tournaments t
   JOIN groups g ON g.id = t.group_id
   JOIN users  u ON u.id = g.user_id
@@ -64,7 +64,7 @@ async function loadTournament(q, tournamentId, { lock = false } = {}) {
     signup_contacts: t.g_signup_contacts, level: t.g_level, signup_capacity: t.g_signup_capacity,
     signup_capacity_unit: t.g_signup_capacity_unit, signup_closes_at: t.g_signup_closes_at,
     rules: t.g_rules,
-  }, t.owner_social_links);
+  }, t.owner_profile);
   return { t, signup };
 }
 

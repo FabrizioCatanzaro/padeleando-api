@@ -4,7 +4,7 @@ export const EXPIRY_DAYS = 30;
 export const VISIBILITIES = ['publico', 'link'];
 export const SLOTS = [[1, 1], [1, 2], [2, 1], [2, 2]];
 export const SIDES = ['drive', 'reves', 'cualquiera'];
-export const HANDS = ['diestro', 'zurdo'];
+export const HANDS = ['diestro', 'zurdo', 'ambidiestro'];
 export const STYLES = ['caballeros', 'damas', 'mixto'];
 const MAX_PRICE = 10_000_000;
 const MAX_GUEST_NAME = 40;
@@ -117,7 +117,7 @@ export function parseWhatsapp(value) {
 export function parseGameData(input = {}, { withWhatsapp = false } = {}) {
   const out = {
     side: parseEnum(input?.side, SIDES, 'El lado debe ser drive, revés o cualquiera'),
-    hand: parseEnum(input?.hand, HANDS, 'La mano hábil debe ser diestro o zurdo'),
+    hand: parseEnum(input?.hand, HANDS, 'La mano hábil debe ser diestro, zurdo o ambidiestro'),
   };
   if (withWhatsapp) out.whatsapp = parseWhatsapp(input?.whatsapp);
   return out;

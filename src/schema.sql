@@ -155,9 +155,6 @@ CREATE TABLE IF NOT EXISTS premium_claim_codes (
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url       TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_public_id TEXT;
 
--- Bio libre del usuario (hasta 200 chars)
-ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
-
 -- Confirmación de email (registro con email/password)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
 
@@ -829,7 +826,7 @@ CREATE TABLE IF NOT EXISTS friendly_match_players (
   user_id      TEXT REFERENCES users(id) ON DELETE SET NULL,
   guest_name   TEXT,
   side         TEXT CHECK (side IS NULL OR side IN ('drive', 'reves', 'cualquiera')),
-  hand         TEXT CHECK (hand IS NULL OR hand IN ('diestro', 'zurdo')),
+  hand         TEXT CHECK (hand IS NULL OR hand IN ('diestro', 'zurdo', 'ambidiestro')),
   whatsapp     TEXT,
   invite_token TEXT,
   joined_at    TIMESTAMPTZ,
@@ -856,3 +853,91 @@ CREATE TABLE IF NOT EXISTS friendly_match_proposals (
 CREATE INDEX IF NOT EXISTS idx_friendly_proposals_match ON friendly_match_proposals(match_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_friendly_pending ON friendly_match_proposals(match_id) WHERE status = 'pendiente';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_friendly_reminder ON notifications(user_id, entity_id, body) WHERE type = 'friendly_reminder';
+
+-- Perfil (2026-11): nombre y apellido separados, datos personales, redes fijas y WhatsApp aparte.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name  TEXT NOT NULL DEFAULT '';
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+              WHERE table_schema = current_schema() AND table_name = 'users'
+                AND column_name = 'name' AND is_generated = 'NEVER') THEN
+    UPDATE users SET
+      first_name = split_part(btrim(regexp_replace(name, '\s+', ' ', 'g')), ' ', 1),
+      last_name  = btrim(substr(btrim(regexp_replace(name, '\s+', ' ', 'g')),
+                                length(split_part(btrim(regexp_replace(name, '\s+', ' ', 'g')), ' ', 1)) + 1))
+    WHERE first_name IS NULL;
+    ALTER TABLE users DROP COLUMN name;
+    ALTER TABLE users ADD COLUMN name TEXT GENERATED ALWAYS AS (btrim(first_name || ' ' || last_name)) STORED NOT NULL;
+  END IF;
+END $$;
+ALTER TABLE users ALTER COLUMN first_name SET NOT NULL;
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username_changed_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS nationality TEXT CHECK (nationality IS NULL OR nationality ~ '^[A-Z]{2}$');
+ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date  DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS gender      TEXT CHECK (gender IS NULL OR gender IN ('masculino', 'femenino', 'no_decir'));
+ALTER TABLE users ADD COLUMN IF NOT EXISTS doc_type    TEXT CHECK (doc_type IS NULL OR doc_type IN ('dni', 'pasaporte', 'otro'));
+ALTER TABLE users ADD COLUMN IF NOT EXISTS doc_number  TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp        TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_public BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS instagram TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS twitter   TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS facebook  TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS website   TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS hand TEXT CHECK (hand IS NULL OR hand IN ('diestro', 'zurdo', 'ambidiestro'));
+ALTER TABLE users ADD COLUMN IF NOT EXISTS side TEXT CHECK (side IS NULL OR side IN ('drive', 'reves', 'cualquiera'));
+ALTER TABLE users ADD COLUMN IF NOT EXISTS country       TEXT CHECK (country IS NULL OR country ~ '^[A-Z]{2}$');
+ALTER TABLE users ADD COLUMN IF NOT EXISTS province      TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS locality      TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS street        TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS street_number TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS postal_code   TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS emergency_contacts JSONB NOT NULL DEFAULT '[]'::jsonb
+  CHECK (jsonb_typeof(emergency_contacts) = 'array');
+
+CREATE OR REPLACE FUNCTION pg_temp.legacy_link(links jsonb, net text) RETURNS text LANGUAGE sql AS $f$
+  SELECT btrim(e.l->>'url')
+    FROM jsonb_array_elements(CASE WHEN jsonb_typeof(links) = 'array' THEN links ELSE '[]'::jsonb END)
+         WITH ORDINALITY AS e(l, ord)
+   WHERE e.l->>'network' = net AND btrim(COALESCE(e.l->>'url', '')) <> ''
+   ORDER BY e.ord LIMIT 1
+$f$;
+CREATE OR REPLACE FUNCTION pg_temp.legacy_handle(url text, host text, pat text) RETURNS text LANGUAGE sql AS $f$
+  SELECT CASE WHEN h ~ pat THEN h END
+    FROM (SELECT regexp_replace(
+                   regexp_replace(url, '^(https?://)?(www\.|m\.|mobile\.|web\.)?(' || host || ')/', '', 'i'),
+                   '^@+|[/?#].*$', '', 'g') AS h) x
+$f$;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+              WHERE table_schema = current_schema() AND table_name = 'users' AND column_name = 'social_links') THEN
+    UPDATE users SET
+      instagram = COALESCE(instagram, pg_temp.legacy_handle(pg_temp.legacy_link(social_links, 'instagram'), 'instagram\.com', '^[A-Za-z0-9._]{1,30}$')),
+      twitter   = COALESCE(twitter,   pg_temp.legacy_handle(pg_temp.legacy_link(social_links, 'twitter'), 'x\.com|twitter\.com', '^[A-Za-z0-9_]{1,15}$')),
+      facebook  = COALESCE(facebook,  pg_temp.legacy_handle(pg_temp.legacy_link(social_links, 'facebook'), 'facebook\.com|fb\.com', '^[A-Za-z0-9.]{5,50}$')),
+      website   = COALESCE(website, (SELECT CASE WHEN o ~* '^https?://' THEN o ELSE 'https://' || o END
+                                       FROM (SELECT pg_temp.legacy_link(social_links, 'other') AS o) x WHERE o IS NOT NULL)),
+      whatsapp  = COALESCE(whatsapp, (SELECT '+' || d FROM (SELECT regexp_replace(COALESCE(pg_temp.legacy_link(social_links, 'whatsapp'), ''), '\D', '', 'g') AS d) x
+                                       WHERE length(d) BETWEEN 8 AND 15));
+    ALTER TABLE users DROP COLUMN social_links;
+  END IF;
+END $$;
+ALTER TABLE users DROP COLUMN IF EXISTS bio;
+
+-- Email de la cuenta de Google conectada; las vinculadas antes se conectaron por coincidencia de email.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS google_email TEXT;
+UPDATE users SET google_email = email WHERE google_id IS NOT NULL AND google_email IS NULL;
+
+-- Un @username dejado queda reservado 90 días para su dueño y redirige al nuevo.
+CREATE TABLE IF NOT EXISTS username_history (
+  username    TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  released_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_username_history_user ON username_history(user_id);
+
+ALTER TABLE friendly_match_players DROP CONSTRAINT IF EXISTS friendly_match_players_hand_check;
+ALTER TABLE friendly_match_players ADD CONSTRAINT friendly_match_players_hand_check
+  CHECK (hand IS NULL OR hand IN ('diestro', 'zurdo', 'ambidiestro'));

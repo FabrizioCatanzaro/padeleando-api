@@ -116,7 +116,7 @@ const NEVER_STORE = [
 // Gestión de reservas del dueño y Mercado Pago Connect: nunca en caché
 // compartida -- son GET pero devuelven datos por-usuario (o hacen un redirect
 // con efectos), y sin esto el prefijo público de /api/clubs los agarraría.
-const NEVER_STORE_PATTERNS = [/\/bookings\/manage$/, /\/mercadopago\/(connect|callback)$/];
+const NEVER_STORE_PATTERNS = [/\/bookings\/manage$/, /\/mercadopago\/(connect|callback)$/, /\/players\/[^/]+\/ficha$/];
 
 // Respuestas que dependen de quién mira: private, no-cache (nearby queda público)
 const VIEWER_DEPENDENT_PATTERNS = [
