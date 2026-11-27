@@ -63,7 +63,7 @@ router.get('/players', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const me = req.user.id;
-    const [network, matchRows, bracketRows, friendlyRows, sugRows, sugBracketRows, sugFriendlyRows, organizers] = await Promise.all([
+    const [network, matchRows, bracketRows, friendlyRows, sugRows, sugBracketRows, sugFriendlyRows, organizers, followRows] = await Promise.all([
       sql`
         SELECT (SELECT COUNT(*)::int FROM user_follows WHERE follower_id  = ${me}) AS following,
                (SELECT COUNT(*)::int FROM user_follows WHERE following_id = ${me}) AS followers
@@ -155,8 +155,10 @@ router.get('/players', requireAuth, async (req, res, next) => {
         WHERE fm.status = 'confirmado' AND p.user_id IN (SELECT uid FROM sug)
         GROUP BY p.user_id`, [me]),
       organizersQuery(sql, { me, lat: null, lon: null, limit: 3 }),
+      sql`SELECT following_id FROM user_follows WHERE follower_id = ${me}`,
     ]);
 
+    const following = new Set(followRows.map((r) => r.following_id));
     const extra = addFriendlyStatsByUser(bracketStatsByUser(sugBracketRows), sugFriendlyRows);
     const suggested = sugRows.map((r) => {
       const add = extra.get(String(r.id)) ?? { partidos: 0, victorias: 0 };
@@ -171,7 +173,8 @@ router.get('/players', requireAuth, async (req, res, next) => {
 
     res.json({
       network: network[0],
-      companions: mergeCompanions([...matchRows, ...bracketCompanions(bracketRows), ...friendlyRows]),
+      companions: mergeCompanions([...matchRows, ...bracketCompanions(bracketRows), ...friendlyRows])
+        .map((c) => ({ ...c, is_following: c.key.startsWith('u:') && following.has(c.key.slice(2)) })),
       suggested,
       organizers,
     });
