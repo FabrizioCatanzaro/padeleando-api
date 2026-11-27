@@ -1,4 +1,5 @@
 // Cobro online de una inscripción: preferencia de Checkout Pro con la cuenta del dueño y reintegros.
+// Sin split: el pago entra entero al dueño y la comisión se liquida después (lib/settlements.js).
 import { MercadoPagoConfig, Preference, Payment, PaymentRefund } from 'mercadopago';
 import { userMpToken } from './mpAccount.js';
 import { uid } from '../uid.js';
@@ -6,7 +7,7 @@ import { uid } from '../uid.js';
 export const externalRef = (registrationId) => `reg:${registrationId}`;
 
 /** Cuerpo de la preferencia. Sin efectivo ni cajero: tienen que acreditarse en la reserva de 30 min. */
-export function preferenceBody({ registrationId, groupId, tournamentId, tournamentName, total, fee, kind, expiresAt, apiUrl, frontendUrl }) {
+export function preferenceBody({ registrationId, groupId, tournamentId, tournamentName, total, kind, expiresAt, apiUrl, frontendUrl }) {
   const back = `${frontendUrl}/cat/${groupId}/torneo/${tournamentId}`;
   return {
     items: [{
@@ -16,7 +17,6 @@ export function preferenceBody({ registrationId, groupId, tournamentId, tourname
       unit_price: total,
       currency_id: 'ARS',
     }],
-    marketplace_fee: fee,
     external_reference: externalRef(registrationId),
     notification_url: `${apiUrl}/api/registrations/mercadopago/webhook?reg=${registrationId}`,
     back_urls: { success: `${back}?pago=ok`, pending: `${back}?pago=pendiente`, failure: `${back}?pago=error` },

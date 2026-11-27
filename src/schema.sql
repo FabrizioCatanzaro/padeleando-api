@@ -395,7 +395,7 @@ ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
                   'booking_cancelled','registration_received','registration_decided','registration_partner',
                   'friendly_added','friendly_joined','friendly_left','friendly_removed','friendly_full',
                   'friendly_updated','friendly_proposal','friendly_confirmed','friendly_cancelled','friendly_reminder',
-                  'registration_refund_failed'));
+                  'registration_refund_failed','commission_due'));
 
 -- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
 -- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
@@ -989,3 +989,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_registrations_active_p1
   WHERE status IN ('awaiting_payment', 'pending', 'approved', 'waitlist');
 CREATE UNIQUE INDEX IF NOT EXISTS uq_registrations_mp_payment
   ON tournament_registrations(mp_payment_id) WHERE mp_payment_id IS NOT NULL;
+
+-- Liquidación de comisiones (2026-11-27): sin split de Mercado Pago la inscripción entra entera al
+-- organizador y la comisión se paga después, una por torneo al cerrar la inscripción. Ver lib/settlements.js.
+CREATE TABLE IF NOT EXISTS commission_settlements (
+  id                  TEXT PRIMARY KEY,
+  tournament_id       TEXT NOT NULL UNIQUE REFERENCES tournaments(id) ON DELETE CASCADE,
+  owner_id            TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  amount              NUMERIC(12, 2) NOT NULL,
+  credit_applied      NUMERIC(12, 2) NOT NULL DEFAULT 0,
+  registrations_count INTEGER NOT NULL DEFAULT 0,
+  status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'cancelled')),
+  due_at              TIMESTAMPTZ NOT NULL,
+  mp_preference_id    TEXT,
+  mp_init_point       TEXT,
+  mp_payment_id       TEXT UNIQUE,
+  paid_at             TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (credit_applied >= 0 AND credit_applied <= amount)
+);
+CREATE INDEX IF NOT EXISTS idx_settlements_owner ON commission_settlements(owner_id, status);

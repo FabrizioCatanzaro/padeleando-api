@@ -26,6 +26,7 @@ import {
 } from '../lib/copa.js';
 import { PLAYER_PLANS, ORGANIZER_PLANS } from '../lib/planCatalog.js';
 import { onlinePriceError } from '../lib/commission.js';
+import { settlementBlockError } from '../lib/settlements.js';
 
 const router = Router();
 
@@ -264,11 +265,15 @@ async function onlineSetupError(sql, groupId, signup, cur = {}) {
   const pick = (k) => (k in signup ? signup[k] : cur[k]);
   if (!pick('signup_online')) return null;
   const [g] = await sql`
-    SELECT g.signup_price, g.signup_price_unit, (u.mp_connected_at IS NOT NULL) AS mp,
+    SELECT g.user_id, g.signup_price, g.signup_price_unit, (u.mp_connected_at IS NOT NULL) AS mp,
            EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id = g.user_id AND s.status = 'active'
                      AND s.plan = ANY(${ORGANIZER_PLANS})) AS org
     FROM groups g JOIN users u ON u.id = g.user_id WHERE g.id = ${groupId}`;
   if (!g?.mp) return 'El dueño de la categoría tiene que vincular su Mercado Pago (Torneos › Organizar) para cobrar online';
+  if (signup.signup_online === true && !cur.signup_online) {
+    const blocked = await settlementBlockError(sql, g.user_id);
+    if (blocked) return blocked;
+  }
   const price = pick('signup_price') ?? g.signup_price;
   const unit = pick('signup_price_unit') ?? g.signup_price_unit ?? 'player';
   return onlinePriceError({
@@ -338,14 +343,16 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     const rawNames = playerNames.filter(Boolean).map((n) => n.trim()).filter(Boolean);
     const usernames = rawNames.filter((n) => n.startsWith('@')).map((n) => n.slice(1)).filter(Boolean);
 
-    const [quotaError, clubRows, userRows] = await Promise.all([
+    const [quotaError, clubRows, userRows, settlementError] = await Promise.all([
       tournamentQuotaError(sql, groupId, req.accessCtx.owner_id, { format }),
       club_id ? sql`SELECT id FROM clubs WHERE id = ${club_id}` : Promise.resolve([]),
       usernames.length
         ? sql`SELECT id, name, username FROM users WHERE username = ANY(${usernames})`
         : Promise.resolve([]),
+      settlementBlockError(sql, req.accessCtx.owner_id),
     ]);
 
+    if (settlementError) return res.status(403).json({ error: settlementError, code: 'settlement_due' });
     if (quotaError) return res.status(403).json({ error: quotaError, code: 'plan_limit' });
     if (club_id && clubRows.length === 0) return res.status(404).json({ error: 'Club no encontrado' });
 

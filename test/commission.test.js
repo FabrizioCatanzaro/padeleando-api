@@ -45,7 +45,7 @@ test('preferencia del cobro online', async () => {
     expiresAt: '2026-11-27T12:30:00Z', apiUrl: 'https://api.test', frontendUrl: 'https://app.test',
   });
   assert.equal(body.items[0].unit_price, 21200);
-  assert.equal(body.marketplace_fee, 1200);
+  assert.equal(body.marketplace_fee, undefined);
   assert.equal(body.external_reference, externalRef('r1'));
   assert.equal(body.notification_url, 'https://api.test/api/registrations/mercadopago/webhook?reg=r1');
   assert.equal(body.auto_return, 'approved');
@@ -66,4 +66,23 @@ test('lo que ve el público de un torneo con cobro online', async () => {
   assert.deepEqual(publicSignup({ ...base, fee_payer: 'organizer' }, { format: 'liga', used: 0 }).online_quote,
     { solo: { total: 20000, fee: 0 }, pair: { total: 40000, fee: 0 } });
   assert.equal(publicSignup({ ...base, online: false }, { format: 'liga', used: 0 }).online_quote, undefined);
+});
+
+test('liquidación de comisiones: saldo, vencimiento y saldo a favor', async () => {
+  const { amountDue, isOverdue, creditToApply, settlementPreferenceBody } = await import('../src/lib/settlements.js');
+  assert.equal(amountDue({ amount: '3600', credit_applied: '1200' }), 2400);
+  assert.equal(amountDue({ amount: '500', credit_applied: '500' }), 0);
+  const now = new Date('2026-12-10T12:00:00Z');
+  assert.equal(isOverdue({ status: 'pending', amount: 100, credit_applied: 0, due_at: '2026-12-09T00:00:00Z' }, now), true);
+  assert.equal(isOverdue({ status: 'pending', amount: 100, credit_applied: 0, due_at: '2026-12-11T00:00:00Z' }, now), false);
+  assert.equal(isOverdue({ status: 'paid', amount: 100, credit_applied: 0, due_at: '2026-12-09T00:00:00Z' }, now), false);
+  assert.equal(isOverdue({ status: 'pending', amount: 100, credit_applied: 100, due_at: '2026-12-09T00:00:00Z' }, now), false);
+  assert.equal(creditToApply(3000, 1200), 1200);
+  assert.equal(creditToApply(800, 1200), 800);
+  assert.equal(creditToApply(800, -50), 0);
+  const body = settlementPreferenceBody({ id: 's1', amount: 2400, tournamentName: 'Liga', apiUrl: 'https://api.test', frontendUrl: 'https://app.test' });
+  assert.equal(body.items[0].unit_price, 2400);
+  assert.equal(body.external_reference, 'set:s1');
+  assert.equal(body.notification_url, 'https://api.test/api/payments/settlements/webhook?set=s1');
+  assert.equal(body.back_urls.success, 'https://app.test/torneos/organizar?liquidacion=ok');
 });

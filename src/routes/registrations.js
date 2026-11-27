@@ -238,7 +238,7 @@ router.post('/', requireAuth, async (req, res, next) => {
       try {
         checkout = await createCheckout(sql, t.owner_id, {
           registrationId: id, groupId: t.group_id, tournamentId, tournamentName: t.name,
-          total: amounts.total, fee: amounts.fee, kind, expiresAt,
+          total: amounts.total, kind, expiresAt,
         });
       } catch (e) {
         console.error('No se pudo crear el pago de la inscripción:', e?.message ?? e);
