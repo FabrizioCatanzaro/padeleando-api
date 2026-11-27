@@ -19,6 +19,7 @@ import { deleteUserAccount, ANON_ID } from '../lib/deleteUser.js';
 import { getActiveSubscription } from './subscriptions.js';
 import { parseCategory } from '../lib/category.js';
 import { parseNamePart, parseProfileUpdate, ProfileError, usernameChangeStatus, splitLegacyName, googleNames } from '../lib/profile.js';
+import { PLAYER_PLANS } from '../lib/planCatalog.js';
 
 const router       = Router();
 const SECRET       = process.env.JWT_SECRET;
@@ -862,7 +863,7 @@ router.patch('/me', requireAuth, async (req, res, next) => {
       if (advanced_stats_public) {
         const [premium] = await sql`
           SELECT 1 FROM subscriptions
-          WHERE user_id = ${req.user.id} AND status = 'active' AND plan = 'premium'
+          WHERE user_id = ${req.user.id} AND status = 'active' AND plan = ANY(${PLAYER_PLANS})
         `;
         if (!premium)
           return res.status(403).json({ error: 'Publicar las estadísticas avanzadas es una función premium' });

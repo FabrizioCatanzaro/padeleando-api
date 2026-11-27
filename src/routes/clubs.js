@@ -9,6 +9,7 @@ import { uploadClubPhoto, uploadClubHeader, uploadClubClaimPhotos } from '../mid
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
 import { arNow } from '../lib/friendlies.js';
+import { CLUB_PLAN_ENABLED } from '../lib/planCatalog.js';
 
 const router = Router();
 
@@ -433,10 +434,10 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         CASE WHEN c.owner_visible THEN ou.username     ELSE NULL END AS owner_username,
         CASE WHEN c.owner_visible THEN ou.avatar_url    ELSE NULL END AS owner_avatar_url,
         (c.mp_access_token IS NOT NULL) AS mp_connected,
-        (EXISTS (
+        (c.owner_id IS NOT NULL AND (NOT ${CLUB_PLAN_ENABLED} OR EXISTS (
           SELECT 1 FROM subscriptions s
-          WHERE s.user_id = c.owner_id AND s.plan = 'premium' AND s.status = 'active'
-        )) AS owner_is_premium
+          WHERE s.user_id = c.owner_id AND s.plan = 'club' AND s.status = 'active'
+        ))) AS can_collect_online
         FROM clubs c
         LEFT JOIN users ou ON ou.id = c.owner_id
         WHERE c.id = ${req.params.id}
@@ -1006,21 +1007,21 @@ router.patch('/:id/courts/:courtId/move', requireAuth, requireClubManage, async 
 
 // ── Mercado Pago Connect del club (Premium) ─────────────────────────────────
 // El dueño vincula su propia cuenta de MP para cobrar reservas desde la app.
-// GET /:id/mercadopago/connect: arma la URL de autorización de MP. Solo Premium.
+// GET /:id/mercadopago/connect: arma la URL de autorización de MP. Plan Club cuando esté habilitado.
 router.get('/:id/mercadopago/connect', requireAuth, requireClubManage, async (req, res, next) => {
   try {
     const sql = getDb();
     const [club] = await sql`
       SELECT c.owner_id,
-             (EXISTS (
+             (c.owner_id IS NOT NULL AND (NOT ${CLUB_PLAN_ENABLED} OR EXISTS (
                SELECT 1 FROM subscriptions s
-               WHERE s.user_id = c.owner_id AND s.plan = 'premium' AND s.status = 'active'
-             )) AS owner_is_premium
+               WHERE s.user_id = c.owner_id AND s.plan = 'club' AND s.status = 'active'
+             ))) AS can_collect_online
       FROM clubs c WHERE c.id = ${req.params.id}
     `;
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
-    if (!club.owner_is_premium) {
-      return res.status(403).json({ error: 'Vincular Mercado Pago es una función Premium', code: 'plan_limit' });
+    if (!club.can_collect_online) {
+      return res.status(403).json({ error: 'Vincular Mercado Pago requiere el plan Club', code: 'plan_limit' });
     }
 
     const state = jwt.sign({ clubId: req.params.id }, MP_STATE_SECRET, { expiresIn: '10m' });

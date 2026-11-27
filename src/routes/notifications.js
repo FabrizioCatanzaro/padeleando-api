@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { getDb } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { PLAYER_PLANS } from '../lib/planCatalog.js';
 
 const router = Router();
 
@@ -23,7 +24,7 @@ router.get('/', requireAuth, async (req, res, next) => {
         COALESCE(a.role = 'admin', false) AS actor_is_admin,
         CASE WHEN a.id IS NOT NULL THEN EXISTS(
           SELECT 1 FROM subscriptions s
-          WHERE s.user_id = a.id AND s.plan = 'premium' AND s.status = 'active'
+          WHERE s.user_id = a.id AND s.plan = ANY(${PLAYER_PLANS}) AND s.status = 'active'
             AND (s.ends_at IS NULL OR s.ends_at > NOW())
         ) ELSE false END AS actor_is_premium,
         CASE WHEN n.type = 'follow' THEN

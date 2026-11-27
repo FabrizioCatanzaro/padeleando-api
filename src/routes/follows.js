@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { getDb } from '../db.js';
 import { uid } from '../uid.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
+import { PLAYER_PLANS } from '../lib/planCatalog.js';
 
 const router = Router();
 
@@ -79,7 +80,7 @@ router.get('/:username/followers', optionalAuth, async (req, res, next) => {
         u.id, u.name, u.username, u.avatar_url,
         EXISTS(
           SELECT 1 FROM subscriptions s
-          WHERE s.user_id = u.id AND s.plan = 'premium' AND s.status = 'active'
+          WHERE s.user_id = u.id AND s.plan = ANY(${PLAYER_PLANS}) AND s.status = 'active'
             AND (s.ends_at IS NULL OR s.ends_at > NOW())
         ) AS is_premium,
         EXISTS(
@@ -108,7 +109,7 @@ router.get('/:username/following', optionalAuth, async (req, res, next) => {
         u.id, u.name, u.username, u.avatar_url,
         EXISTS(
           SELECT 1 FROM subscriptions s
-          WHERE s.user_id = u.id AND s.plan = 'premium' AND s.status = 'active'
+          WHERE s.user_id = u.id AND s.plan = ANY(${PLAYER_PLANS}) AND s.status = 'active'
             AND (s.ends_at IS NULL OR s.ends_at > NOW())
         ) AS is_premium,
         EXISTS(

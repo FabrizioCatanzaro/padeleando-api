@@ -4,21 +4,14 @@ import { getDb }   from '../db.js';
 import { uid }     from '../uid.js';
 import { requireAuth } from '../middleware/auth.js';
 import { MercadoPagoConfig, PreApproval, Payment } from 'mercadopago';
+import { PAID_PLANS, isPurchasable, mpPlanEnvKey, mpPlanIndex, rolesOf } from '../lib/planCatalog.js';
 
 const mp        = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
 const resend    = new Resend(process.env.RESEND_API_KEY);
 const MAIL_FROM = process.env.MAIL_FROM || 'Padeleando <onboarding@resend.dev>';
 
-const MP_PLAN_IDS = {
-  monthly: () => process.env.MP_PLAN_ID_MONTHLY,
-  annual:  () => process.env.MP_PLAN_ID_ANNUAL,
-};
-
-// Mapa inverso: preapproval_plan_id de MP → billing_period de la app.
-const PLAN_BILLING = () => ({
-  [process.env.MP_PLAN_ID_MONTHLY]: 'monthly',
-  [process.env.MP_PLAN_ID_ANNUAL]:  'annual',
-});
+const mpPlanId = (plan, billing) => process.env[mpPlanEnvKey(plan, billing)] || null;
+const preAmount = (pre) => Number(pre?.auto_recurring?.transaction_amount) || null;
 
 const router = Router();
 
@@ -53,7 +46,7 @@ function endsAtFromPreapproval(pre, billing) {
 export async function getActiveSubscription(sql, userId) {
   let [sub] = await sql`
     SELECT id, plan, billing_period, status, mp_preapproval_id, cancel_at_period_end,
-           starts_at, ends_at AS plan_ends_at
+           starts_at, ends_at AS plan_ends_at, amount
     FROM subscriptions
     WHERE user_id = ${userId} AND status = 'active'
     ORDER BY created_at DESC
@@ -94,17 +87,30 @@ export async function getActiveSubscription(sql, userId) {
     sub = null;
   }
 
-  if (!sub) return { plan: 'free', billing_period: null, status: 'active', cancel_at_period_end: false, starts_at: null, plan_ends_at: null };
+  if (!sub) return { plan: 'free', roles: [], billing_period: null, status: 'active', cancel_at_period_end: false, starts_at: null, plan_ends_at: null };
   return {
-    id: sub.id, plan: sub.plan, billing_period: sub.billing_period, status: 'active',
+    id: sub.id, plan: sub.plan, roles: rolesOf(sub.plan), billing_period: sub.billing_period, status: 'active',
+    amount: sub.amount == null ? null : Number(sub.amount),
     cancel_at_period_end: sub.cancel_at_period_end, starts_at: sub.starts_at, plan_ends_at: sub.plan_ends_at,
   };
 }
 
+// Al cambiar de plan, la suscripción anterior se cancela en MP para no cobrar dos veces.
+async function cancelPreviousPreapprovals(sql, userId, keepPreId) {
+  const prev = await sql`
+    SELECT mp_preapproval_id FROM subscriptions
+    WHERE user_id = ${userId} AND status = 'active'
+      AND mp_preapproval_id IS NOT NULL AND mp_preapproval_id <> ${keepPreId}
+  `;
+  await Promise.all(prev.map(({ mp_preapproval_id: id }) =>
+    new PreApproval(mp).update({ id, body: { status: 'cancelled' } }).catch(() => null)));
+}
+
 // ── Helper: activar la suscripción pendiente de un usuario ────────────────────
 // Expira cualquier activa previa y activa la pendiente con el preapproval dado.
-async function activatePendingSubscription(sql, userId, pendingSubId, preId, billing, endsAt) {
+async function activatePendingSubscription(sql, userId, pendingSubId, preId, { plan, billing }, endsAt, amount = null) {
   const ends_at = endsAt ?? new Date(Date.now() + (PERIOD_DAYS[billing] ?? 30) * 24 * 60 * 60 * 1000);
+  await cancelPreviousPreapprovals(sql, userId, preId);
 
   await sql`
     UPDATE subscriptions
@@ -113,7 +119,7 @@ async function activatePendingSubscription(sql, userId, pendingSubId, preId, bil
   `;
   await sql`
     UPDATE subscriptions
-    SET status = 'active', mp_preapproval_id = ${preId},
+    SET status = 'active', mp_preapproval_id = ${preId}, plan = ${plan}, amount = ${amount},
         billing_period = ${billing}, ends_at = ${ends_at}
     WHERE id = ${pendingSubId}
   `;
@@ -143,7 +149,7 @@ async function findAuthorizedPreapprovalId(payerId) {
     const search = await new PreApproval(mp).search({
       options: { payer_id: payerId, status: 'authorized' },
     });
-    const ours = new Set(Object.keys(PLAN_BILLING()));
+    const ours = new Set(Object.keys(mpPlanIndex()));
     const matches = (search.results ?? [])
       .filter((p) => p.status === 'authorized' && ours.has(p.preapproval_plan_id))
       .sort((a, b) => new Date(b.date_created ?? 0) - new Date(a.date_created ?? 0));
@@ -161,9 +167,10 @@ export async function linkPreapprovalToUser(sql, userId, preapprovalId) {
   try { pre = await new PreApproval(mp).get({ id: preapprovalId }); }
   catch (_) { return { ok: false, error: 'No se encontró ese preapproval en Mercado Pago' }; }
 
-  const billing = PLAN_BILLING()[pre?.preapproval_plan_id];
-  if (pre?.status !== 'authorized' || !billing)
+  const match = mpPlanIndex()[pre?.preapproval_plan_id];
+  if (pre?.status !== 'authorized' || !match)
     return { ok: false, error: 'El preapproval no está autorizado o no es de un plan de Padeleando' };
+  const { plan, billing } = match;
 
   const [taken] = await sql`
     SELECT user_id FROM subscriptions WHERE mp_preapproval_id = ${pre.id}
@@ -171,15 +178,16 @@ export async function linkPreapprovalToUser(sql, userId, preapprovalId) {
   if (taken && taken.user_id !== userId)
     return { ok: false, error: 'Ese preapproval ya está vinculado a otro usuario' };
 
+  await cancelPreviousPreapprovals(sql, userId, pre.id);
   await sql`
     UPDATE subscriptions SET status = 'expired'
     WHERE user_id = ${userId} AND status = 'active'
   `;
   await sql`
-    INSERT INTO subscriptions (id, user_id, plan, billing_period, status, mp_preapproval_id, ends_at)
-    VALUES (${uid()}, ${userId}, 'premium', ${billing}, 'active', ${pre.id}, ${endsAtFromPreapproval(pre, billing)})
+    INSERT INTO subscriptions (id, user_id, plan, billing_period, status, mp_preapproval_id, ends_at, amount)
+    VALUES (${uid()}, ${userId}, ${plan}, ${billing}, 'active', ${pre.id}, ${endsAtFromPreapproval(pre, billing)}, ${preAmount(pre)})
   `;
-  return { ok: true, billing };
+  return { ok: true, plan, billing };
 }
 
 // ── GET /api/subscriptions/me ─────────────────────────────────────────────────
@@ -230,11 +238,10 @@ router.post('/grant', async (req, res, next) => {
     if (!user_id)
       return res.status(400).json({ error: 'user_id es requerido' });
 
-    if (!['free', 'premium'].includes(plan))
-      return res.status(400).json({ error: 'plan debe ser "free" o "premium"' });
+    if (plan !== 'free' && !PAID_PLANS.includes(plan))
+      return res.status(400).json({ error: `plan debe ser free o uno de: ${PAID_PLANS.join(', ')}` });
 
-    // Para premium se requiere billing_period; para free no aplica
-    if (plan === 'premium' && !BILLING_DURATIONS[billing_period])
+    if (plan !== 'free' && !BILLING_DURATIONS[billing_period])
       return res.status(400).json({ error: 'billing_period debe ser monthly, quarterly, annual o trial' });
 
     const sql = getDb();
@@ -269,10 +276,14 @@ router.post('/grant', async (req, res, next) => {
 // volver del pago vía el preapproval_id que MP agrega al back_url (ver /sync).
 router.post('/checkout', requireAuth, async (req, res, next) => {
   try {
-    const { billing_period } = req.body;
-    const planId = MP_PLAN_IDS[billing_period]?.();
-    if (!planId)
+    const { plan, billing_period } = req.body;
+    if (!isPurchasable(plan))
+      return res.status(400).json({ error: 'Ese plan no está disponible', code: 'plan_unavailable' });
+    if (billing_period !== 'monthly' && billing_period !== 'annual')
       return res.status(400).json({ error: 'billing_period debe ser monthly o annual' });
+    const planId = mpPlanId(plan, billing_period);
+    if (!planId)
+      return res.status(503).json({ error: 'Ese plan todavía no se puede contratar', code: 'plan_unavailable' });
 
     const sql = getDb();
 
@@ -284,7 +295,7 @@ router.post('/checkout', requireAuth, async (req, res, next) => {
     `;
     await sql`
       INSERT INTO subscriptions (id, user_id, plan, billing_period, status)
-      VALUES (${uid()}, ${req.user.id}, 'premium', ${billing_period}, 'pending')
+      VALUES (${uid()}, ${req.user.id}, ${plan}, ${billing_period}, 'pending')
     `;
 
     const init_point = `https://www.mercadopago.com.ar/subscriptions/checkout?preapproval_plan_id=${planId}`;
@@ -302,8 +313,7 @@ router.post('/webhook', async (req, res) => {
       const preapproval = await new PreApproval(mp).get({ id: body.data.id });
       const sql = getDb();
 
-      // Determinar billing_period según el plan asociado al preapproval.
-      const billing_period = PLAN_BILLING()[preapproval.preapproval_plan_id];
+      const billing_period = mpPlanIndex()[preapproval.preapproval_plan_id]?.billing;
 
       // Matcheo por preapproval_id (lo guarda /sync al volver del pago). MP no
       // expone el payer_email en las suscripciones, así que no hay forma de
@@ -402,8 +412,8 @@ router.get('/sync', requireAuth, async (req, res, next) => {
     catch (_) { return res.json({ synced: false }); }
 
     // Debe estar autorizado y ser de uno de nuestros planes.
-    const billing = PLAN_BILLING()[pre?.preapproval_plan_id];
-    if (pre?.status !== 'authorized' || !billing)
+    const match = mpPlanIndex()[pre?.preapproval_plan_id];
+    if (pre?.status !== 'authorized' || !match)
       return res.json({ synced: false });
 
     // No permitir reclamar un preapproval ya vinculado a otro usuario.
@@ -414,7 +424,7 @@ router.get('/sync', requireAuth, async (req, res, next) => {
       return res.json({ synced: false });
 
     await activatePendingSubscription(
-      sql, req.user.id, pendingSub.id, pre.id, billing, endsAtFromPreapproval(pre, billing),
+      sql, req.user.id, pendingSub.id, pre.id, match, endsAtFromPreapproval(pre, match.billing), preAmount(pre),
     );
     res.json({ synced: true });
   } catch (err) { next(err); }
@@ -458,9 +468,9 @@ router.post('/claim/start', requireAuth, async (req, res, next) => {
           await resend.emails.send({
             from:    MAIL_FROM,
             to:      email,
-            subject: `Tu código para activar Premium: ${code}`,
+            subject: `Tu código para activar tu plan: ${code}`,
             html: `<div style="font-family:sans-serif;max-width:480px;margin:auto">
-              <h2>Activá tu Premium en Padeleando</h2>
+              <h2>Activá tu plan en Padeleando</h2>
               <p>Usá este código para confirmar que sos el titular de esta cuenta de Mercado Pago:</p>
               <p style="font-size:28px;font-weight:bold;letter-spacing:4px">${code}</p>
               <p style="color:#666;font-size:13px">Vence en 15 minutos. Si no pediste esto, ignorá este mail.</p>
@@ -474,7 +484,7 @@ router.post('/claim/start', requireAuth, async (req, res, next) => {
     }
 
     // Fallback: no encontramos un pago reclamable → avisar a los admins.
-    const body   = `reclama su Premium. Pagó en Mercado Pago con el email: ${email}`;
+    const body   = `reclama su plan. Pagó en Mercado Pago con el email: ${email}`;
     const admins = await sql`SELECT id FROM users WHERE role = 'admin'`;
     for (const admin of admins) {
       if (admin.id === req.user.id) continue;

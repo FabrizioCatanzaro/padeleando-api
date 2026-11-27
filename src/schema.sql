@@ -941,3 +941,10 @@ CREATE INDEX IF NOT EXISTS idx_username_history_user ON username_history(user_id
 ALTER TABLE friendly_match_players DROP CONSTRAINT IF EXISTS friendly_match_players_hand_check;
 ALTER TABLE friendly_match_players ADD CONSTRAINT friendly_match_players_hand_check
   CHECK (hand IS NULL OR hand IN ('diestro', 'zurdo', 'ambidiestro'));
+
+-- Planes por rol: premium queda como plan anterior y vale como combo.
+ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_plan_check;
+ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_plan_check
+  CHECK (plan IN ('free', 'premium', 'jugador_plus', 'organizador', 'combo', 'club'));
+-- Monto que cobra Mercado Pago: el precio promocional se mantiene aunque cambie la lista.
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS amount NUMERIC(12, 2);

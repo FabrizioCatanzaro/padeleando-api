@@ -8,9 +8,10 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 
 ---
 
-## Current Status (updated 2026-11-26)
+## Current Status (updated 2026-11-27)
 
-- **In progress: Perfil** — branch `feat/perfil` (both repos), the five stages done, pending review and the merge into `staging`. `db:init` migrates `name` to `first_name`/`last_name`, moves `social_links` to the fixed networks and drops `bio`. See [Perfil](#perfil). Spec: Project doc `claude/perfil-rediseno-spec.md`, mockups: https://claude.ai/artifact/3EXHdQ9P3uexvEc99tTa8U
+- **In progress: Planes por rol** — branch `feat/planes` (both repos). Stage 1 of 5 done: plans by role (Jugador+, Organizador, Combo, Club disabled), role gates, promo/list prices, the plan picker and ad-free paid plans. Next: online signup payment with commission, launch period, boost, referrals. Business model: Project doc `claude/modelo-de-negocio.md`. Pending before release: the six Mercado Pago preapproval plans (`MP_PLAN_ID_<PLAN>_<PERIOD>`).
+- **Previous: Perfil** — branch `feat/perfil` (both repos), the five stages done and merged into `staging`. `db:init` migrates `name` to `first_name`/`last_name`, moves `social_links` to the fixed networks and drops `bio`. See [Perfil](#perfil). Spec: Project doc `claude/perfil-rediseno-spec.md`, mockups: https://claude.ai/artifact/3EXHdQ9P3uexvEc99tTa8U
 - **Last sprint: Navegación por módulos** — on `staging`, PR `staging` → `main` pending. The same PR carries the americano from 4 to 32 pairs. Read-only endpoints for the new logged-in navigation: `/api/me/*`, `/api/padeleros/*` and `?stats=1` on clubs. No schema change. See [Me y Padeleros](#me-y-padeleros). Plan: https://claude.ai/artifact/GC9aYGdjAfUNyqHRokNKKT
 - **Previous sprint: Amistosos** — merged to `main` (front PR #45, API PR #38). Friendly 2 vs 2 matches outside any tournament that count toward the profile once the rival team accepts the result: open matches people join from `/amistosos`, played matches loaded with their result, proposals and counter-proposals, guests who claim their slot by link, reminders generated on read, the profile filter Todos / Torneos / Amistosos, an edit screen and a club-name search. Design doc: https://claude.ai/artifact/2y4oNfCD6oWt2FewGrzHC1
 - **The friendly schema is in production since that deploy**: `db:init` creates `friendly_matches`, `friendly_match_players` and `friendly_match_proposals`, widens `notifications_type_check` and adds `uq_friendly_reminder`. It was tested on a Neon branch that has been deleted.
@@ -143,10 +144,14 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 
 ### Plans and quotas
 
+- **Plans by role** (business model: Project doc `claude/modelo-de-negocio.md`). `subscriptions.plan` is `jugador_plus`, `organizador`, `combo` or `club`; the legacy `premium` counts as `combo`. One active subscription per user: adding a role means moving to the combo. `lib/planCatalog.js` (pure, tested) maps each plan to its roles (`jugador`, `organizador`, `club`) and exports `PLAYER_PLANS` / `ORGANIZER_PLANS` for SQL: `s.plan = ANY(${PLAYER_PLANS})`. Never compare against `'premium'` again.
+- What each role gates: **jugador** → the profile's advanced stats and the badge (`is_premium` on users keeps its name and now means this role); **organizador** → quotas, galleries and category advanced stats (`owner_is_premium` keeps its name and means the category owner has this role); **club** → linking Mercado Pago for bookings, but only once `CLUB_PLAN_ENABLED` is true. While it is false, any club owner links MP for free (`can_collect_online`).
+- `POST /subscriptions/checkout` takes `{ plan, billing_period }`. Each plan and period has its own Mercado Pago preapproval plan in `MP_PLAN_ID_<PLAN>_<PERIOD>` (e.g. `MP_PLAN_ID_COMBO_ANNUAL`); the old `MP_PLAN_ID_MONTHLY`/`ANNUAL` still resolve to `premium`. A plan without its variable answers 503 `plan_unavailable`; `club` answers 400 while disabled. Activating a new plan cancels the previous preapproval in MP, so a plan change never bills twice. `subscriptions.amount` stores what MP charges, so a promo price survives a list-price change.
+- Annual = 10 monthly payments. `clubMonthlyPrice(courts)`: active courts × average `price_60`, floor `CLUB_MIN_PRICE`.
 - `lib/plan.js`: free allows **2 categories** and **2 jornadas per category per calendar month** (counted on `created_at`). `POST /groups` and `POST /tournaments` answer `403 { code: 'plan_limit' }`.
-- **Quotas and premium gates always evaluate the category OWNER**, never the acting user — a premium co-organizer must not lift a free owner's limit.
+- **Quotas and plan gates always evaluate the category OWNER**, never the acting user — an organizer-plan co-organizer must not lift a free owner's limit.
 - **A downgrade never touches what already exists.** Quotas compare against the current total, so a premium user who created 5 categories keeps all 5 working on free; only creating a new one is blocked. Same for jornadas and for already-uploaded photos. Never make a downgrade archive, hide or freeze anything.
-- `requirePremium` middleware gates premium-only features (galleries, avatar upload); `getActiveSubscription` re-checks Mercado Pago only within ~6 h of `ends_at`, not on every request.
+- `getActiveSubscription` returns `plan` and `roles`, and re-checks Mercado Pago only within ~6 h of `ends_at`, not on every request.
 
 ### Domain rules
 

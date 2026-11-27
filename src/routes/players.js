@@ -6,6 +6,7 @@ import { requireGroupManage, requireTournamentManage } from '../middleware/acces
 import { canManageGroup } from '../lib/access.js';
 import { parseAvailability } from '../lib/availability.js';
 import { parseWhatsapp, usaFechas, esCopa } from '../lib/copa.js';
+import { PLAYER_PLANS } from '../lib/planCatalog.js';
 
 const router = Router();
 
@@ -87,7 +88,7 @@ router.get('/group/:groupId', optionalAuth, async (req, res, next) => {
         GROUP  BY tp.player_id
       ) tc ON tc.player_id = p.id
       LEFT   JOIN users u ON u.id = p.user_id
-      LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
       LEFT   JOIN player_invitations pi
         ON   pi.player_id = p.id AND pi.group_id = ${groupId} AND pi.status = 'pending'
       WHERE  ${manager}::boolean

@@ -24,6 +24,7 @@ import {
   sortearZonas, validateZonas, generateCopaFecha, validateCopaFecha,
   zonaStandings, rankClasificados, seedCuadro, seedCuadroDirecto, generateCupBracket, gruposPendientes, ordenarSemillas,
 } from '../lib/copa.js';
+import { PLAYER_PLANS, ORGANIZER_PLANS } from '../lib/planCatalog.js';
 
 const router = Router();
 
@@ -94,7 +95,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              (EXISTS (
                SELECT 1 FROM subscriptions s
                JOIN   groups g ON g.user_id = s.user_id
-               WHERE  g.id = t.group_id AND s.plan = 'premium' AND s.status = 'active'
+               WHERE  g.id = t.group_id AND s.plan = ANY(${ORGANIZER_PLANS}) AND s.status = 'active'
              )) AS owner_is_premium
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
@@ -142,7 +143,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       FROM players p
       INNER JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${id}
       LEFT JOIN users u ON u.id = p.user_id
-      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
       LEFT JOIN player_invitations pi
         ON pi.player_id = p.id AND pi.group_id = ${tournament.group_id} AND pi.status = 'pending'
     `;
@@ -165,7 +166,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
                  (s.id IS NOT NULL) AS is_premium
           FROM   players p
           LEFT   JOIN users u ON u.id = p.user_id
-          LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+          LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
           WHERE  p.id = ANY(${orphanIds})
         `
       : [];

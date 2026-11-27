@@ -7,6 +7,7 @@ import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { canManageGroup }           from '../lib/access.js';
 import { getActiveSubscription }    from './subscriptions.js';
 import { parseInstagramUrl, instagramEmbedUrl, MAX_INSTAGRAM_POSTS } from '../lib/instagram.js';
+import { ORGANIZER_PLANS } from '../lib/planCatalog.js';
 
 const router = Router({ mergeParams: true });
 
@@ -68,7 +69,7 @@ router.post('/instagram', requireAuth, async (req, res, next) => {
     if (!(await canManageGroup(sql, req.user.id, owner.group_id)))
       return res.status(403).json({ error: 'Sin permiso' });
     const ownerSub = await getActiveSubscription(sql, owner.user_id);
-    if (ownerSub.plan !== 'premium')
+    if (!ORGANIZER_PLANS.includes(ownerSub.plan))
       return res.status(403).json({ error: 'Las fotos son una función Premium del dueño de la categoría' });
 
     const [{ count }] = await sql`
@@ -119,7 +120,7 @@ router.post('/', requireAuth, uploadTournamentPhoto, async (req, res, next) => {
 
     // La compuerta premium se evalúa contra el DUEÑO de la categoría, no contra quien sube.
     const ownerSub = await getActiveSubscription(sql, owner.user_id);
-    if (ownerSub.plan !== 'premium')
+    if (!ORGANIZER_PLANS.includes(ownerSub.plan))
       return res.status(403).json({ error: 'Las fotos son una función Premium del dueño de la categoría' });
 
     const [{ count }] = await sql`

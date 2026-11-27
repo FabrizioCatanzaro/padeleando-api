@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { getDb }  from '../db.js';
 import { resolveSignup } from '../lib/signup.js';
 import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations.js';
+import { PLAYER_PLANS, ORGANIZER_PLANS } from '../lib/planCatalog.js';
  
 const router = Router();
  
@@ -25,7 +26,7 @@ router.get('/:tournamentId', async (req, res, next) => {
              g.is_public     AS group_is_public,
              (EXISTS (
                SELECT 1 FROM subscriptions s
-               WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
+               WHERE s.user_id = g.user_id AND s.plan = ANY(${ORGANIZER_PLANS}) AND s.status = 'active'
              )) AS group_owner_is_premium,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
@@ -81,7 +82,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       FROM   players p
       INNER JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${tournamentId}
       LEFT  JOIN users u ON u.id = p.user_id
-      LEFT  JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT  JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
     `;
 
     // Backward-compat: also include any players from matches/pairs not in tournament_players
@@ -100,7 +101,7 @@ router.get('/:tournamentId', async (req, res, next) => {
                  (s.id IS NOT NULL) AS is_premium
           FROM   players p
           LEFT   JOIN users u ON u.id = p.user_id
-          LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+          LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
           WHERE  p.id = ANY(${extraIds})
         `
       : [];

@@ -6,6 +6,7 @@ import { championCountsQuery, leagueTitleRowsQuery } from '../lib/profileQueries
 import { parseAgendaRange, buildAgenda } from '../lib/agenda.js';
 import { arNow } from '../lib/friendlies.js';
 import { FREE_MAX_GROUPS, FREE_TOURNAMENTS_PER_MONTH, FREE_COPAS_PER_MONTH } from '../lib/plan.js';
+import { ORGANIZER_PLANS } from '../lib/planCatalog.js';
 
 const router = Router();
 
@@ -280,7 +281,7 @@ router.get('/organize', requireAuth, async (req, res, next) => {
                ou.username AS owner_username, ou.name AS owner_name,
                gclub.name AS club_name, gclub.photo_url AS club_photo_url,
                EXISTS (SELECT 1 FROM subscriptions s
-                       WHERE s.user_id = g.user_id AND s.status = 'active' AND s.plan = 'premium') AS owner_is_premium,
+                       WHERE s.user_id = g.user_id AND s.status = 'active' AND s.plan = ANY(${ORGANIZER_PLANS})) AS owner_is_premium,
                (SELECT COUNT(DISTINCT tp.player_id)::int FROM tournament_players tp
                 JOIN tournaments t ON t.id = tp.tournament_id WHERE t.group_id = g.id) AS player_count,
                (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
@@ -307,7 +308,7 @@ router.get('/organize', requireAuth, async (req, res, next) => {
       pendingRegistrationsQuery(sql, me),
       sql`
         SELECT EXISTS (SELECT 1 FROM subscriptions s
-                       WHERE s.user_id = ${me} AND s.status = 'active' AND s.plan = 'premium') AS premium,
+                       WHERE s.user_id = ${me} AND s.status = 'active' AND s.plan = ANY(${ORGANIZER_PLANS})) AS premium,
                (SELECT COUNT(*)::int FROM groups WHERE user_id = ${me}) AS groups_owned
       `,
     ]);
