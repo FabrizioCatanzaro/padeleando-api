@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { getDb } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { bracketStatsByUser, countLeagueTitles } from '../lib/profileStats.js';
+import { bracketStatsByUser, countLeagueTitles, countBracketPlayed } from '../lib/profileStats.js';
 import { championCountsQuery, leagueTitleRowsQuery } from '../lib/profileQueries.js';
 import { parseAgendaRange, buildAgenda } from '../lib/agenda.js';
 import { arNow } from '../lib/friendlies.js';
@@ -247,6 +247,10 @@ router.get('/tournaments', requireAuth, async (req, res, next) => {
       SELECT t.id, t.name, t.format, t.status, t.event_date::text AS event_date,
              to_char(t.event_time, 'HH24:MI') AS event_time, t.created_at,
              t.group_id, g.name AS group_name, g.emojis AS group_emojis, c.name AS club_name,
+             c.photo_url AS club_photo_url, t.flyer_url, COALESCE(t.level, g.level) AS level,
+             (SELECT ph.url FROM tournament_photos ph WHERE ph.tournament_id = t.id AND ph.is_cover ORDER BY ph.created_at DESC LIMIT 1) AS cover_url,
+             ou.name AS owner_name, ou.username AS owner_username, ou.avatar_url AS owner_avatar_url,
+             t.bracket, t.bracket_plata,
              mine.plays, mine.manages, mine.my_registration,
              COALESCE(jsonb_typeof(t.live_match) = 'array' AND jsonb_array_length(t.live_match) > 0, false) AS live,
              (SELECT COUNT(*)::int FROM tournament_players tp WHERE tp.tournament_id = t.id) AS player_count,
@@ -261,11 +265,17 @@ router.get('/tournaments', requireAuth, async (req, res, next) => {
       FROM mine
       JOIN tournaments t ON t.id = mine.id
       JOIN groups g ON g.id = t.group_id
+      JOIN users ou ON ou.id = g.user_id
       LEFT JOIN clubs c ON c.id = t.club_id
       WHERE mine.plays OR mine.manages OR mine.my_registration IS NOT NULL
       ORDER BY COALESCE(t.event_date, t.created_at::date) DESC, t.created_at DESC
       LIMIT 200
     `;
+    for (const t of rows) {
+      t.match_count += countBracketPlayed(t.bracket) + countBracketPlayed(t.bracket_plata);
+      delete t.bracket;
+      delete t.bracket_plata;
+    }
     res.json(rows);
   } catch (err) { next(err); }
 });
