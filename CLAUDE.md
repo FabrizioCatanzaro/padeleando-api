@@ -10,6 +10,7 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 
 ## Current Status (updated 2026-11-27)
 
+- **In progress: Home público** — branch `feat/home-publico` (both repos). `GET /api/home` adds champions and open friendlies for the new visitor landing (see [Portada del visitante](#portada-del-visitante)).
 - **In progress: Planes por rol** — branch `feat/planes` (both repos). Stages 1 and 2 of 5 done: plans by role (Jugador+, Organizador, Combo, Club disabled) and online signup payment with commission (see [Cobro online de inscripciones](#cobro-online-de-inscripciones)). Next: launch period, boost, referrals. Business model: Project doc `claude/modelo-de-negocio.md`. Pending before release: the six Mercado Pago preapproval plans (`MP_PLAN_ID_<PLAN>_<PERIOD>`).
 - **Previous: Perfil** — branch `feat/perfil` (both repos), the five stages done and merged into `staging`. `db:init` migrates `name` to `first_name`/`last_name`, moves `social_links` to the fixed networks and drops `bio`. See [Perfil](#perfil). Spec: Project doc `claude/perfil-rediseno-spec.md`, mockups: https://claude.ai/artifact/3EXHdQ9P3uexvEc99tTa8U
 - **Last sprint: Navegación por módulos** — on `staging`, PR `staging` → `main` pending. The same PR carries the americano from 4 to 32 pairs. Read-only endpoints for the new logged-in navigation: `/api/me/*`, `/api/padeleros/*` and `?stats=1` on clubs. No schema change. See [Me y Padeleros](#me-y-padeleros). Plan: https://claude.ai/artifact/GC9aYGdjAfUNyqHRokNKKT
@@ -229,6 +230,13 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - The quota in `/organize` is the category **owner's**, like every plan gate; a co-organizer sees the owner's limits.
 - `routes/padeleros.js`: `GET /players` (`requireAuth`) returns the network counts, "Jugaste con" (top 4 by matches as partner or rival: `matches`, brackets and confirmed friendlies; a player without an account is keyed by normalized name), up to 6 suggested users (shared public tournaments, not followed yet; stats counted like the profile; "Juega en" = most frequent club of the last 6 months) and the 3 most active organizers. The suggested set is a CTE repeated in the three queries that need it, so the whole endpoint is one round of 8 queries. `GET /organizers` (`optionalAuth`): owners of public categories with a tournament in the last 90 days; with `lat`/`lon` it sorts by the closest club.
 - `GET /clubs` and `GET /clubs/nearby` accept `?stats=1`: open friendlies, `bookable` (owner + active courts), active courts, header and WhatsApp, from one extra query run in parallel. Without the flag the response is unchanged.
+
+### Portada del visitante
+
+- `GET /api/home` feeds the visitor landing in one `Promise.all`: live, upcoming, signup, featured, totals, `champions` and `friendlies`.
+- `champions`: the 10 latest finished public tournaments with a bracket final; `lib/homeChampions.js` (tested) shapes the card and reads the score from the winning pair. The cover is the tournament's `is_cover` photo, with no fallback.
+- `friendlies`: `listOpenFriendlies` from `routes/friendlies.js`, the same open public filter as `GET /friendlies`, without a viewer.
+- `signup[].signup` carries `level` and `availability` (`open`/`few`/`full`), never the capacity or the count.
 
 ### HTTP behavior
 
