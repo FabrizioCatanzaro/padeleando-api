@@ -884,14 +884,19 @@ router.get('/search', async (req, res, next) => {
     if (!q || q.length < 2) return res.json([]);
     const sql = getDb();
     const groups = await sql`
-      SELECT g.id, g.name, g.description, g.emojis, g.created_at,
+      SELECT g.id, g.name, g.description, g.emojis, g.created_at, g.level, g.location_name,
              u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
-             COALESCE(gclub.name, lastclub.name) AS club_name
+             COALESCE(gclub.name, lastclub.name) AS club_name,
+             COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url,
+             (SELECT COUNT(DISTINCT tp.player_id)::int FROM tournament_players tp
+              JOIN tournaments t ON t.id = tp.tournament_id WHERE t.group_id = g.id) AS player_count,
+             (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+             (SELECT MIN(t.event_date)::text FROM tournaments t WHERE t.group_id = g.id AND t.status <> 'finished' AND t.event_date >= CURRENT_DATE) AS next_date
       FROM groups g
       JOIN users u ON u.id = g.user_id
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
-        SELECT c2.name
+        SELECT c2.name, c2.photo_url
         FROM   tournaments t2
         JOIN   clubs c2 ON c2.id = t2.club_id
         WHERE  t2.group_id = g.id

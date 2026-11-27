@@ -106,7 +106,8 @@ router.get('/', async (req, res, next) => {
       `,
       // Reserva: categorías públicas con actividad, para que la portada nunca quede vacía.
       sql`
-        SELECT g.id, g.name, g.description, g.emojis, g.location_name, g.is_public,
+        SELECT g.id, g.name, g.description, g.emojis, g.location_name, g.is_public, g.level,
+               (SELECT MIN(t.event_date)::text FROM tournaments t WHERE t.group_id = g.id AND t.status <> 'finished' AND t.event_date >= CURRENT_DATE) AS next_date,
                u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
                (SELECT COUNT(DISTINCT tp.player_id)::int
                 FROM tournament_players tp
@@ -114,12 +115,13 @@ router.get('/', async (req, res, next) => {
                 WHERE t.group_id = g.id) AS player_count,
                (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
                (SELECT MAX(t.created_at) FROM tournaments t WHERE t.group_id = g.id) AS last_activity,
-               COALESCE(gclub.name, lastclub.name) AS club_name
+               COALESCE(gclub.name, lastclub.name) AS club_name,
+               COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url
         FROM groups g
         JOIN users u ON u.id = g.user_id
         LEFT JOIN clubs gclub ON gclub.id = g.club_id
         LEFT JOIN LATERAL (
-          SELECT c2.name
+          SELECT c2.name, c2.photo_url
           FROM   tournaments t2
           JOIN   clubs c2 ON c2.id = t2.club_id
           WHERE  t2.group_id = g.id
