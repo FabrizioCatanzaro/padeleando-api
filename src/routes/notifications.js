@@ -63,7 +63,7 @@ router.get('/', requireAuth, async (req, res, next) => {
       LEFT JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
       LEFT JOIN groups gnt ON gnt.id = tnt.group_id
       LEFT JOIN tournament_registrations tr
-             ON n.type IN ('registration_received', 'registration_decided', 'registration_partner') AND tr.id = n.entity_id
+             ON n.type IN ('registration_received', 'registration_decided', 'registration_partner', 'registration_refund_failed') AND tr.id = n.entity_id
       LEFT JOIN tournaments ttr ON ttr.id = tr.tournament_id
       LEFT JOIN groups gtr ON gtr.id = ttr.group_id
       LEFT JOIN friendly_matches fm ON n.type LIKE 'friendly\_%' AND fm.id = n.entity_id
@@ -143,7 +143,7 @@ router.get('/count', requireAuth, async (req, res, next) => {
         LEFT   JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
         LEFT   JOIN groups gnt ON gnt.id = tnt.group_id
         LEFT   JOIN tournament_registrations tr
-               ON n.type IN ('registration_received', 'registration_decided', 'registration_partner') AND tr.id = n.entity_id
+               ON n.type IN ('registration_received', 'registration_decided', 'registration_partner', 'registration_refund_failed') AND tr.id = n.entity_id
         LEFT   JOIN tournaments ttr ON ttr.id = tr.tournament_id
         LEFT   JOIN groups gtr ON gtr.id = ttr.group_id
         LEFT   JOIN friendly_matches fm ON n.type LIKE 'friendly\_%' AND fm.id = n.entity_id

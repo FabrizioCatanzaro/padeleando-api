@@ -5,6 +5,8 @@ import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations
 import { PLAYER_PLANS, ORGANIZER_PLANS } from '../lib/planCatalog.js';
  
 const router = Router();
+
+const onlineOnlyIfConnected = (signup, connected) => ({ ...signup, online: signup.online && connected === true });
  
 // GET /api/readonly/:tournamentId  — endpoint público sin autenticación
 router.get('/:tournamentId', async (req, res, next) => {
@@ -17,6 +19,7 @@ router.get('/:tournamentId', async (req, res, next) => {
              u.name          AS owner_name,
              u.avatar_url    AS owner_avatar_url,
              json_build_object('whatsapp', CASE WHEN u.whatsapp_public THEN u.whatsapp END, 'instagram', u.instagram) AS owner_profile,
+             (u.mp_connected_at IS NOT NULL) AS owner_mp_connected,
              g.name          AS group_name,
              -- La vista de espectador pedía esto en una segunda llamada a
              -- /groups/:id/meta que sólo podía salir cuando ya había respondido
@@ -159,7 +162,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       points_loss:    tournament.points_loss ?? 0,
       flyer_url:      tournament.flyer_url ?? null,
       // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
-      signup: publicSignup(resolveSignup(tournament, {
+      signup: publicSignup(onlineOnlyIfConnected(resolveSignup(tournament, {
         signup_open:       tournament.group_signup_open,
         signup_price:      tournament.group_signup_price,
         signup_price_unit: tournament.group_signup_price_unit,
@@ -169,7 +172,9 @@ router.get('/:tournamentId', async (req, res, next) => {
         signup_capacity_unit: tournament.group_signup_capacity_unit,
         signup_closes_at:     tournament.group_signup_closes_at,
         rules:                tournament.group_rules,
-      }, tournament.owner_profile), { format: tournament.format, used: await countUsedPlayers(sql, tournamentId) }),
+      }, tournament.owner_profile), tournament.owner_mp_connected), {
+        format: tournament.format, used: await countUsedPlayers(sql, tournamentId), organizerPlan: tournament.group_owner_is_premium,
+      }),
       // El plantel queda oculto hasta que empieza el torneo (Fabri, 2026-11-09).
       players:           rosterHidden ? [] : players,
       pairs:             rosterHidden ? [] : pairs,

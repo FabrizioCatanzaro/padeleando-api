@@ -30,6 +30,7 @@ import friendliesRouter     from './routes/friendlies.js';
 import meRouter             from './routes/me.js';
 import padelerosRouter      from './routes/padeleros.js';
 import { getDb } from './db.js';
+import paymentsRouter from './routes/payments.js';
 
 const app  = express();
 const PORT = process.env.PORT ?? 3001;
@@ -100,6 +101,7 @@ const PUBLIC_CACHEABLE = [
 const NEVER_STORE = [
   '/api/auth',
   '/api/subscriptions',
+  '/api/payments',
   '/api/admin',
   '/api/notifications',
   '/api/invitations',
@@ -153,6 +155,7 @@ app.use('/api/readonly',    readonlyRouter);
 app.use('/api/invitations',    invitationsRouter);
 app.use('/api/join-requests',  joinRequestsRouter);
 app.use('/api/registrations',  registrationsRouter);
+app.use('/api/payments',       paymentsRouter);
 app.use('/api/follows',        followsRouter);
 app.use('/api/notifications',  notificationsRouter);
 app.use('/api/subscriptions', subscriptionsRouter);

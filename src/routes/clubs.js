@@ -10,6 +10,7 @@ import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
 import { arNow } from '../lib/friendlies.js';
 import { CLUB_PLAN_ENABLED } from '../lib/planCatalog.js';
+import { saveUserMp, exchangeCode } from '../lib/mpAccount.js';
 
 const router = Router();
 
@@ -1040,11 +1041,18 @@ router.get('/mercadopago/callback', async (req, res) => {
   const fail = (clubId) => res.redirect(`${process.env.FRONTEND_URL}/club/${clubId ?? ''}?mp=error`);
   try {
     const { code, state } = req.query;
-    let clubId;
+    let clubId, userId;
     try {
-      ({ clubId } = jwt.verify(state, MP_STATE_SECRET));
+      ({ clubId, userId } = jwt.verify(state, MP_STATE_SECRET));
     } catch {
       return fail(null);
+    }
+    // La misma redirect_uri sirve al organizador que vincula su cuenta para cobrar inscripciones.
+    if (userId) {
+      const back = (r) => res.redirect(`${process.env.FRONTEND_URL}/torneos/organizar?mp=${r}`);
+      if (!code) return back('error');
+      try { await saveUserMp(getDb(), userId, await exchangeCode(code)); return back('connected'); }
+      catch (e) { console.error('Error al vincular Mercado Pago del organizador:', e.message); return back('error'); }
     }
     if (!code) return fail(clubId);
 

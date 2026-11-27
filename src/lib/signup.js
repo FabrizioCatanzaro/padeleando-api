@@ -3,6 +3,7 @@
 // porque se configura en el mismo lugar y se hereda igual.
 import { parseLevel } from './category.js';
 import { profileContacts } from './profile.js';
+import { FEE_PAYERS } from './commission.js';
 
 export const CONTACT_TYPES = ['whatsapp', 'phone', 'email', 'instagram'];
 
@@ -10,6 +11,7 @@ const MAX_CONTACTS = 4;
 const MAX_VALUE    = 80;
 const MAX_PRICE    = 100_000_000;
 export const MAX_RULES = 10_000;
+export const MAX_PAYMENT_NOTE = 200;
 
 class SignupError extends Error {}
 
@@ -101,6 +103,23 @@ export function parseSignupFields(body) {
     }
   }
 
+  // Cobro online: sólo del torneo, sin herencia.
+  if ('signup_online' in body) {
+    if (typeof body.signup_online !== 'boolean') throw new SignupError('signup_online debe ser booleano');
+    out.signup_online = body.signup_online;
+  }
+  if ('signup_fee_payer' in body) {
+    if (!FEE_PAYERS.includes(body.signup_fee_payer)) throw new SignupError('signup_fee_payer debe ser "player" u "organizer"');
+    out.signup_fee_payer = body.signup_fee_payer;
+  }
+  if ('signup_payment_note' in body) {
+    const v = body.signup_payment_note;
+    if (v !== null && typeof v !== 'string') throw new SignupError('Los otros medios de pago deben ser texto');
+    const clean = (v ?? '').trim();
+    if (clean.length > MAX_PAYMENT_NOTE) throw new SignupError(`Los otros medios de pago no pueden superar los ${MAX_PAYMENT_NOTE} caracteres`);
+    out.signup_payment_note = clean || null;
+  }
+
   // Reglamento del torneo: texto libre; vacío vuelve a heredar.
   if ('rules' in body) {
     const v = body.rules;
@@ -135,6 +154,9 @@ export function resolveSignup(tournament, group, ownerProfile = null) {
     capacity_unit: pick('signup_capacity_unit') ?? 'pair',
     closes_at:     pick('signup_closes_at'),
     rules:         pick('rules'),
+    online:        tournament?.signup_online === true,
+    fee_payer:     tournament?.signup_fee_payer ?? 'player',
+    payment_note:  tournament?.signup_payment_note ?? null,
   };
 }
 
