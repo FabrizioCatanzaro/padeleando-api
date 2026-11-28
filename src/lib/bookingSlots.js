@@ -39,3 +39,6 @@ export function withinHorizon(date, firstTime, today, horizonDays) {
   if (date <= last) return true;
   return date === addDaysStr(last, 1) && timeToMinutes(firstTime) < 12 * 60;
 }
+
+// Un turno que ya empezó no se puede reservar
+export const hasStarted = (item, now) => `${item.date} ${item.start_time}` <= `${now.date} ${now.time}`;

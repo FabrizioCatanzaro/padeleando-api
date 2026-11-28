@@ -9,7 +9,7 @@ import { uploadClubPhoto, uploadClubHeader, uploadClubClaimPhotos } from '../mid
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
 import { arNow } from '../lib/friendlies.js';
-import { expandBookingSlots, withinHorizon, addDaysStr } from '../lib/bookingSlots.js';
+import { expandBookingSlots, withinHorizon, addDaysStr, hasStarted } from '../lib/bookingSlots.js';
 import { parseClubExtras, parseCourtExtras, COURT_WALL_TYPES, clubPhotoLimit } from '../lib/clubProfile.js';
 
 const CLUB_PLANS = plansWith('club');
@@ -1486,6 +1486,7 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
     if (!withinHorizon(req.body.date, items[0].start_time, todayStr(), BOOKING_HORIZON_DAYS)) {
       return res.status(400).json({ error: `Sólo se puede reservar dentro de los próximos ${BOOKING_HORIZON_DAYS} días` });
     }
+    if (hasStarted(items[0], arNow())) return res.status(400).json({ error: 'Ese horario ya pasó' });
 
     let court_id = null;
     let court_name = null;

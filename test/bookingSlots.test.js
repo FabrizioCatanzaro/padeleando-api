@@ -42,3 +42,12 @@ test('horizonte de 7 días más la madrugada del día siguiente al último', () 
   assert.equal(withinHorizon('2026-12-05', '15:00', today, 7), false);
   assert.equal(addDaysStr('2026-11-30', 1), '2026-12-01');
 });
+
+import { hasStarted } from '../src/lib/bookingSlots.js';
+
+test('hasStarted compara fecha y hora', () => {
+  const now = { date: '2026-11-28', time: '21:10' };
+  assert.equal(hasStarted({ date: '2026-11-28', start_time: '21:00' }, now), true);
+  assert.equal(hasStarted({ date: '2026-11-28', start_time: '21:30' }, now), false);
+  assert.equal(hasStarted({ date: '2026-11-29', start_time: '00:30' }, now), false);
+});
