@@ -1,8 +1,14 @@
 // Reglas puras de la inscripción a torneos. Las rutas (routes/registrations.js)
 // leen la base, llaman acá y escriben. Tests: test/registrations.test.js.
+import { quote } from './commission.js';
 
 /** Estados que ocupan al usuario: no puede tener otra inscripción en el torneo. */
-export const ACTIVE_STATUSES = ['pending', 'approved', 'waitlist'];
+export const ACTIVE_STATUSES = ['awaiting_payment', 'pending', 'approved', 'waitlist'];
+
+/** Minutos que se guarda una inscripción mientras se paga. */
+export const PAYMENT_HOLD_MINUTES = 30;
+/** Margen antes de vencer una inscripción sin pago: el aviso de MP puede llegar tarde. */
+export const PAYMENT_GRACE_MINUTES = 10;
 
 /** Tope del americano: 32 parejas. */
 export const AMERICANO_MAX_PLAYERS = 64;
@@ -87,11 +93,19 @@ export function availability(capPlayers, used) {
   return 'open';
 }
 
-/** La inscripción sin los números del cupo, con su disponibilidad. */
-export function publicSignup(signup, { format, used }) {
+/** La inscripción sin los números del cupo, con su disponibilidad y lo que paga cada uno online. */
+export function publicSignup(signup, { format, used, organizerPlan = false, waived = false }) {
   const { capacity, capacity_unit, ...rest } = signup;
   const cap = capacityInPlayers({ capacity, unit: capacity_unit, format });
-  return { ...rest, availability: availability(cap, used) };
+  const out = { ...rest, availability: availability(cap, used) };
+  if (signup.online && signup.price > 0) {
+    const q = (kind) => {
+      const { total, fee } = quote({ price: signup.price, unit: signup.unit, kind, payer: signup.fee_payer, organizerPlan, waived });
+      return { total, fee: signup.fee_payer === 'player' ? fee : 0 };
+    };
+    out.online_quote = { solo: q('solo'), pair: q('pair') };
+  }
+  return out;
 }
 
 /**

@@ -10,6 +10,7 @@ import { linkPreapprovalToUser } from './subscriptions.js';
 import { mdToHtml, personalize } from '../lib/richText.js';
 import AdminBroadcastTemplate from '../emails/AdminBroadcast.jsx';
 import { color as mailColor } from '../emails/theme.js';
+import { PLANS } from '../lib/planCatalog.js';
 
 const resend    = new Resend(process.env.RESEND_API_KEY);
 const MAIL_FROM = process.env.MAIL_FROM || 'Padeleando <onboarding@resend.dev>';
@@ -40,7 +41,7 @@ router.get('/stats', async (_req, res, next) => {
         (SELECT COUNT(*) FROM matches WHERE created_at > NOW() - INTERVAL '30 days')::int                AS matches_30d,
         (SELECT COUNT(*) FROM players)::int                                                              AS total_players,
         (SELECT COUNT(*) FROM subscriptions
-           WHERE plan = 'premium' AND status = 'active'
+           WHERE plan <> 'free' AND status = 'active'
              AND (ends_at IS NULL OR ends_at > NOW()))::int                                              AS premium_users,
         (SELECT COUNT(*) FROM tournament_photos)::int                                                    AS total_photos,
         (SELECT COUNT(*) FROM clubs)::int                                                                AS total_clubs,
@@ -226,10 +227,12 @@ router.post('/users/:id/grant-premium', async (req, res, next) => {
       WHERE user_id = ${id} AND status = 'active'
     `;
 
+    const plan = req.body?.plan ?? 'combo';
+    if (!PLANS.includes(plan)) return res.status(400).json({ error: `plan debe ser uno de: ${PLANS.join(', ')}` });
     const ends_at = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
     const [created] = await sql`
       INSERT INTO subscriptions (id, user_id, plan, billing_period, status, ends_at)
-      VALUES (${uid()}, ${id}, 'premium', 'trial', 'active', ${ends_at})
+      VALUES (${uid()}, ${id}, ${plan}, 'trial', 'active', ${ends_at})
       RETURNING id, plan, billing_period, status, starts_at, ends_at
     `;
 
@@ -247,7 +250,7 @@ router.post('/users/:id/revoke-premium', async (req, res, next) => {
     const result = await sql`
       UPDATE subscriptions
       SET status = 'cancelled', ends_at = NOW()
-      WHERE user_id = ${id} AND status = 'active' AND plan = 'premium'
+      WHERE user_id = ${id} AND status = 'active' AND plan <> 'free'
     `;
 
     res.json({ ok: true, cancelled: result.length ?? result.count ?? 0 });
@@ -327,7 +330,7 @@ router.post('/broadcast', async (req, res, next) => {
         WHERE u.email_verified_at IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM subscriptions s
-            WHERE s.user_id = u.id AND s.plan = 'premium' AND s.status = 'active'
+            WHERE s.user_id = u.id AND s.plan <> 'free' AND s.status = 'active'
               AND (s.ends_at IS NULL OR s.ends_at > NOW())
           )
       `;
@@ -337,7 +340,7 @@ router.post('/broadcast', async (req, res, next) => {
         WHERE u.email_verified_at IS NOT NULL
           AND EXISTS (
             SELECT 1 FROM subscriptions s
-            WHERE s.user_id = u.id AND s.plan = 'premium' AND s.status = 'active'
+            WHERE s.user_id = u.id AND s.plan <> 'free' AND s.status = 'active'
               AND (s.ends_at IS NULL OR s.ends_at > NOW())
           )
       `;

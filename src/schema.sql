@@ -394,7 +394,8 @@ ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
                   'player_unlinked','new_tournament','club_claim','booking_decided','booking_requested',
                   'booking_cancelled','registration_received','registration_decided','registration_partner',
                   'friendly_added','friendly_joined','friendly_left','friendly_removed','friendly_full',
-                  'friendly_updated','friendly_proposal','friendly_confirmed','friendly_cancelled','friendly_reminder'));
+                  'friendly_updated','friendly_proposal','friendly_confirmed','friendly_cancelled','friendly_reminder',
+                  'registration_refund_failed','commission_due'));
 
 -- Broadcasts de admin: lista de destinatarios cuando target = 'user' (varios usuarios).
 -- La tabla vive en migration_admin_broadcasts.sql; el IF EXISTS evita fallar si aún no se creó.
@@ -941,3 +942,106 @@ CREATE INDEX IF NOT EXISTS idx_username_history_user ON username_history(user_id
 ALTER TABLE friendly_match_players DROP CONSTRAINT IF EXISTS friendly_match_players_hand_check;
 ALTER TABLE friendly_match_players ADD CONSTRAINT friendly_match_players_hand_check
   CHECK (hand IS NULL OR hand IN ('diestro', 'zurdo', 'ambidiestro'));
+
+-- Planes por rol: premium queda como plan anterior y vale como combo.
+ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_plan_check;
+ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_plan_check
+  CHECK (plan IN ('free', 'premium', 'jugador_plus', 'organizador', 'combo', 'club'));
+-- Monto que cobra Mercado Pago: el precio promocional se mantiene aunque cambie la lista.
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS amount NUMERIC(12, 2);
+
+-- Cobro online de inscripciones (2026-11-27). Ver lib/commission.js y lib/mpAccount.js.
+-- Cuenta de Mercado Pago del dueño de la categoría, vinculada por OAuth. Nunca sale en la sesión.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mp_user_id       TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mp_access_token  TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mp_refresh_token TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mp_public_key    TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mp_connected_at  TIMESTAMPTZ;
+
+-- Se configura por torneo, sin herencia de la categoría.
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_online       BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_fee_payer    TEXT    NOT NULL DEFAULT 'player';
+ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS signup_payment_note TEXT;
+ALTER TABLE tournaments DROP CONSTRAINT IF EXISTS tournaments_signup_fee_payer_check;
+ALTER TABLE tournaments ADD  CONSTRAINT tournaments_signup_fee_payer_check
+  CHECK (signup_fee_payer IN ('player', 'organizer'));
+
+-- awaiting_payment: inscripción creada que espera el pago (30 min); al acreditarse pasa a pending.
+ALTER TABLE tournament_registrations DROP CONSTRAINT IF EXISTS tournament_registrations_status_check;
+ALTER TABLE tournament_registrations ADD  CONSTRAINT tournament_registrations_status_check
+  CHECK (status IN ('awaiting_payment', 'pending', 'approved', 'rejected', 'waitlist', 'cancelled'));
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS payment_status     TEXT;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS price_amount       NUMERIC(12, 2);
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS fee_amount         NUMERIC(12, 2);
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS total_amount       NUMERIC(12, 2);
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS mp_preference_id   TEXT;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS mp_init_point      TEXT;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS mp_payment_id      TEXT;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS payment_expires_at TIMESTAMPTZ;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS refunded_at        TIMESTAMPTZ;
+ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS refund_error       TEXT;
+ALTER TABLE tournament_registrations DROP CONSTRAINT IF EXISTS tournament_registrations_payment_status_check;
+ALTER TABLE tournament_registrations ADD  CONSTRAINT tournament_registrations_payment_status_check
+  CHECK (payment_status IS NULL OR payment_status IN ('pending', 'approved', 'refunded', 'refund_failed'));
+DROP INDEX IF EXISTS uq_registrations_active_p1;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_registrations_active_p1
+  ON tournament_registrations(tournament_id, p1_user_id)
+  WHERE status IN ('awaiting_payment', 'pending', 'approved', 'waitlist');
+CREATE UNIQUE INDEX IF NOT EXISTS uq_registrations_mp_payment
+  ON tournament_registrations(mp_payment_id) WHERE mp_payment_id IS NOT NULL;
+
+-- Liquidación de comisiones (2026-11-27): sin split de Mercado Pago la inscripción entra entera al
+-- organizador y la comisión se paga después, una por torneo al cerrar la inscripción. Ver lib/settlements.js.
+CREATE TABLE IF NOT EXISTS commission_settlements (
+  id                  TEXT PRIMARY KEY,
+  tournament_id       TEXT NOT NULL UNIQUE REFERENCES tournaments(id) ON DELETE CASCADE,
+  owner_id            TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  amount              NUMERIC(12, 2) NOT NULL,
+  credit_applied      NUMERIC(12, 2) NOT NULL DEFAULT 0,
+  registrations_count INTEGER NOT NULL DEFAULT 0,
+  status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'cancelled')),
+  due_at              TIMESTAMPTZ NOT NULL,
+  mp_preference_id    TEXT,
+  mp_init_point       TEXT,
+  mp_payment_id       TEXT UNIQUE,
+  paid_at             TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (credit_applied >= 0 AND credit_applied <= amount)
+);
+CREATE INDEX IF NOT EXISTS idx_settlements_owner ON commission_settlements(owner_id, status);
+
+-- Perfil de club: servicios, email, color y descripción de cada cancha
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS amenities       TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS amenities_other TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS contact_email   TEXT;
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS floor_color TEXT;
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE club_courts DROP CONSTRAINT IF EXISTS club_courts_wall_type_check;
+ALTER TABLE club_courts ADD CONSTRAINT club_courts_wall_type_check
+  CHECK (wall_type IS NULL OR wall_type IN ('cemento', 'cristal', 'cristal_panoramico'));
+
+-- Perfil de club: galería y seguidores
+CREATE TABLE IF NOT EXISTS club_photos (
+  id         TEXT PRIMARY KEY,
+  club_id    TEXT NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  url        TEXT NOT NULL,
+  public_id  TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_club_photos_club ON club_photos(club_id, created_at);
+CREATE TABLE IF NOT EXISTS club_follows (
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  club_id    TEXT NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, club_id)
+);
+CREATE INDEX IF NOT EXISTS idx_club_follows_club ON club_follows(club_id);
+ALTER TABLE IF EXISTS notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
+ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
+  CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
+                  'collab_invite','ownership_transfer','ownership_received','premium_claim',
+                  'player_unlinked','new_tournament','club_claim','booking_decided','booking_requested',
+                  'booking_cancelled','registration_received','registration_decided','registration_partner',
+                  'friendly_added','friendly_joined','friendly_left','friendly_removed','friendly_full',
+                  'friendly_updated','friendly_proposal','friendly_confirmed','friendly_cancelled','friendly_reminder',
+                  'registration_refund_failed','commission_due','club_tournament_signup'));

@@ -9,6 +9,15 @@ import { uploadClubPhoto, uploadClubHeader, uploadClubClaimPhotos } from '../mid
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
 import { arNow } from '../lib/friendlies.js';
+import { expandBookingSlots, withinHorizon, addDaysStr, hasStarted } from '../lib/bookingSlots.js';
+import { parseClubExtras, parseCourtExtras, COURT_WALL_TYPES, clubPhotoLimit } from '../lib/clubProfile.js';
+
+const CLUB_PLANS = plansWith('club');
+import { activityFrom, buildActivity } from '../lib/clubActivity.js';
+import { championCard } from '../lib/homeChampions.js';
+import { listOpenFriendlies } from './friendlies.js';
+import { CLUB_PLAN_ENABLED, plansWith } from '../lib/planCatalog.js';
+import { saveUserMp, exchangeCode } from '../lib/mpAccount.js';
 
 const router = Router();
 
@@ -421,11 +430,12 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     // ve también las deshabilitadas temporalmente, para poder reactivarlas).
     // Filtrar por gestión exacta requiere saber owner_id, que recién se sabe
     // con `club` resuelto -- se filtra en JS un poco más abajo.
-    const [[club], [agg], brackets, courtsList, [pendingBookings]] = await Promise.all([
+    const [[club], [agg], brackets, courtsList, [pendingBookings], photos, [follows]] = await Promise.all([
       sql`
         SELECT c.id, c.name, c.photo_url, c.header_url, c.social_links,
         c.contact_phone, c.contact_whatsapp,
         c.location_name, c.lat, c.lon, c.courts, c.slot_minutes, c.schedule, c.created_at,
+        c.amenities, c.amenities_other, c.contact_email,
         (c.owner_id IS NOT NULL)          AS has_owner,
         COALESCE(c.owner_id = ${viewerId}, false) AS is_owner,
         c.owner_visible,
@@ -433,10 +443,14 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         CASE WHEN c.owner_visible THEN ou.username     ELSE NULL END AS owner_username,
         CASE WHEN c.owner_visible THEN ou.avatar_url    ELSE NULL END AS owner_avatar_url,
         (c.mp_access_token IS NOT NULL) AS mp_connected,
-        (EXISTS (
+        (c.owner_id IS NOT NULL AND (NOT ${CLUB_PLAN_ENABLED} OR EXISTS (
           SELECT 1 FROM subscriptions s
-          WHERE s.user_id = c.owner_id AND s.plan = 'premium' AND s.status = 'active'
-        )) AS owner_is_premium
+          WHERE s.user_id = c.owner_id AND s.plan = 'club' AND s.status = 'active'
+        ))) AS can_collect_online,
+        (${CLUB_PLAN_ENABLED}::boolean AND EXISTS (
+          SELECT 1 FROM subscriptions s
+          WHERE s.user_id = c.owner_id AND s.plan = ANY(${CLUB_PLANS}) AND s.status = 'active'
+        )) AS owner_has_club_plan
         FROM clubs c
         LEFT JOIN users ou ON ou.id = c.owner_id
         WHERE c.id = ${req.params.id}
@@ -469,12 +483,17 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       `,
       // Trae TODAS las canchas acá (activas e inactivas): se filtran abajo.
       sql`
-        SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+        SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
         FROM club_courts WHERE club_id = ${req.params.id}
         ORDER BY sort_order ASC, created_at ASC
       `,
       // Cuenta grupos de reservas, no filas: un grupo de varios turnos son varias filas
       sql`SELECT COUNT(DISTINCT group_id)::int AS n FROM bookings WHERE club_id = ${req.params.id} AND status = 'pending'`,
+      sql`SELECT id, url FROM club_photos WHERE club_id = ${req.params.id} ORDER BY created_at`,
+      sql`
+        SELECT COUNT(*)::int AS n, COALESCE(bool_or(user_id = ${viewerId}), false) AS mine
+        FROM club_follows WHERE club_id = ${req.params.id}
+      `,
     ]);
 
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
@@ -485,8 +504,13 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     // Más estricto que isManager: el admin solo gestiona reservas de clubes sin dueño
     const canManageBookings = club.is_owner === true || (req.user?.role === 'admin' && !club.has_owner);
 
+    const { owner_has_club_plan, ...publicClub } = club;
     res.json({
-      ...club,
+      ...publicClub,
+      photos,
+      photo_limit: isManager ? clubPhotoLimit(owner_has_club_plan) : undefined,
+      followers_count: follows?.n ?? 0,
+      is_following: !!follows?.mine,
       courts_list,
       can_manage_bookings: canManageBookings,
       pending_bookings_count: canManageBookings ? (pendingBookings?.n ?? 0) : undefined,
@@ -505,12 +529,18 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
 router.get('/:id/events', async (req, res, next) => {
   try {
     const sql = getDb();
-    const [club] = await sql`SELECT id FROM clubs WHERE id = ${req.params.id}`;
-    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
-
-    const rows = await sql`
+    const clubId = req.params.id;
+    const today = arNow().date;
+    const from = activityFrom(today);
+    const [[club], rows, champions, friendlies, activityRows] = await Promise.all([
+      sql`SELECT id FROM clubs WHERE id = ${clubId}`,
+      sql`
       SELECT
-        t.id, t.name, t.format, t.mode, t.status, t.event_date, t.created_at,
+        t.id, t.name, t.format, t.mode, t.status, t.event_date, t.event_time, t.created_at,
+        t.flyer_url, COALESCE(t.level, g.level) AS level,
+        (SELECT ph.url FROM tournament_photos ph WHERE ph.tournament_id = t.id AND ph.is_cover ORDER BY ph.created_at DESC LIMIT 1) AS cover_url,
+        (t.status <> 'finished' AND COALESCE(t.signup_open, g.signup_open, false)
+         AND (t.event_date IS NULL OR t.event_date >= ${today}::date)) AS signup_open,
         -- No alcanza con IS NOT NULL: live_match queda en un array vacío cuando
         -- se cierra el último partido, y una jornada terminada conserva el
         -- payload viejo. Misma condición que la consulta live de GET /api/home.
@@ -524,9 +554,54 @@ router.get('/:id/events', async (req, res, next) => {
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
       LEFT JOIN users u ON u.id = g.user_id
-      WHERE t.club_id = ${req.params.id} AND g.is_public = true
+      WHERE t.club_id = ${clubId} AND g.is_public = true
       ORDER BY COALESCE(t.event_date, t.created_at::date) DESC
-    `;
+    `,
+      sql`
+        SELECT t.id, t.name, t.format, t.bracket->'final' AS final,
+               COALESCE(t.level, g.level) AS level,
+               COALESCE(t.event_date, (SELECT MIN(m.played_at)::date FROM matches m WHERE m.tournament_id = t.id), t.created_at::date) AS played_on,
+               g.id AS group_id, g.name AS group_name,
+               ou.name AS owner_name, ou.username AS owner_username,
+               COALESCE(u1.name, p1.name) AS p1_name, u1.avatar_url AS p1_avatar, u1.username AS p1_username,
+               COALESCE(u2.name, p2.name) AS p2_name, u2.avatar_url AS p2_avatar, u2.username AS p2_username
+        FROM   tournaments t
+        JOIN   groups g  ON g.id = t.group_id
+        JOIN   users  ou ON ou.id = g.user_id
+        JOIN   pairs  pr ON pr.tournament_id = t.id AND pr.id = t.bracket->'final'->>'winner_id'
+        LEFT   JOIN players p1 ON p1.id = pr.p1_id
+        LEFT   JOIN users   u1 ON u1.id = p1.user_id
+        LEFT   JOIN players p2 ON p2.id = pr.p2_id
+        LEFT   JOIN users   u2 ON u2.id = p2.user_id
+        WHERE  t.club_id = ${clubId} AND g.is_public = true
+          AND  t.status = 'finished'
+          AND  t.bracket->'final'->>'winner_id' IS NOT NULL
+        ORDER  BY played_on DESC, t.created_at DESC
+        LIMIT  3
+      `,
+      listOpenFriendlies(sql, 20, clubId),
+      sql`
+        WITH tt AS (
+          SELECT t.id, COALESCE(t.event_date, t.created_at::date) AS d
+          FROM tournaments t JOIN groups g ON g.id = t.group_id AND g.is_public = true
+          WHERE t.club_id = ${clubId}
+        ), people AS (
+          SELECT tt.d, COALESCE('u:' || p.user_id, 'n:' || lower(trim(p.name))) AS k
+          FROM tt JOIN tournament_players tp ON tp.tournament_id = tt.id JOIN players p ON p.id = tp.player_id
+          UNION ALL
+          SELECT fm.date, COALESCE('u:' || fp.user_id, 'n:' || lower(trim(fp.guest_name)))
+          FROM friendly_matches fm JOIN friendly_match_players fp ON fp.match_id = fm.id
+          WHERE fm.club_id = ${clubId} AND fm.status = 'confirmado'
+            AND (fp.user_id IS NOT NULL OR fp.guest_name IS NOT NULL)
+        )
+        SELECT 'torneos' AS serie, 'm' AS kind, to_char(d, 'YYYY-MM') AS key, COUNT(*)::int AS n FROM tt WHERE d >= ${from}::date GROUP BY 3
+        UNION ALL SELECT 'torneos', 'y', to_char(d, 'YYYY'), COUNT(*)::int FROM tt GROUP BY 3
+        UNION ALL SELECT 'jugadores', 'm', to_char(d, 'YYYY-MM'), COUNT(DISTINCT k)::int FROM people WHERE d >= ${from}::date GROUP BY 3
+        UNION ALL SELECT 'jugadores', 'y', to_char(d, 'YYYY'), COUNT(DISTINCT k)::int FROM people GROUP BY 3
+        UNION ALL SELECT 'jugadores', 'total', 'total', COUNT(DISTINCT k)::int FROM people
+      `,
+    ]);
+    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
     const events = { upcoming: [], ongoing: [], past: [] };
     for (const t of rows) {
@@ -538,7 +613,12 @@ router.get('/:id/events', async (req, res, next) => {
     }
     // upcoming en orden cronológico ascendente (lo más próximo primero)
     events.upcoming.reverse();
-    res.json(events);
+    res.json({
+      ...events,
+      champions: champions.map(championCard),
+      friendlies,
+      activity: buildActivity(activityRows, today),
+    });
   } catch (err) { next(err); }
 });
 
@@ -659,6 +739,9 @@ router.put('/:id', requireAuth, requireClubManage, async (req, res, next) => {
 
     const f = clubFields(req.body);
     const ownerVisible = typeof req.body?.owner_visible === 'boolean' ? req.body.owner_visible : null;
+    const extras = parseClubExtras(req.body);
+    if (extras.error) return res.status(400).json({ error: extras.error });
+    const x = extras.fields;
 
     const [current] = await sql`
       SELECT name, location_name, lat, lon FROM clubs WHERE id = ${req.params.id}
@@ -684,10 +767,14 @@ router.put('/:id', requireAuth, requireClubManage, async (req, res, next) => {
         lon              = CASE WHEN ${isAdmin}::boolean THEN ${f.lon} ELSE lon END,
         courts           = ${f.courts},
         slot_minutes     = ${f.slot_minutes},
-        owner_visible    = COALESCE(${ownerVisible}::boolean, owner_visible)
+        owner_visible    = COALESCE(${ownerVisible}::boolean, owner_visible),
+        amenities        = CASE WHEN ${'amenities' in x}::boolean THEN ${x.amenities ?? []}::text[] ELSE amenities END,
+        amenities_other  = CASE WHEN ${'amenities_other' in x}::boolean THEN ${x.amenities_other ?? null} ELSE amenities_other END,
+        contact_email    = CASE WHEN ${'contact_email' in x}::boolean THEN ${x.contact_email ?? null} ELSE contact_email END
       WHERE id = ${req.params.id}
       RETURNING id, name, photo_url, header_url, social_links, contact_phone, contact_whatsapp,
-      location_name, lat, lon, courts, slot_minutes, schedule, owner_visible, created_at
+      location_name, lat, lon, courts, slot_minutes, schedule, owner_visible, created_at,
+      amenities, amenities_other, contact_email
     `;
 
     let pendingIdentityRequestId = null;
@@ -857,9 +944,76 @@ router.delete('/:id/header', requireAuth, requireClubManage, async (req, res, ne
   } catch (err) { next(err); }
 });
 
+// Galería: el límite sale del plan del dueño; bajar de plan no borra las que ya están
+router.post('/:id/photos', requireAuth, requireClubManage, uploadClubPhoto, async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No se envió imagen' });
+    const sql = getDb();
+    const [[club], [{ n }]] = await Promise.all([
+      sql`
+        SELECT c.id, (${CLUB_PLAN_ENABLED}::boolean AND EXISTS (
+          SELECT 1 FROM subscriptions s
+          WHERE s.user_id = c.owner_id AND s.plan = ANY(${CLUB_PLANS}) AND s.status = 'active'
+        )) AS has_plan
+        FROM clubs c WHERE c.id = ${req.params.id}
+      `,
+      sql`SELECT COUNT(*)::int AS n FROM club_photos WHERE club_id = ${req.params.id}`,
+    ]);
+    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
+    const limit = clubPhotoLimit(club.has_plan);
+    if (n >= limit) return res.status(403).json({ error: `Llegaste al límite de ${limit} fotos`, code: 'plan_limit', limit });
+
+    const result = await uploadBuffer(req.file.buffer, { folder: `padeliando/clubs/${club.id}/gallery` });
+    const [photo] = await sql`
+      INSERT INTO club_photos (id, club_id, url, public_id)
+      VALUES (${uid()}, ${club.id}, ${result.secure_url}, ${result.public_id})
+      RETURNING id, url
+    `;
+    res.status(201).json(photo);
+  } catch (err) { next(err); }
+});
+
+router.delete('/:id/photos/:photoId', requireAuth, requireClubManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [gone] = await sql`
+      DELETE FROM club_photos WHERE id = ${req.params.photoId} AND club_id = ${req.params.id} RETURNING public_id
+    `;
+    if (!gone) return res.status(404).json({ error: 'Foto no encontrada' });
+    if (gone.public_id) await deleteByPublicId(gone.public_id);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// Seguir el club: avisa cuando un torneo del club abre la inscripción
+async function followState(sql, clubId, userId) {
+  const [row] = await sql`
+    SELECT COUNT(*)::int AS n, COALESCE(bool_or(user_id = ${userId}), false) AS mine
+    FROM club_follows WHERE club_id = ${clubId}
+  `;
+  return { followers_count: row.n, is_following: row.mine };
+}
+
+router.post('/:id/follow', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [club] = await sql`SELECT id FROM clubs WHERE id = ${req.params.id}`;
+    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
+    await sql`INSERT INTO club_follows (user_id, club_id) VALUES (${req.user.id}, ${club.id}) ON CONFLICT DO NOTHING`;
+    res.json(await followState(sql, club.id, req.user.id));
+  } catch (err) { next(err); }
+});
+
+router.delete('/:id/follow', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    await sql`DELETE FROM club_follows WHERE user_id = ${req.user.id} AND club_id = ${req.params.id}`;
+    res.json(await followState(sql, req.params.id, req.user.id));
+  } catch (err) { next(err); }
+});
+
 // Canchas del club: una fila por cancha física; horario y duración son del club entero
 const COURT_FLOOR_TYPES = ['cesped_sintetico', 'cesped_natural', 'cemento'];
-const COURT_WALL_TYPES  = ['cemento', 'cristal'];
 
 // Dos precios por cancha (30 y 60 min); cada uno puede ser null
 function parsePrice(v) {
@@ -874,7 +1028,9 @@ function courtFields(body = {}) {
   const external_play = typeof body.external_play === 'boolean' ? body.external_play : null;
   const price_30 = parsePrice(body.price_30);
   const price_60 = parsePrice(body.price_60);
-  return { floor_type, wall_type, covered, lit, external_play, price_30, price_60 };
+  const extras = parseCourtExtras(body);
+  if (extras.error) return { error: extras.error };
+  return { floor_type, wall_type, covered, lit, external_play, price_30, price_60, ...extras.fields };
 }
 
 // Total de turnos seguidos: bloques de 60 más un 30 suelto; si falta un precio se estima del otro
@@ -907,7 +1063,7 @@ router.get('/:id/courts', optionalAuth, async (req, res, next) => {
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
     const isManager = req.user?.role === 'admin' || (!!req.user && req.user.id === club.owner_id);
     const courts = await sql`
-      SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+      SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
       FROM club_courts
       WHERE club_id = ${req.params.id} AND (${isManager}::boolean OR active = true)
       ORDER BY sort_order ASC, created_at ASC
@@ -923,15 +1079,16 @@ router.post('/:id/courts', requireAuth, requireClubManage, async (req, res, next
     if (!name)            return res.status(400).json({ error: 'El nombre de la cancha es requerido' });
     if (name.length > 40) return res.status(400).json({ error: 'El nombre de la cancha no puede superar los 40 caracteres' });
 
-    const sql = getDb();
     const c = courtFields(req.body);
+    if (c.error) return res.status(400).json({ error: c.error });
+    const sql = getDb();
     const [{ next_order }] = await sql`
       SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM club_courts WHERE club_id = ${req.params.id}
     `;
     const [court] = await sql`
-      INSERT INTO club_courts (id, club_id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, sort_order)
-      VALUES (${uid()}, ${req.params.id}, ${name}, ${c.floor_type}, ${c.wall_type}, ${c.covered}, ${c.lit}, ${c.external_play}, ${c.price_30}, ${c.price_60}, ${next_order})
-      RETURNING id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+      INSERT INTO club_courts (id, club_id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, sort_order)
+      VALUES (${uid()}, ${req.params.id}, ${name}, ${c.floor_type}, ${c.wall_type}, ${c.covered}, ${c.lit}, ${c.external_play}, ${c.price_30}, ${c.price_60}, ${c.floor_color}, ${c.description}, ${next_order})
+      RETURNING id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
     `;
     await syncLegacyCourtsCount(sql, req.params.id);
     res.status(201).json(court);
@@ -945,16 +1102,18 @@ router.put('/:id/courts/:courtId', requireAuth, requireClubManage, async (req, r
     if (!name)            return res.status(400).json({ error: 'El nombre de la cancha es requerido' });
     if (name.length > 40) return res.status(400).json({ error: 'El nombre de la cancha no puede superar los 40 caracteres' });
 
-    const sql = getDb();
     const c = courtFields(req.body);
+    if (c.error) return res.status(400).json({ error: c.error });
+    const sql = getDb();
     const active = typeof req.body?.active === 'boolean' ? req.body.active : true;
     const [court] = await sql`
       UPDATE club_courts SET
         name = ${name}, floor_type = ${c.floor_type}, wall_type = ${c.wall_type},
         covered = ${c.covered}, lit = ${c.lit}, external_play = ${c.external_play},
-        price_30 = ${c.price_30}, price_60 = ${c.price_60}, active = ${active}
+        price_30 = ${c.price_30}, price_60 = ${c.price_60},
+        floor_color = ${c.floor_color}, description = ${c.description}, active = ${active}
       WHERE id = ${req.params.courtId} AND club_id = ${req.params.id}
-      RETURNING id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+      RETURNING id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
     `;
     if (!court) return res.status(404).json({ error: 'Cancha no encontrada' });
     await syncLegacyCourtsCount(sql, req.params.id);
@@ -997,7 +1156,7 @@ router.patch('/:id/courts/:courtId/move', requireAuth, requireClubManage, async 
     } // si ya está en la punta, no-op -- se devuelve la lista tal cual está.
 
     const updated = await sql`
-      SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+      SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
       FROM club_courts WHERE club_id = ${req.params.id} ORDER BY sort_order ASC, created_at ASC
     `;
     res.json(updated);
@@ -1006,21 +1165,21 @@ router.patch('/:id/courts/:courtId/move', requireAuth, requireClubManage, async 
 
 // ── Mercado Pago Connect del club (Premium) ─────────────────────────────────
 // El dueño vincula su propia cuenta de MP para cobrar reservas desde la app.
-// GET /:id/mercadopago/connect: arma la URL de autorización de MP. Solo Premium.
+// GET /:id/mercadopago/connect: arma la URL de autorización de MP. Plan Club cuando esté habilitado.
 router.get('/:id/mercadopago/connect', requireAuth, requireClubManage, async (req, res, next) => {
   try {
     const sql = getDb();
     const [club] = await sql`
       SELECT c.owner_id,
-             (EXISTS (
+             (c.owner_id IS NOT NULL AND (NOT ${CLUB_PLAN_ENABLED} OR EXISTS (
                SELECT 1 FROM subscriptions s
-               WHERE s.user_id = c.owner_id AND s.plan = 'premium' AND s.status = 'active'
-             )) AS owner_is_premium
+               WHERE s.user_id = c.owner_id AND s.plan = 'club' AND s.status = 'active'
+             ))) AS can_collect_online
       FROM clubs c WHERE c.id = ${req.params.id}
     `;
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
-    if (!club.owner_is_premium) {
-      return res.status(403).json({ error: 'Vincular Mercado Pago es una función Premium', code: 'plan_limit' });
+    if (!club.can_collect_online) {
+      return res.status(403).json({ error: 'Vincular Mercado Pago requiere el plan Club', code: 'plan_limit' });
     }
 
     const state = jwt.sign({ clubId: req.params.id }, MP_STATE_SECRET, { expiresIn: '10m' });
@@ -1039,11 +1198,18 @@ router.get('/mercadopago/callback', async (req, res) => {
   const fail = (clubId) => res.redirect(`${process.env.FRONTEND_URL}/club/${clubId ?? ''}?mp=error`);
   try {
     const { code, state } = req.query;
-    let clubId;
+    let clubId, userId;
     try {
-      ({ clubId } = jwt.verify(state, MP_STATE_SECRET));
+      ({ clubId, userId } = jwt.verify(state, MP_STATE_SECRET));
     } catch {
       return fail(null);
+    }
+    // La misma redirect_uri sirve al organizador que vincula su cuenta para cobrar inscripciones.
+    if (userId) {
+      const back = (r) => res.redirect(`${process.env.FRONTEND_URL}/torneos/organizar?mp=${r}`);
+      if (!code) return back('error');
+      try { await saveUserMp(getDb(), userId, await exchangeCode(code)); return back('connected'); }
+      catch (e) { console.error('Error al vincular Mercado Pago del organizador:', e.message); return back('error'); }
     }
     if (!code) return fail(clubId);
 
@@ -1152,12 +1318,7 @@ function isValidDateStr(s) {
   return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
 }
 function todayStr() {
-  return new Date().toISOString().slice(0, 10);
-}
-function addDaysStr(dateStr, days) {
-  const d = new Date(`${dateStr}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().slice(0, 10);
+  return arNow().date;
 }
 
 // GET /api/clubs/:id/bookings: público, nunca devuelve quién reservó
@@ -1215,6 +1376,23 @@ router.get('/:id/bookings/manage', requireAuth, requireClubBookingManage, async 
   } catch (err) { next(err); }
 });
 
+// GET .../bookings/occupancy: turnos confirmados de las últimas 8 semanas por día y franja de 2 h
+const OCCUPANCY_WEEKS = 8;
+router.get('/:id/bookings/occupancy', requireAuth, requireClubBookingManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const today = todayStr();
+    const rows = await sql`
+      SELECT EXTRACT(ISODOW FROM date)::int AS dow, (EXTRACT(HOUR FROM start_time)::int / 2) AS band, COUNT(*)::int AS slots
+      FROM bookings
+      WHERE club_id = ${req.params.id} AND status = 'confirmed'
+        AND date >= ${addDaysStr(today, -7 * OCCUPANCY_WEEKS)}::date AND date < ${today}::date
+      GROUP BY 1, 2
+    `;
+    res.json({ weeks: OCCUPANCY_WEEKS, cells: rows });
+  } catch (err) { next(err); }
+});
+
 const MAX_SLOTS_PER_BOOKING = 8; // tope de turnos consecutivos en una sola reserva
 
 function timeToMinutes(hhmm) {
@@ -1228,11 +1406,11 @@ function minutesToTime(mins) {
 }
 
 // Inserta N filas con el mismo group_id de forma atómica; el status depende de quien llama
-async function insertBookingGroup({ clubId, slotMinutes, date, sorted, court_id, price, userId, guestName, guestContact, status }) {
+async function insertBookingGroup({ clubId, slotMinutes, items, court_id, price, userId, guestName, guestContact, status }) {
   const groupId = uid();
   return withTransaction(async (client) => {
     const rows = [];
-    for (const start_time of sorted) {
+    for (const { date, start_time } of items) {
       const { rows: [row] } = await client.query(
         `INSERT INTO bookings
            (id, group_id, club_id, court_id, user_id, guest_name, guest_contact, date, start_time, duration_minutes, price, status)
@@ -1299,28 +1477,16 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
     if (!guest_contact) return res.status(400).json({ error: 'Un teléfono o WhatsApp de contacto es requerido' });
     if (!isValidDateStr(req.body?.date)) return res.status(400).json({ error: 'Fecha inválida' });
 
-    const slots = Array.isArray(req.body?.slots) ? [...req.body.slots] : [];
-    if (!slots.length || slots.length > MAX_SLOTS_PER_BOOKING || !slots.every((s) => /^\d{2}:\d{2}$/.test(s))) {
-      return res.status(400).json({ error: 'Horario inválido' });
-    }
-
-    const min = todayStr();
-    const max = addDaysStr(min, BOOKING_HORIZON_DAYS - 1);
-    if (req.body.date < min || req.body.date > max) {
-      return res.status(400).json({ error: `Sólo se puede reservar dentro de los próximos ${BOOKING_HORIZON_DAYS} días` });
-    }
-
     const sql = getDb();
     const [club] = await sql`SELECT id, name, owner_id, slot_minutes, mp_access_token FROM clubs WHERE id = ${req.params.id}`;
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
-    // Los turnos deben ser consecutivos y sin repetir
-    const sorted = [...slots].sort();
-    for (let i = 1; i < sorted.length; i++) {
-      if (timeToMinutes(sorted[i]) - timeToMinutes(sorted[i - 1]) !== club.slot_minutes) {
-        return res.status(400).json({ error: 'Los turnos elegidos tienen que ser consecutivos' });
-      }
+    const { items, error: slotsError } = expandBookingSlots(req.body.date, req.body?.slots, club.slot_minutes, MAX_SLOTS_PER_BOOKING);
+    if (slotsError) return res.status(400).json({ error: slotsError });
+    if (!withinHorizon(req.body.date, items[0].start_time, todayStr(), BOOKING_HORIZON_DAYS)) {
+      return res.status(400).json({ error: `Sólo se puede reservar dentro de los próximos ${BOOKING_HORIZON_DAYS} días` });
     }
+    if (hasStarted(items[0], arNow())) return res.status(400).json({ error: 'Ese horario ya pasó' });
 
     let court_id = null;
     let court_name = null;
@@ -1334,16 +1500,15 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
       court_id = court.id;
       court_name = court.name;
       // Precio total repartido en partes iguales entre las filas; es solo informativo
-      totalPrice = computeTotalPrice(court.price_30, court.price_60, sorted.length);
-      price = totalPrice != null ? Math.round((totalPrice / sorted.length) * 100) / 100 : null;
+      totalPrice = computeTotalPrice(court.price_30, court.price_60, items.length);
+      price = totalPrice != null ? Math.round((totalPrice / items.length) * 100) / 100 : null;
     }
 
     try {
       const bookings = await insertBookingGroup({
         clubId: req.params.id,
         slotMinutes: club.slot_minutes,
-        date: req.body.date,
-        sorted,
+        items,
         court_id,
         price,
         userId: req.user?.id ?? null,
@@ -1386,11 +1551,11 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
       // Avisar al dueño, o a los admins si no hay dueño; best-effort. Si va a
       // pago online no hace falta que apruebe nada, pero igual se entera.
       try {
-        const endTime = minutesToTime(timeToMinutes(sorted[sorted.length - 1]) + club.slot_minutes);
+        const endTime = minutesToTime(timeToMinutes(items[items.length - 1].start_time) + club.slot_minutes);
         const courtLabel = court_name ? ` en ${court_name}` : '';
         const body = checkout_url
-          ? `${guest_name} está pagando un turno${courtLabel} para el ${req.body.date} de ${sorted[0]} a ${endTime} hs.`
-          : `${guest_name} pidió un turno${courtLabel} para el ${req.body.date} de ${sorted[0]} a ${endTime} hs.`;
+          ? `${guest_name} está pagando un turno${courtLabel} para el ${req.body.date} de ${items[0].start_time} a ${endTime} hs.`
+          : `${guest_name} pidió un turno${courtLabel} para el ${req.body.date} de ${items[0].start_time} a ${endTime} hs.`;
         const actorId = req.user?.id ?? null;
         // entity_id es el club: el front lleva a su ficha
         if (club.owner_id) {
@@ -1428,21 +1593,12 @@ router.post('/:id/bookings/manual', requireAuth, requireClubBookingManage, async
     if (!isValidDateStr(req.body?.date)) return res.status(400).json({ error: 'Fecha inválida' });
     if (req.body.date < todayStr()) return res.status(400).json({ error: 'No se puede bloquear una fecha pasada' });
 
-    const slots = Array.isArray(req.body?.slots) ? [...req.body.slots] : [];
-    if (!slots.length || slots.length > MAX_SLOTS_PER_BOOKING || !slots.every((s) => /^\d{2}:\d{2}$/.test(s))) {
-      return res.status(400).json({ error: 'Horario inválido' });
-    }
-
     const sql = getDb();
     const [club] = await sql`SELECT id, name, slot_minutes FROM clubs WHERE id = ${req.params.id}`;
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
-    const sorted = [...slots].sort();
-    for (let i = 1; i < sorted.length; i++) {
-      if (timeToMinutes(sorted[i]) - timeToMinutes(sorted[i - 1]) !== club.slot_minutes) {
-        return res.status(400).json({ error: 'Los turnos elegidos tienen que ser consecutivos' });
-      }
-    }
+    const { items, error: slotsError } = expandBookingSlots(req.body.date, req.body?.slots, club.slot_minutes, MAX_SLOTS_PER_BOOKING);
+    if (slotsError) return res.status(400).json({ error: slotsError });
 
     let court_id = null;
     let price = null;
@@ -1452,16 +1608,15 @@ router.post('/:id/bookings/manual', requireAuth, requireClubBookingManage, async
       `;
       if (!court) return res.status(400).json({ error: 'Cancha no válida' });
       court_id = court.id;
-      const totalPrice = computeTotalPrice(court.price_30, court.price_60, sorted.length);
-      price = totalPrice != null ? Math.round((totalPrice / sorted.length) * 100) / 100 : null;
+      const totalPrice = computeTotalPrice(court.price_30, court.price_60, items.length);
+      price = totalPrice != null ? Math.round((totalPrice / items.length) * 100) / 100 : null;
     }
 
     try {
       const bookings = await insertBookingGroup({
         clubId: req.params.id,
         slotMinutes: club.slot_minutes,
-        date: req.body.date,
-        sorted,
+        items,
         court_id,
         price,
         userId: null,

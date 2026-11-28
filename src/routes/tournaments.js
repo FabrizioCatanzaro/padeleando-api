@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { notifyClubFollowersSignup } from '../lib/clubFollowers.js';
 import { getDb, withTransaction } from '../db.js';
 import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
@@ -24,6 +25,9 @@ import {
   sortearZonas, validateZonas, generateCopaFecha, validateCopaFecha,
   zonaStandings, rankClasificados, seedCuadro, seedCuadroDirecto, generateCupBracket, gruposPendientes, ordenarSemillas,
 } from '../lib/copa.js';
+import { PLAYER_PLANS, ORGANIZER_PLANS } from '../lib/planCatalog.js';
+import { onlinePriceError } from '../lib/commission.js';
+import { settlementBlockError } from '../lib/settlements.js';
 
 const router = Router();
 
@@ -84,6 +88,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              g.signup_closes_at     AS group_signup_closes_at,
              g.rules                AS group_rules,
              json_build_object('whatsapp', CASE WHEN ow.whatsapp_public THEN ow.whatsapp END, 'instagram', ow.instagram) AS owner_profile,
+             (ow.mp_connected_at IS NOT NULL) AS owner_mp_connected,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
              c.location_name AS club_location_name,
@@ -94,7 +99,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
              (EXISTS (
                SELECT 1 FROM subscriptions s
                JOIN   groups g ON g.user_id = s.user_id
-               WHERE  g.id = t.group_id AND s.plan = 'premium' AND s.status = 'active'
+               WHERE  g.id = t.group_id AND s.plan = ANY(${ORGANIZER_PLANS}) AND s.status = 'active'
              )) AS owner_is_premium
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
@@ -142,7 +147,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       FROM players p
       INNER JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${id}
       LEFT JOIN users u ON u.id = p.user_id
-      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
       LEFT JOIN player_invitations pi
         ON pi.player_id = p.id AND pi.group_id = ${tournament.group_id} AND pi.status = 'pending'
     `;
@@ -165,7 +170,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
                  (s.id IS NOT NULL) AS is_premium
           FROM   players p
           LEFT   JOIN users u ON u.id = p.user_id
-          LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+          LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
           WHERE  p.id = ANY(${orphanIds})
         `
       : [];
@@ -228,7 +233,8 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       return res.json({
         ...visible,
         group_owner_is_premium: tournament.owner_is_premium,
-        signup: publicSignup(signup, { format: tournament.format, used }),
+        signup: publicSignup({ ...signup, online: signup.online && tournament.owner_mp_connected },
+          { format: tournament.format, used, organizerPlan: tournament.owner_is_premium }),
         players: rosterHidden ? [] : conSusDatos(players),
         pairs: rosterHidden ? [] : pairs,
         matches,
@@ -254,6 +260,27 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     });
   } catch (err) { next(err); }
 });
+
+// El cobro online necesita el Mercado Pago del dueño y un precio que deje neto positivo.
+async function onlineSetupError(sql, groupId, signup, cur = {}) {
+  const pick = (k) => (k in signup ? signup[k] : cur[k]);
+  if (!pick('signup_online')) return null;
+  const [g] = await sql`
+    SELECT g.user_id, g.signup_price, g.signup_price_unit, (u.mp_connected_at IS NOT NULL) AS mp,
+           EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id = g.user_id AND s.status = 'active'
+                     AND s.plan = ANY(${ORGANIZER_PLANS})) AS org
+    FROM groups g JOIN users u ON u.id = g.user_id WHERE g.id = ${groupId}`;
+  if (!g?.mp) return 'El dueño de la categoría tiene que vincular su Mercado Pago (Torneos › Organizar) para cobrar online';
+  if (signup.signup_online === true && !cur.signup_online) {
+    const blocked = await settlementBlockError(sql, g.user_id);
+    if (blocked) return blocked;
+  }
+  const price = pick('signup_price') ?? g.signup_price;
+  const unit = pick('signup_price_unit') ?? g.signup_price_unit ?? 'player';
+  return onlinePriceError({
+    price: price == null ? null : Number(price), unit, payer: pick('signup_fee_payer') ?? 'player', organizerPlan: g.org,
+  });
+}
 
 // POST /api/tournaments
 // Body: { groupId, name, mode, format, playerNames[], pairs?: [{p1Name,p2Name}] }
@@ -296,6 +323,8 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     if (liga.liga_mode === 'temporada' && mode !== 'pairs') {
       return res.status(400).json({ error: 'La liga en varios días se juega con parejas fijas' });
     }
+    const onlineError = await onlineSetupError(getDb(), groupId, signup);
+    if (onlineError) return res.status(400).json({ error: onlineError, code: 'online_setup' });
 
     // Por debajo del mínimo el americano queda en borrador: acá sólo se controla el tope.
     if (format === 'americano' && pairsInput.length > AMERICANO_MAX_PAIRS) {
@@ -315,14 +344,16 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     const rawNames = playerNames.filter(Boolean).map((n) => n.trim()).filter(Boolean);
     const usernames = rawNames.filter((n) => n.startsWith('@')).map((n) => n.slice(1)).filter(Boolean);
 
-    const [quotaError, clubRows, userRows] = await Promise.all([
+    const [quotaError, clubRows, userRows, settlementError] = await Promise.all([
       tournamentQuotaError(sql, groupId, req.accessCtx.owner_id, { format }),
       club_id ? sql`SELECT id FROM clubs WHERE id = ${club_id}` : Promise.resolve([]),
       usernames.length
         ? sql`SELECT id, name, username FROM users WHERE username = ANY(${usernames})`
         : Promise.resolve([]),
+      settlementBlockError(sql, req.accessCtx.owner_id),
     ]);
 
+    if (settlementError) return res.status(403).json({ error: settlementError, code: 'settlement_due' });
     if (quotaError) return res.status(403).json({ error: quotaError, code: 'plan_limit' });
     if (club_id && clubRows.length === 0) return res.status(404).json({ error: 'Club no encontrado' });
 
@@ -458,9 +489,10 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
            (id, group_id, name, mode, format, number_of_courts, club_id, event_date, event_time, pending_club_request_id,
             signup_open, signup_price, signup_price_unit, signup_contacts, level,
             signup_capacity, signup_capacity_unit, signup_closes_at,
-            liga_mode, allow_rematch, winner_format, playoff_size, rules, points_win, points_loss, copa_config)
+            liga_mode, allow_rematch, winner_format, playoff_size, rules, points_win, points_loss, copa_config,
+            signup_online, signup_fee_payer, signup_payment_note)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18,
-                 $19, $20, $21, $22, $23, $24, $25, $26::jsonb) RETURNING *`,
+                 $19, $20, $21, $22, $23, $24, $25, $26::jsonb, $27, $28, $29) RETURNING *`,
         [tId, groupId, name.trim(), mode, format, number_of_courts ?? 1,
          club_id ?? null, event_date || null, event_time || null, pending_club_request_id ?? null,
          signup.signup_open ?? null, signup.signup_price ?? null, signup.signup_price_unit ?? null,
@@ -470,7 +502,8 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
          liga.liga_mode ?? 'jornada', liga.allow_rematch ?? false,
          liga.winner_format ?? 'tabla', liga.playoff_size ?? null, signup.rules ?? null,
          liga.points_win ?? 3, liga.points_loss ?? 0,
-         copaConfig ? JSON.stringify(copaConfig) : null]
+         copaConfig ? JSON.stringify(copaConfig) : null,
+         signup.signup_online ?? false, signup.signup_fee_payer ?? 'player', signup.signup_payment_note ?? null]
       );
 
       let prizeRows = [];
@@ -563,6 +596,9 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     notifyFavorites(groupId, tId, req.user.id).catch((err) =>
       console.error('No se pudo avisar a quienes la tienen en favoritas:', err)
     );
+    notifyClubFollowersSignup(tId, req.user.id).catch((err) =>
+      console.error('No se pudo avisar a quienes siguen el club:', err)
+    );
   } catch (err) { next(err); }
 });
 
@@ -603,6 +639,13 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
     if (club_id) {
       const [club] = await sql`SELECT id FROM clubs WHERE id = ${club_id}`;
       if (!club) return res.status(404).json({ error: 'Club no encontrado' });
+    }
+
+    if (['signup_online', 'signup_price', 'signup_price_unit', 'signup_fee_payer'].some((k) => k in signup)) {
+      const [cur] = await sql`
+        SELECT group_id, signup_online, signup_price, signup_price_unit, signup_fee_payer FROM tournaments WHERE id = ${id}`;
+      const onlineError = cur && await onlineSetupError(sql, cur.group_id, signup, cur);
+      if (onlineError) return res.status(400).json({ error: onlineError, code: 'online_setup' });
     }
 
     // Opciones de la liga por fechas: se validan contra lo guardado, porque
@@ -676,11 +719,19 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
           signup_capacity      = CASE WHEN ${'signup_capacity'      in signup}::boolean THEN ${signup.signup_capacity      ?? null}::int ELSE signup_capacity END,
           signup_capacity_unit = CASE WHEN ${'signup_capacity_unit' in signup}::boolean THEN ${signup.signup_capacity_unit ?? null} ELSE signup_capacity_unit END,
           signup_closes_at     = CASE WHEN ${'signup_closes_at'     in signup}::boolean THEN ${signup.signup_closes_at     ?? null}::timestamptz ELSE signup_closes_at END,
-          rules                = CASE WHEN ${'rules'                in signup}::boolean THEN ${signup.rules                ?? null} ELSE rules END
+          rules                = CASE WHEN ${'rules'                in signup}::boolean THEN ${signup.rules                ?? null} ELSE rules END,
+          signup_online       = COALESCE(${signup.signup_online ?? null}::boolean, signup_online),
+          signup_fee_payer    = COALESCE(${signup.signup_fee_payer ?? null}, signup_fee_payer),
+          signup_payment_note = CASE WHEN ${'signup_payment_note' in signup}::boolean THEN ${signup.signup_payment_note ?? null} ELSE signup_payment_note END
       WHERE id = ${id} RETURNING *
     `;
     if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });
     res.json(updated);
+    if (signup.signup_open === true || club_id) {
+      notifyClubFollowersSignup(id, req.user.id).catch((err) =>
+        console.error('No se pudo avisar a quienes siguen el club:', err)
+      );
+    }
   } catch (err) { next(err); }
 });
 

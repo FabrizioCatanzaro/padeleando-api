@@ -6,6 +6,8 @@
 //   GET    /api/registrations/tournament/:tournamentId   panel del organizador
 //   PATCH  /api/registrations/:id                 el organizador aprueba o rechaza
 //   PATCH  /api/registrations/:id/paid            el organizador marca el pago
+//   POST   /api/registrations/mercadopago/webhook  aviso de Mercado Pago del cobro online
+//   POST   /api/registrations/tournament/:tournamentId/refund-all  reintegra todo y cierra la inscripción
 import { Router } from 'express';
 import { sendDecisionMail } from '../lib/registrationMail.js';
 import { getDb, withTransaction } from '../db.js';
@@ -17,8 +19,12 @@ import { parseAvailability, AvailabilityError } from '../lib/availability.js';
 import { checkRegistrationLevel } from '../lib/category.js';
 import {
   ACTIVE_STATUSES, capacityInPlayers, hasRoom, signupState, parseGuestPartner, summarize, publicSignup,
+  PAYMENT_HOLD_MINUTES, PAYMENT_GRACE_MINUTES,
 } from '../lib/registrations.js';
 import { usaFechas, esCopa, parseWhatsapp } from '../lib/copa.js';
+import { ORGANIZER_PLANS } from '../lib/planCatalog.js';
+import { quote } from '../lib/commission.js';
+import { createCheckout, fetchPayment, refundRegistration, externalRef } from '../lib/registrationPayment.js';
 
 const router = Router();
 
@@ -44,6 +50,10 @@ const TOURNAMENT_SQL = `
   SELECT t.id, t.group_id, t.name, t.format, t.mode, t.status, t.bracket, t.liga_mode, t.copa_config,
          t.signup_open, t.signup_price, t.signup_price_unit, t.signup_contacts, t.level,
          t.signup_capacity, t.signup_capacity_unit, t.signup_closes_at, t.rules,
+         t.signup_online, t.signup_fee_payer, t.signup_payment_note,
+         (u.mp_connected_at IS NOT NULL) AS owner_mp_connected,
+         EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id = g.user_id AND s.status = 'active'
+                   AND s.plan = ANY($2::text[])) AS owner_organizer,
          g.user_id AS owner_id, g.signup_open AS g_signup_open, g.signup_price AS g_signup_price,
          g.signup_price_unit AS g_signup_price_unit, g.signup_contacts AS g_signup_contacts,
          g.level AS g_level, g.signup_capacity AS g_signup_capacity,
@@ -57,7 +67,7 @@ const TOURNAMENT_SQL = `
 
 /** Torneo + su inscripción ya resuelta entre jornada y categoría. */
 async function loadTournament(q, tournamentId, { lock = false } = {}) {
-  const { rows: [t] } = await q(TOURNAMENT_SQL + (lock ? ' FOR UPDATE OF t' : ''), [tournamentId]);
+  const { rows: [t] } = await q(TOURNAMENT_SQL + (lock ? ' FOR UPDATE OF t' : ''), [tournamentId, ORGANIZER_PLANS]);
   if (!t) throw new HttpError(404, 'Torneo no encontrado');
   const signup = resolveSignup(t, {
     signup_open: t.g_signup_open, signup_price: t.g_signup_price, signup_price_unit: t.g_signup_price_unit,
@@ -99,6 +109,16 @@ async function userHasActiveRegistration(q, tournamentId, userId) {
     WHERE tournament_id = $1 AND status = ANY($3::text[])
       AND (p1_user_id = $2 OR p2_user_id = $2) LIMIT 1`, [tournamentId, userId, ACTIVE_STATUSES]);
   return rows.length > 0;
+}
+
+/** Vence las inscripciones que no se pagaron a tiempo, con margen por si el aviso de MP llega tarde. */
+async function expireUnpaid(q, { tournamentId = null, userId = null }) {
+  await q(`
+    UPDATE tournament_registrations SET status = 'cancelled'
+    WHERE status = 'awaiting_payment'
+      AND payment_expires_at < NOW() - make_interval(mins => $3)
+      AND ($1::text IS NULL OR tournament_id = $1)
+      AND ($2::text IS NULL OR p1_user_id = $2)`, [tournamentId, userId, PAYMENT_GRACE_MINUTES]);
 }
 
 async function groupManagers(q, groupId) {
@@ -163,6 +183,7 @@ router.post('/', requireAuth, async (req, res, next) => {
       throw new HttpError(400, 'Completá tu categoría en el perfil antes de inscribirte', 'category_required');
     }
     if (await userInTournament(q, tournamentId, me)) throw new HttpError(409, 'Ya estás en este torneo');
+    await expireUnpaid(q, { tournamentId });
     if (await userHasActiveRegistration(q, tournamentId, me)) throw new HttpError(409, 'Ya tenés una inscripción en este torneo');
 
     let p2UserId = null, p2Name = null, p2Phone = null;
@@ -183,23 +204,101 @@ router.post('/', requireAuth, async (req, res, next) => {
       }
     }
 
+    const online = signup.online === true;
+    let amounts = null;
+    if (online) {
+      if (!(Number(signup.price) > 0)) throw new HttpError(409, 'El torneo cobra online pero no tiene precio cargado');
+      if (!t.owner_mp_connected) {
+        throw new HttpError(409, 'El organizador todavía no habilitó el cobro online', 'payment_unavailable');
+      }
+      amounts = quote({
+        price: Number(signup.price), unit: signup.unit, kind, payer: signup.fee_payer, organizerPlan: t.owner_organizer,
+      });
+    }
+    const expiresAt = online ? new Date(Date.now() + PAYMENT_HOLD_MINUTES * 60_000) : null;
+
     const id = uid();
     const { rows: [registration] } = await q(`
       INSERT INTO tournament_registrations
         (id, tournament_id, kind, created_by, p1_user_id, p2_user_id, p2_name, p2_phone, rules_accepted_at, availability,
-         p2_availability, p1_whatsapp, p1_whatsapp_visible)
-      VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12) RETURNING *`,
+         p2_availability, p1_whatsapp, p1_whatsapp_visible,
+         status, payment_status, price_amount, fee_amount, total_amount, payment_expires_at)
+      VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING *`,
       [id, tournamentId, kind, me, p2UserId, p2Name, p2Phone, signup.rules ? new Date().toISOString() : null,
        // Solo los torneos con fixture por día piden disponibilidad y WhatsApp.
        pideDatos(t) ? jsonOrNull(availability) : null,
        pideDatos(t) && kind === 'pair' ? jsonOrNull(partnerAvailability) : null,
-       pideDatos(t) ? whatsapp : null, pideDatos(t) && whatsapp ? whatsappVisible : false]);
+       pideDatos(t) ? whatsapp : null, pideDatos(t) && whatsapp ? whatsappVisible : false,
+       online ? 'awaiting_payment' : 'pending', online ? 'pending' : null,
+       amounts?.base ?? null, amounts?.fee ?? null, amounts?.total ?? null, expiresAt?.toISOString() ?? null]);
+
+    // Con cobro online, el organizador se entera recién cuando se acredita el pago (webhook).
+    if (online) {
+      let checkout;
+      try {
+        checkout = await createCheckout(sql, t.owner_id, {
+          registrationId: id, groupId: t.group_id, tournamentId, tournamentName: t.name,
+          total: amounts.total, kind, expiresAt,
+        });
+      } catch (e) {
+        console.error('No se pudo crear el pago de la inscripción:', e?.message ?? e);
+        await q('DELETE FROM tournament_registrations WHERE id = $1', [id]);
+        throw new HttpError(502, 'No pudimos iniciar el pago con Mercado Pago. Probá de nuevo en unos minutos', 'payment_error');
+      }
+      await q('UPDATE tournament_registrations SET mp_preference_id = $2, mp_init_point = $3 WHERE id = $1',
+        [id, checkout.preference_id, checkout.init_point]);
+      return res.status(201).json({ ...registration, mp_init_point: checkout.init_point, checkout_url: checkout.init_point });
+    }
 
     await notify(q, await groupManagers(q, t.group_id), 'registration_received', me, id);
     if (p2UserId) await notify(q, [p2UserId], 'registration_partner', me, id);
 
     res.status(201).json(registration);
   } catch (err) { sendError(res, next, err); }
+});
+
+// ── POST /api/registrations/mercadopago/webhook?reg=ID ─────────────────────
+// El pago se lee con el token del dueño y se valida contra external_reference. Responde siempre 200.
+router.post('/mercadopago/webhook', async (req, res) => {
+  try {
+    const regId = req.query.reg;
+    const type = req.body?.type ?? req.query.type ?? req.query.topic;
+    const paymentId = req.body?.data?.id ?? req.query['data.id'] ?? req.query.id;
+    if (!regId || type !== 'payment' || !paymentId) return res.sendStatus(200);
+
+    const sql = getDb();
+    const [r] = await sql`
+      SELECT r.*, g.user_id AS owner_id, t.group_id
+      FROM tournament_registrations r
+      JOIN tournaments t ON t.id = r.tournament_id
+      JOIN groups g ON g.id = t.group_id
+      WHERE r.id = ${regId}`;
+    if (!r) return res.sendStatus(200);
+
+    const payment = await fetchPayment(sql, r.owner_id, paymentId);
+    if (payment?.external_reference !== externalRef(r.id) || payment.status !== 'approved') return res.sendStatus(200);
+
+    const [paid] = await sql`
+      UPDATE tournament_registrations
+      SET status = 'pending', paid = true, payment_status = 'approved', mp_payment_id = ${String(payment.id)}
+      WHERE id = ${r.id} AND status = 'awaiting_payment'
+      RETURNING *`;
+    const q = httpQuery(sql);
+    if (paid) {
+      await notify(q, await groupManagers(q, r.group_id), 'registration_received', r.p1_user_id, r.id);
+      if (r.p2_user_id) await notify(q, [r.p2_user_id], 'registration_partner', r.p1_user_id, r.id);
+    } else if (r.status === 'cancelled' && !r.mp_payment_id) {
+      // Pagó después de que venciera la reserva: se le devuelve todo.
+      const [late] = await sql`
+        UPDATE tournament_registrations
+        SET paid = true, payment_status = 'approved', mp_payment_id = ${String(payment.id)}
+        WHERE id = ${r.id} AND mp_payment_id IS NULL RETURNING *`;
+      if (late) await refundRegistration(sql, late, await groupManagers(q, r.group_id));
+    }
+  } catch (err) {
+    console.error('Webhook de inscripción:', err?.message ?? err);
+  }
+  res.sendStatus(200);
 });
 
 // ── GET /api/registrations/mine ─────────────────────────────────────────────
@@ -209,8 +308,10 @@ router.get('/mine', requireAuth, async (req, res, next) => {
   try {
     const sql = getDb();
     const me = req.user.id;
+    await expireUnpaid(httpQuery(sql), { userId: me });
     const rows = await sql.query(`
       SELECT r.id, r.tournament_id, r.kind, r.status, r.reject_reason, r.paid, r.created_at, r.decided_at,
+             r.payment_status, r.total_amount, r.mp_init_point, r.payment_expires_at,
              r.p1_user_id, r.p2_user_id, r.p2_name,
              u1.name AS p1_user_name, u1.username AS p1_username,
              u2.name AS p2_user_name, u2.username AS p2_username,
@@ -250,7 +351,10 @@ router.get('/mine', requireAuth, async (req, res, next) => {
         created_at: r.created_at, decided_at: r.decided_at,
         partner_name: partner, level: signup.level, closes_at: signup.closes_at,
         price: signup.price ?? null, price_unit: signup.unit ?? null,
-        can_cancel: ACTIVE_STATUSES.includes(r.status) && state.open,
+        payment_status: r.payment_status, total_amount: r.total_amount == null ? null : Number(r.total_amount),
+        checkout_url: r.status === 'awaiting_payment' && r.p1_user_id === me ? r.mp_init_point : null,
+        payment_expires_at: r.payment_expires_at,
+        can_cancel: ACTIVE_STATUSES.includes(r.status) && (state.open || r.status === 'awaiting_payment'),
       };
     }));
   } catch (err) { sendError(res, next, err); }
@@ -263,7 +367,10 @@ router.get('/mine/:tournamentId', requireAuth, async (req, res, next) => {
     const sql = getDb();
     const q = httpQuery(sql);
     const { tournamentId } = req.params;
-    const { t, signup } = await loadTournament(q, tournamentId);
+    const [{ t, signup }] = await Promise.all([
+      loadTournament(q, tournamentId),
+      expireUnpaid(q, { tournamentId, userId: req.user.id }),
+    ]);
     const [{ rows }, used, inTournament, canManage] = await Promise.all([
       q(`SELECT r.*, u2.name AS p2_user_name, u2.username AS p2_username
          FROM tournament_registrations r
@@ -280,14 +387,17 @@ router.get('/mine/:tournamentId', requireAuth, async (req, res, next) => {
       // Sin los números del cupo: sólo hay cupos / últimos / completo.
       signup: {
         ...state,
-        availability: publicSignup(signup, { format: t.format, used }).availability,
+        ...(({ availability, online_quote }) => ({ availability, online_quote }))(
+          publicSignup(signup, { format: t.format, used, organizerPlan: t.owner_organizer })),
         closes_at: signup.closes_at, level: signup.level,
         price: signup.price, price_unit: signup.unit,
         rules: signup.rules,
+        online: signup.online && t.owner_mp_connected, fee_payer: signup.fee_payer, payment_note: signup.payment_note,
       },
       // El WhatsApp de cada jugador lo ve él y su compañero; p2_phone es el del jugador 2, con o sin cuenta.
       registration: mine && {
         ...mine,
+        mp_init_point: mine.status === 'awaiting_payment' && mine.p1_user_id === req.user.id ? mine.mp_init_point : null,
         p2_phone: [mine.p1_user_id, mine.p2_user_id].includes(req.user.id) ? mine.p2_phone : null,
         p1_whatsapp: mine.p1_whatsapp,
       },
@@ -414,9 +524,10 @@ router.post('/:id/cancel', requireAuth, async (req, res, next) => {
 
       const { rows: [updated] } = await q(
         `UPDATE tournament_registrations SET status = 'cancelled' WHERE id = $1 RETURNING *`, [r.id]);
-      return updated;
+      return { ...updated, group_id: t.group_id };
     });
-    res.json(result);
+    const { group_id, ...out } = result;
+    res.json(await refundAfter(out, group_id));
   } catch (err) { sendError(res, next, err); }
 });
 
@@ -442,7 +553,7 @@ router.get('/tournament/:tournamentId', requireAuth, async (req, res, next) => {
          FROM tournament_registrations r
          JOIN users u1 ON u1.id = r.p1_user_id
          LEFT JOIN users u2 ON u2.id = r.p2_user_id
-         WHERE r.tournament_id = $1
+         WHERE r.tournament_id = $1 AND r.status <> 'awaiting_payment'
          ORDER BY r.created_at`, [tournamentId]),
       usedPlayers(q, tournamentId),
     ]);
@@ -601,7 +712,7 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
     const { _mail, ...out } = result;
     // El mail sale después del commit y nunca hace fallar la respuesta.
     if (_mail?.to?.length) sendDecisionMail(getDb(), _mail).catch((e) => console.error('mail de inscripción:', e));
-    res.json(out);
+    res.json(out.status === 'rejected' ? await refundAfter(out, _mail?.t?.group_id) : out);
   } catch (err) { sendError(res, next, err); }
 });
 
@@ -612,13 +723,51 @@ router.patch('/:id/paid', requireAuth, async (req, res, next) => {
     if (typeof paid !== 'boolean') throw new HttpError(400, 'paid debe ser true o false');
     const sql = getDb();
     const [r] = await sql`
-      SELECT r.id, t.group_id FROM tournament_registrations r
+      SELECT r.id, r.payment_status, t.group_id FROM tournament_registrations r
       JOIN tournaments t ON t.id = r.tournament_id WHERE r.id = ${req.params.id}`;
     if (!r) throw new HttpError(404, 'Inscripción no encontrada');
     if (!(await canManageGroup(sql, req.user.id, r.group_id))) throw new HttpError(403, 'No autorizado');
+    if (r.payment_status) throw new HttpError(409, 'Esta inscripción se pagó por la app: el pago lo maneja Mercado Pago');
     const [updated] = await sql`
       UPDATE tournament_registrations SET paid = ${paid} WHERE id = ${r.id} RETURNING *`;
     res.json(updated);
+  } catch (err) { sendError(res, next, err); }
+});
+
+/** Reintegro total después del commit; devuelve la fila con el resultado. */
+async function refundAfter(registration, groupId) {
+  if (registration.payment_status !== 'approved') return registration;
+  const sql = getDb();
+  await refundRegistration(sql, registration, await groupManagers(httpQuery(sql), groupId));
+  const [fresh] = await sql`SELECT * FROM tournament_registrations WHERE id = ${registration.id}`;
+  return fresh;
+}
+
+// ── POST /api/registrations/tournament/:tournamentId/refund-all ─────────────
+// El torneo no se juega: cierra la inscripción, cancela las activas y reintegra todo lo cobrado por la app.
+router.post('/tournament/:tournamentId/refund-all', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const q = httpQuery(sql);
+    const { tournamentId } = req.params;
+    const { t } = await loadTournament(q, tournamentId);
+    if (!(await canManageGroup(sql, req.user.id, t.group_id))) throw new HttpError(403, 'No autorizado');
+
+    const [, cancelled] = await Promise.all([
+      sql`UPDATE tournaments SET signup_open = false WHERE id = ${tournamentId}`,
+      sql`UPDATE tournament_registrations SET status = 'cancelled'
+          WHERE tournament_id = ${tournamentId} AND status = ANY(${ACTIVE_STATUSES})
+          RETURNING *`,
+    ]);
+    const managers = await groupManagers(q, t.group_id);
+    const results = await Promise.all(cancelled.map((r) => refundRegistration(sql, r, managers)));
+    await Promise.all(cancelled.map((r) =>
+      notify(q, [r.p1_user_id, r.p2_user_id], 'registration_decided', req.user.id, r.id, 'cancelled')));
+    res.json({
+      cancelled: cancelled.length,
+      refunded: results.filter((x) => x === 'refunded').length,
+      failed: results.filter((x) => x === 'refund_failed').length,
+    });
   } catch (err) { sendError(res, next, err); }
 });
 

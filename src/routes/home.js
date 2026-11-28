@@ -1,7 +1,11 @@
 import { Router } from 'express';
 import { getDb }  from '../db.js';
 import { resolveSignup } from '../lib/signup.js';
-import { hasStarted } from '../lib/registrations.js';
+import { hasStarted, availability, capacityInPlayers } from '../lib/registrations.js';
+import { championCard } from '../lib/homeChampions.js';
+import { listOpenFriendlies } from './friendlies.js';
+import { arNow } from '../lib/friendlies.js';
+import { parseAgendaRange } from '../lib/agenda.js';
 
 const router = Router();
 
@@ -9,6 +13,8 @@ const LIMIT_LIVE     = 6;
 const LIMIT_UPCOMING = 8;
 const LIMIT_SIGNUP   = 8;
 const LIMIT_FEATURED = 8;
+const LIMIT_CHAMPIONS = 10;
+const LIMIT_FRIENDLIES = 4;
 
 // Presentación de una jornada pública: categoría, dueño y club.
 function card(t) {
@@ -19,6 +25,7 @@ function card(t) {
     owner_username: t.owner_username, owner_name: t.owner_name ?? null, owner_avatar_url: t.owner_avatar_url ?? null,
     club_id: t.club_id ?? null, club_name: t.club_name ?? null,
     club_photo_url: t.club_photo_url ?? null, club_location_name: t.club_location_name ?? null,
+    flyer_url: t.flyer_url ?? null, cover_url: t.cover_url ?? null, level: t.level ?? null,
   };
 }
 
@@ -26,12 +33,14 @@ function card(t) {
 router.get('/', async (req, res, next) => {
   try {
     const sql = getDb();
-    const [live, upcoming, signup, featured, [totals]] = await Promise.all([
+    const [live, upcoming, signup, featured, [totals], champions, friendlies] = await Promise.all([
       sql`
         SELECT t.id, t.name, t.status, t.format, t.mode, t.event_date, t.event_time, t.live_match,
                g.id AS group_id, g.name AS group_name, g.emojis AS group_emojis,
                u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
-               c.id AS club_id, c.name AS club_name, c.photo_url AS club_photo_url, c.location_name AS club_location_name
+               c.id AS club_id, c.name AS club_name, c.photo_url AS club_photo_url, c.location_name AS club_location_name,
+               t.flyer_url, COALESCE(t.level, g.level) AS level,
+               (SELECT ph.url FROM tournament_photos ph WHERE ph.tournament_id = t.id AND ph.is_cover ORDER BY ph.created_at DESC LIMIT 1) AS cover_url
         FROM   tournaments t
         JOIN   groups g ON g.id = t.group_id
         JOIN   users  u ON u.id = g.user_id
@@ -48,6 +57,8 @@ router.get('/', async (req, res, next) => {
                g.id AS group_id, g.name AS group_name, g.emojis AS group_emojis,
                u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
                c.id AS club_id, c.name AS club_name, c.photo_url AS club_photo_url, c.location_name AS club_location_name,
+               t.flyer_url, COALESCE(t.level, g.level) AS level,
+               (SELECT ph.url FROM tournament_photos ph WHERE ph.tournament_id = t.id AND ph.is_cover ORDER BY ph.created_at DESC LIMIT 1) AS cover_url,
                t.live_match, (t.bracket IS NOT NULL) AS has_bracket,
                (SELECT COUNT(*)::int FROM matches m WHERE m.tournament_id = t.id) AS match_count,
                (SELECT COUNT(*)::int FROM tournament_players tp WHERE tp.tournament_id = t.id) AS player_count
@@ -67,10 +78,21 @@ router.get('/', async (req, res, next) => {
                u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
                json_build_object('whatsapp', CASE WHEN u.whatsapp_public THEN u.whatsapp END, 'instagram', u.instagram) AS owner_profile,
                c.id AS club_id, c.name AS club_name, c.photo_url AS club_photo_url, c.location_name AS club_location_name,
+               t.flyer_url, (SELECT ph.url FROM tournament_photos ph WHERE ph.tournament_id = t.id AND ph.is_cover ORDER BY ph.created_at DESC LIMIT 1) AS cover_url,
                t.signup_price, t.signup_price_unit, t.signup_contacts,
                g.signup_price      AS group_signup_price,
                g.signup_price_unit AS group_signup_price_unit,
-               g.signup_contacts   AS group_signup_contacts
+               g.signup_contacts   AS group_signup_contacts,
+               COALESCE(t.level, g.level) AS level,
+               t.signup_capacity, t.signup_capacity_unit,
+               g.signup_capacity      AS group_signup_capacity,
+               g.signup_capacity_unit AS group_signup_capacity_unit,
+               (SELECT COUNT(*)::int FROM tournament_players tp
+                WHERE tp.tournament_id = t.id
+                  AND (NOT EXISTS (SELECT 1 FROM pairs p WHERE p.tournament_id = t.id AND p.status = 'withdrawn'
+                                    AND tp.player_id IN (p.p1_id, p.p2_id))
+                       OR EXISTS  (SELECT 1 FROM pairs p WHERE p.tournament_id = t.id AND p.status = 'active'
+                                    AND tp.player_id IN (p.p1_id, p.p2_id)))) AS used_players
         FROM   tournaments t
         JOIN   groups g ON g.id = t.group_id
         JOIN   users  u ON u.id = g.user_id
@@ -84,7 +106,8 @@ router.get('/', async (req, res, next) => {
       `,
       // Reserva: categorías públicas con actividad, para que la portada nunca quede vacía.
       sql`
-        SELECT g.id, g.name, g.description, g.emojis, g.location_name, g.is_public,
+        SELECT g.id, g.name, g.description, g.emojis, g.location_name, g.is_public, g.level,
+               (SELECT MIN(t.event_date)::text FROM tournaments t WHERE t.group_id = g.id AND t.status <> 'finished' AND t.event_date >= CURRENT_DATE) AS next_date,
                u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
                (SELECT COUNT(DISTINCT tp.player_id)::int
                 FROM tournament_players tp
@@ -92,12 +115,13 @@ router.get('/', async (req, res, next) => {
                 WHERE t.group_id = g.id) AS player_count,
                (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
                (SELECT MAX(t.created_at) FROM tournaments t WHERE t.group_id = g.id) AS last_activity,
-               COALESCE(gclub.name, lastclub.name) AS club_name
+               COALESCE(gclub.name, lastclub.name) AS club_name,
+               COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url
         FROM groups g
         JOIN users u ON u.id = g.user_id
         LEFT JOIN clubs gclub ON gclub.id = g.club_id
         LEFT JOIN LATERAL (
-          SELECT c2.name
+          SELECT c2.name, c2.photo_url
           FROM   tournaments t2
           JOIN   clubs c2 ON c2.id = t2.club_id
           WHERE  t2.group_id = g.id
@@ -115,6 +139,38 @@ router.get('/', async (req, res, next) => {
                (SELECT COUNT(DISTINCT tp.player_id)::int FROM tournament_players tp) AS players,
                (SELECT COUNT(*)::int FROM clubs)                                     AS clubs
       `,
+      // Campeón = la pareja que ganó la final del cuadro (americano, copa y liga con playoffs).
+      sql`
+        SELECT t.id, t.name, t.format, t.bracket->'final' AS final,
+               COALESCE(t.level, g.level) AS level,
+               COALESCE(t.event_date, (SELECT MIN(m.played_at)::date FROM matches m WHERE m.tournament_id = t.id), t.created_at::date) AS played_on,
+               g.id AS group_id, g.name AS group_name,
+               ou.name AS owner_name, ou.username AS owner_username,
+               c.name AS club_name, cover.url AS cover_url,
+               COALESCE(u1.name, p1.name) AS p1_name, u1.avatar_url AS p1_avatar, u1.username AS p1_username,
+               COALESCE(u2.name, p2.name) AS p2_name, u2.avatar_url AS p2_avatar, u2.username AS p2_username
+        FROM   tournaments t
+        JOIN   groups g  ON g.id = t.group_id
+        JOIN   users  ou ON ou.id = g.user_id
+        JOIN   pairs  pr ON pr.tournament_id = t.id AND pr.id = t.bracket->'final'->>'winner_id'
+        LEFT   JOIN players p1 ON p1.id = pr.p1_id
+        LEFT   JOIN users   u1 ON u1.id = p1.user_id
+        LEFT   JOIN players p2 ON p2.id = pr.p2_id
+        LEFT   JOIN users   u2 ON u2.id = p2.user_id
+        LEFT   JOIN clubs   c  ON c.id = t.club_id
+        LEFT   JOIN LATERAL (
+          SELECT ph.url FROM tournament_photos ph
+          WHERE  ph.tournament_id = t.id AND ph.is_cover
+          ORDER  BY ph.created_at DESC
+          LIMIT  1
+        ) cover ON true
+        WHERE  g.is_public = true
+          AND  t.status = 'finished'
+          AND  t.bracket->'final'->>'winner_id' IS NOT NULL
+        ORDER  BY played_on DESC, t.created_at DESC
+        LIMIT  ${LIMIT_CHAMPIONS}
+      `,
+      listOpenFriendlies(sql, LIMIT_FRIENDLIES),
     ]);
 
     res.json({
@@ -132,16 +188,60 @@ router.get('/', async (req, res, next) => {
         const started = hasStarted({ ...t, bracket: t.has_bracket || null }, t.match_count);
         return { ...card(t), player_count: started ? (t.player_count ?? 0) : null, roster_hidden: !started };
       }),
-      signup: signup.map((t) => ({
-        ...card(t),
-        signup: resolveSignup(
-          { signup_open: true, signup_price: t.signup_price, signup_price_unit: t.signup_price_unit, signup_contacts: t.signup_contacts },
-          { signup_price: t.group_signup_price, signup_price_unit: t.group_signup_price_unit, signup_contacts: t.group_signup_contacts },
+      signup: signup.map((t) => {
+        const { capacity, capacity_unit, ...resolved } = resolveSignup(
+          { signup_open: true, signup_price: t.signup_price, signup_price_unit: t.signup_price_unit, signup_contacts: t.signup_contacts,
+            level: t.level, signup_capacity: t.signup_capacity, signup_capacity_unit: t.signup_capacity_unit },
+          { signup_price: t.group_signup_price, signup_price_unit: t.group_signup_price_unit, signup_contacts: t.group_signup_contacts,
+            signup_capacity: t.group_signup_capacity, signup_capacity_unit: t.group_signup_capacity_unit },
           t.owner_profile,
-        ),
-      })),
+        );
+        const cap = capacityInPlayers({ capacity, unit: capacity_unit, format: t.format });
+        // Como en la inscripción: el cupo nunca se publica en números.
+        return { ...card(t), signup: { ...resolved, availability: availability(cap, t.used_players) } };
+      }),
       featured,
       totals,
+      champions: champions.map(championCard),
+      friendlies,
+    });
+  } catch (err) { next(err); }
+});
+
+// GET /api/home/calendar?from&to — torneos públicos con fecha en el rango (62 días como máximo).
+router.get('/calendar', async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const today = arNow().date;
+    const { from, to } = parseAgendaRange(req.query, today);
+    const rows = await sql`
+      SELECT t.id, t.name, t.status, t.format, t.mode, t.event_date::text AS event_date,
+             to_char(t.event_time, 'HH24:MI') AS event_time,
+             g.id AS group_id, g.name AS group_name, g.emojis AS group_emojis,
+             u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
+             c.id AS club_id, c.name AS club_name, c.photo_url AS club_photo_url, c.location_name AS club_location_name,
+             t.flyer_url, COALESCE(t.level, g.level) AS level,
+             (SELECT ph.url FROM tournament_photos ph WHERE ph.tournament_id = t.id AND ph.is_cover ORDER BY ph.created_at DESC LIMIT 1) AS cover_url,
+             COALESCE(jsonb_typeof(t.live_match) = 'array' AND jsonb_array_length(t.live_match) > 0, false) AS live,
+             (SELECT COUNT(*)::int FROM tournament_players tp WHERE tp.tournament_id = t.id) AS player_count,
+             COALESCE(t.signup_open, g.signup_open, false) AS signup_open,
+             COALESCE(t.signup_price, g.signup_price) AS signup_price,
+             COALESCE(t.signup_price_unit, g.signup_price_unit, 'player') AS signup_price_unit
+      FROM   tournaments t
+      JOIN   groups g ON g.id = t.group_id
+      JOIN   users  u ON u.id = g.user_id
+      LEFT   JOIN clubs c ON c.id = t.club_id
+      WHERE  g.is_public = true
+        AND  t.event_date BETWEEN ${from}::date AND ${to}::date
+      ORDER  BY t.event_date ASC, t.event_time ASC NULLS LAST, t.created_at ASC
+      LIMIT  300
+    `;
+    res.json({
+      from, to,
+      tournaments: rows.map((t) => ({
+        ...card(t), live: t.live, player_count: t.player_count,
+        signup: { open: t.signup_open && t.status !== 'finished' && t.event_date >= today, price: t.signup_price, unit: t.signup_price_unit },
+      })),
     });
   } catch (err) { next(err); }
 });

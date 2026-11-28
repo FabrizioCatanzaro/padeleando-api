@@ -16,6 +16,7 @@ import {
   mergeWeekdayAndClub, countBlowouts, countSetStats, bracketStatsByUser, buildFollowRanking, dayKey,
   countBracketPlayed, expandFriendlyMatches, addFriendlyStatsByUser,
 } from '../lib/profileStats.js';
+import { PLAYER_PLANS, ORGANIZER_PLANS } from '../lib/planCatalog.js';
 
 // GET /api/groups — solo los del usuario autenticado
 router.get('/', requireAuth, async (req, res, next) => {
@@ -177,7 +178,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
              u.advanced_stats_public, u.category,
              EXISTS (
                SELECT 1 FROM subscriptions s
-               WHERE s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+               WHERE s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
              ) AS has_premium_row
       FROM users u
       WHERE u.username = ${req.params.username}
@@ -521,7 +522,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
         END
       )
       LEFT JOIN users u ON u.id = partner.user_id
-      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
       WHERE p.user_id = ${owner.id}
       GROUP BY COALESCE(partner.user_id, partner.id),
                COALESCE(u.name, partner.name), u.username, u.avatar_url, s.id
@@ -633,7 +634,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
           ELSE 0 END), 0)::int AS victorias
       FROM circle
       JOIN users u ON u.id = circle.uid
-      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
       LEFT JOIN players p ON p.user_id = u.id
       LEFT JOIN matches m ON m.score1 <> m.score2 AND NOT m.walkover
         AND (m.team1_p1 = p.id OR m.team1_p2 = p.id
@@ -816,7 +817,7 @@ router.get('/user/:username', optionalAuth, async (req, res, next) => {
 
     // Veredicto final sobre las avanzadas, ya con la suscripción resuelta: si
     // wantAdvanced las trajo pero la suscripción resultó vencida, no salen.
-    const isPremium    = sub.plan === 'premium';
+    const isPremium    = PLAYER_PLANS.includes(sub.plan);
     const showAdvanced = isOwner || (owner.advanced_stats_public === true && isPremium);
 
     // `has_premium_row` es un detalle interno de la decisión de arriba.
@@ -883,14 +884,19 @@ router.get('/search', async (req, res, next) => {
     if (!q || q.length < 2) return res.json([]);
     const sql = getDb();
     const groups = await sql`
-      SELECT g.id, g.name, g.description, g.emojis, g.created_at,
+      SELECT g.id, g.name, g.description, g.emojis, g.created_at, g.level, g.location_name,
              u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
-             COALESCE(gclub.name, lastclub.name) AS club_name
+             COALESCE(gclub.name, lastclub.name) AS club_name,
+             COALESCE(gclub.photo_url, lastclub.photo_url) AS club_photo_url,
+             (SELECT COUNT(DISTINCT tp.player_id)::int FROM tournament_players tp
+              JOIN tournaments t ON t.id = tp.tournament_id WHERE t.group_id = g.id) AS player_count,
+             (SELECT COUNT(*)::int FROM tournaments t WHERE t.group_id = g.id) AS tournament_count,
+             (SELECT MIN(t.event_date)::text FROM tournaments t WHERE t.group_id = g.id AND t.status <> 'finished' AND t.event_date >= CURRENT_DATE) AS next_date
       FROM groups g
       JOIN users u ON u.id = g.user_id
       LEFT JOIN clubs gclub ON gclub.id = g.club_id
       LEFT JOIN LATERAL (
-        SELECT c2.name
+        SELECT c2.name, c2.photo_url
         FROM   tournaments t2
         JOIN   clubs c2 ON c2.id = t2.club_id
         WHERE  t2.group_id = g.id
@@ -959,7 +965,7 @@ router.get('/:groupId/meta', optionalAuth, async (req, res, next) => {
              u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
              (EXISTS (
                SELECT 1 FROM subscriptions s
-               WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
+               WHERE s.user_id = g.user_id AND s.plan = ANY(${ORGANIZER_PLANS}) AND s.status = 'active'
              )) AS owner_is_premium,
              (g.user_id = ${viewerId}::text) AS is_owner,
              EXISTS (SELECT 1 FROM group_collaborators gc
@@ -1085,6 +1091,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
     sql`
       SELECT g.*, u.username AS owner_username, u.name AS owner_name, u.avatar_url AS owner_avatar_url,
              json_build_object('whatsapp', CASE WHEN u.whatsapp_public THEN u.whatsapp END, 'instagram', u.instagram) AS owner_profile,
+             (u.mp_connected_at IS NOT NULL) AS owner_mp_connected,
              c.name AS club_name, c.location_name AS club_location_name, c.photo_url AS club_photo_url,
              c.courts AS club_courts,
              cr.name AS pending_club_name,
@@ -1094,7 +1101,7 @@ router.get('/:groupId', optionalAuth, async (req, res, next) => {
               WHERE t.group_id = g.id) AS player_count,
              (EXISTS (
                SELECT 1 FROM subscriptions s
-               WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
+               WHERE s.user_id = g.user_id AND s.plan = ANY(${ORGANIZER_PLANS}) AND s.status = 'active'
              )) AS owner_is_premium
       FROM groups g
       JOIN users u ON u.id = g.user_id

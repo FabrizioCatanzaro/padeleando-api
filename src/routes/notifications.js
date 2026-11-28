@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { getDb } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { PLAYER_PLANS } from '../lib/planCatalog.js';
 
 const router = Router();
 
@@ -23,7 +24,7 @@ router.get('/', requireAuth, async (req, res, next) => {
         COALESCE(a.role = 'admin', false) AS actor_is_admin,
         CASE WHEN a.id IS NOT NULL THEN EXISTS(
           SELECT 1 FROM subscriptions s
-          WHERE s.user_id = a.id AND s.plan = 'premium' AND s.status = 'active'
+          WHERE s.user_id = a.id AND s.plan = ANY(${PLAYER_PLANS}) AND s.status = 'active'
             AND (s.ends_at IS NULL OR s.ends_at > NOW())
         ) ELSE false END AS actor_is_premium,
         CASE WHEN n.type = 'follow' THEN
@@ -59,10 +60,10 @@ router.get('/', requireAuth, async (req, res, next) => {
       LEFT JOIN groups got ON got.id = ot.group_id
       LEFT JOIN groups gor ON n.type = 'ownership_received' AND gor.id = n.entity_id
       LEFT JOIN groups gpu ON n.type = 'player_unlinked'    AND gpu.id = n.entity_id
-      LEFT JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
+      LEFT JOIN tournaments tnt ON n.type IN ('new_tournament', 'club_tournament_signup') AND tnt.id = n.entity_id
       LEFT JOIN groups gnt ON gnt.id = tnt.group_id
       LEFT JOIN tournament_registrations tr
-             ON n.type IN ('registration_received', 'registration_decided', 'registration_partner') AND tr.id = n.entity_id
+             ON n.type IN ('registration_received', 'registration_decided', 'registration_partner', 'registration_refund_failed') AND tr.id = n.entity_id
       LEFT JOIN tournaments ttr ON ttr.id = tr.tournament_id
       LEFT JOIN groups gtr ON gtr.id = ttr.group_id
       LEFT JOIN friendly_matches fm ON n.type LIKE 'friendly\_%' AND fm.id = n.entity_id
@@ -139,10 +140,10 @@ router.get('/count', requireAuth, async (req, res, next) => {
         LEFT   JOIN tournament_join_requests tjr ON n.type = 'join_request' AND tjr.id = n.entity_id
         LEFT   JOIN tournaments tj ON tj.id = tjr.tournament_id
         LEFT   JOIN groups gtj ON gtj.id = tj.group_id
-        LEFT   JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
+        LEFT   JOIN tournaments tnt ON n.type IN ('new_tournament', 'club_tournament_signup') AND tnt.id = n.entity_id
         LEFT   JOIN groups gnt ON gnt.id = tnt.group_id
         LEFT   JOIN tournament_registrations tr
-               ON n.type IN ('registration_received', 'registration_decided', 'registration_partner') AND tr.id = n.entity_id
+               ON n.type IN ('registration_received', 'registration_decided', 'registration_partner', 'registration_refund_failed') AND tr.id = n.entity_id
         LEFT   JOIN tournaments ttr ON ttr.id = tr.tournament_id
         LEFT   JOIN groups gtr ON gtr.id = ttr.group_id
         LEFT   JOIN friendly_matches fm ON n.type LIKE 'friendly\_%' AND fm.id = n.entity_id

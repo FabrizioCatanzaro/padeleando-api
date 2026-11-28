@@ -99,12 +99,12 @@ test('edición: qué se bloquea con el sorteo, las fechas y el cuadro', () => {
 });
 
 test('cupo: una copa por mes en cada categoría en el plan Básico', () => {
-  assert.equal(quotaMessage({ premium: false, count: 0, copas: 0, format: 'copa' }), null);
-  assert.match(quotaMessage({ premium: false, count: 1, copas: 1, format: 'copa' }), /1 copa por mes/);
-  assert.equal(quotaMessage({ premium: false, count: 1, copas: 1, format: 'liga' }), null);
-  assert.match(quotaMessage({ premium: false, count: 2, copas: 0, format: 'copa' }), /2 torneos por mes/);
-  assert.match(quotaMessage({ premium: false, count: 2, copas: 1, format: 'americano' }), /2 torneos por mes/);
-  assert.equal(quotaMessage({ premium: true, count: 9, copas: 4, format: 'copa' }), null);
+  assert.equal(quotaMessage({ organizer: false, count: 0, copas: 0, format: 'copa' }), null);
+  assert.match(quotaMessage({ organizer: false, count: 1, copas: 1, format: 'copa' }), /1 copa por mes/);
+  assert.equal(quotaMessage({ organizer: false, count: 1, copas: 1, format: 'liga' }), null);
+  assert.match(quotaMessage({ organizer: false, count: 2, copas: 0, format: 'copa' }), /2 torneos por mes/);
+  assert.match(quotaMessage({ organizer: false, count: 2, copas: 1, format: 'americano' }), /2 torneos por mes/);
+  assert.equal(quotaMessage({ organizer: true, count: 9, copas: 4, format: 'copa' }), null);
 });
 
 test('cupo de inscripción: la copa no pasa de 32 parejas', () => {

@@ -2,8 +2,11 @@ import { Router } from 'express';
 import { getDb }  from '../db.js';
 import { resolveSignup } from '../lib/signup.js';
 import { hasStarted, publicSignup, countUsedPlayers } from '../lib/registrations.js';
+import { PLAYER_PLANS, ORGANIZER_PLANS } from '../lib/planCatalog.js';
  
 const router = Router();
+
+const onlineOnlyIfConnected = (signup, connected) => ({ ...signup, online: signup.online && connected === true });
  
 // GET /api/readonly/:tournamentId  — endpoint público sin autenticación
 router.get('/:tournamentId', async (req, res, next) => {
@@ -16,6 +19,7 @@ router.get('/:tournamentId', async (req, res, next) => {
              u.name          AS owner_name,
              u.avatar_url    AS owner_avatar_url,
              json_build_object('whatsapp', CASE WHEN u.whatsapp_public THEN u.whatsapp END, 'instagram', u.instagram) AS owner_profile,
+             (u.mp_connected_at IS NOT NULL) AS owner_mp_connected,
              g.name          AS group_name,
              -- La vista de espectador pedía esto en una segunda llamada a
              -- /groups/:id/meta que sólo podía salir cuando ya había respondido
@@ -25,7 +29,7 @@ router.get('/:tournamentId', async (req, res, next) => {
              g.is_public     AS group_is_public,
              (EXISTS (
                SELECT 1 FROM subscriptions s
-               WHERE s.user_id = g.user_id AND s.plan = 'premium' AND s.status = 'active'
+               WHERE s.user_id = g.user_id AND s.plan = ANY(${ORGANIZER_PLANS}) AND s.status = 'active'
              )) AS group_owner_is_premium,
              c.name          AS club_name,
              c.photo_url     AS club_photo_url,
@@ -81,7 +85,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       FROM   players p
       INNER JOIN tournament_players tp ON tp.player_id = p.id AND tp.tournament_id = ${tournamentId}
       LEFT  JOIN users u ON u.id = p.user_id
-      LEFT  JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+      LEFT  JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
     `;
 
     // Backward-compat: also include any players from matches/pairs not in tournament_players
@@ -100,7 +104,7 @@ router.get('/:tournamentId', async (req, res, next) => {
                  (s.id IS NOT NULL) AS is_premium
           FROM   players p
           LEFT   JOIN users u ON u.id = p.user_id
-          LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = 'premium'
+          LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active' AND s.plan = ANY(${PLAYER_PLANS})
           WHERE  p.id = ANY(${extraIds})
         `
       : [];
@@ -158,7 +162,7 @@ router.get('/:tournamentId', async (req, res, next) => {
       points_loss:    tournament.points_loss ?? 0,
       flyer_url:      tournament.flyer_url ?? null,
       // Ya resuelto: al espectador no le sirve saber de dónde salió cada campo.
-      signup: publicSignup(resolveSignup(tournament, {
+      signup: publicSignup(onlineOnlyIfConnected(resolveSignup(tournament, {
         signup_open:       tournament.group_signup_open,
         signup_price:      tournament.group_signup_price,
         signup_price_unit: tournament.group_signup_price_unit,
@@ -168,7 +172,9 @@ router.get('/:tournamentId', async (req, res, next) => {
         signup_capacity_unit: tournament.group_signup_capacity_unit,
         signup_closes_at:     tournament.group_signup_closes_at,
         rules:                tournament.group_rules,
-      }, tournament.owner_profile), { format: tournament.format, used: await countUsedPlayers(sql, tournamentId) }),
+      }, tournament.owner_profile), tournament.owner_mp_connected), {
+        format: tournament.format, used: await countUsedPlayers(sql, tournamentId), organizerPlan: tournament.group_owner_is_premium,
+      }),
       // El plantel queda oculto hasta que empieza el torneo (Fabri, 2026-11-09).
       players:           rosterHidden ? [] : players,
       pairs:             rosterHidden ? [] : pairs,
