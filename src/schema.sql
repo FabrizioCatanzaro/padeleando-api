@@ -1019,3 +1019,29 @@ ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE club_courts DROP CONSTRAINT IF EXISTS club_courts_wall_type_check;
 ALTER TABLE club_courts ADD CONSTRAINT club_courts_wall_type_check
   CHECK (wall_type IS NULL OR wall_type IN ('cemento', 'cristal', 'cristal_panoramico'));
+
+-- Perfil de club: galería y seguidores
+CREATE TABLE IF NOT EXISTS club_photos (
+  id         TEXT PRIMARY KEY,
+  club_id    TEXT NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  url        TEXT NOT NULL,
+  public_id  TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_club_photos_club ON club_photos(club_id, created_at);
+CREATE TABLE IF NOT EXISTS club_follows (
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  club_id    TEXT NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, club_id)
+);
+CREATE INDEX IF NOT EXISTS idx_club_follows_club ON club_follows(club_id);
+ALTER TABLE IF EXISTS notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
+ALTER TABLE IF EXISTS notifications ADD CONSTRAINT notifications_type_check
+  CHECK (type IN ('follow','invitation','join_request','admin_message','club_request',
+                  'collab_invite','ownership_transfer','ownership_received','premium_claim',
+                  'player_unlinked','new_tournament','club_claim','booking_decided','booking_requested',
+                  'booking_cancelled','registration_received','registration_decided','registration_partner',
+                  'friendly_added','friendly_joined','friendly_left','friendly_removed','friendly_full',
+                  'friendly_updated','friendly_proposal','friendly_confirmed','friendly_cancelled','friendly_reminder',
+                  'registration_refund_failed','commission_due','club_tournament_signup'));

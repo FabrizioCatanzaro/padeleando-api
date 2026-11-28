@@ -60,7 +60,7 @@ router.get('/', requireAuth, async (req, res, next) => {
       LEFT JOIN groups got ON got.id = ot.group_id
       LEFT JOIN groups gor ON n.type = 'ownership_received' AND gor.id = n.entity_id
       LEFT JOIN groups gpu ON n.type = 'player_unlinked'    AND gpu.id = n.entity_id
-      LEFT JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
+      LEFT JOIN tournaments tnt ON n.type IN ('new_tournament', 'club_tournament_signup') AND tnt.id = n.entity_id
       LEFT JOIN groups gnt ON gnt.id = tnt.group_id
       LEFT JOIN tournament_registrations tr
              ON n.type IN ('registration_received', 'registration_decided', 'registration_partner', 'registration_refund_failed') AND tr.id = n.entity_id
@@ -140,7 +140,7 @@ router.get('/count', requireAuth, async (req, res, next) => {
         LEFT   JOIN tournament_join_requests tjr ON n.type = 'join_request' AND tjr.id = n.entity_id
         LEFT   JOIN tournaments tj ON tj.id = tjr.tournament_id
         LEFT   JOIN groups gtj ON gtj.id = tj.group_id
-        LEFT   JOIN tournaments tnt ON n.type = 'new_tournament' AND tnt.id = n.entity_id
+        LEFT   JOIN tournaments tnt ON n.type IN ('new_tournament', 'club_tournament_signup') AND tnt.id = n.entity_id
         LEFT   JOIN groups gnt ON gnt.id = tnt.group_id
         LEFT   JOIN tournament_registrations tr
                ON n.type IN ('registration_received', 'registration_decided', 'registration_partner', 'registration_refund_failed') AND tr.id = n.entity_id

@@ -28,3 +28,10 @@ test('cancha: color hexadecimal y descripción', () => {
   assert.ok(parseCourtExtras({ floor_color: '#fff' }).error);
   assert.ok(parseCourtExtras({ description: 'x'.repeat(201) }).error);
 });
+
+import { clubPhotoLimit } from '../src/lib/clubProfile.js';
+
+test('galería: 4 fotos gratis y 16 con plan Club', () => {
+  assert.equal(clubPhotoLimit(false), 4);
+  assert.equal(clubPhotoLimit(true), 16);
+});

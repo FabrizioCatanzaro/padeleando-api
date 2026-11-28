@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { notifyClubFollowersSignup } from '../lib/clubFollowers.js';
 import { getDb, withTransaction } from '../db.js';
 import { uid }    from '../uid.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
@@ -595,6 +596,9 @@ router.post('/', requireAuth, requireGroupManage, async (req, res, next) => {
     notifyFavorites(groupId, tId, req.user.id).catch((err) =>
       console.error('No se pudo avisar a quienes la tienen en favoritas:', err)
     );
+    notifyClubFollowersSignup(tId, req.user.id).catch((err) =>
+      console.error('No se pudo avisar a quienes siguen el club:', err)
+    );
   } catch (err) { next(err); }
 });
 
@@ -723,6 +727,11 @@ router.patch('/:id', requireAuth, requireTournamentManage, async (req, res, next
     `;
     if (!updated) return res.status(404).json({ error: 'Torneo no encontrado' });
     res.json(updated);
+    if (signup.signup_open === true || club_id) {
+      notifyClubFollowersSignup(id, req.user.id).catch((err) =>
+        console.error('No se pudo avisar a quienes siguen el club:', err)
+      );
+    }
   } catch (err) { next(err); }
 });
 

@@ -10,11 +10,13 @@ import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
 import { arNow } from '../lib/friendlies.js';
 import { expandBookingSlots, withinHorizon, addDaysStr } from '../lib/bookingSlots.js';
-import { parseClubExtras, parseCourtExtras, COURT_WALL_TYPES } from '../lib/clubProfile.js';
+import { parseClubExtras, parseCourtExtras, COURT_WALL_TYPES, clubPhotoLimit } from '../lib/clubProfile.js';
+
+const CLUB_PLANS = plansWith('club');
 import { activityFrom, buildActivity } from '../lib/clubActivity.js';
 import { championCard } from '../lib/homeChampions.js';
 import { listOpenFriendlies } from './friendlies.js';
-import { CLUB_PLAN_ENABLED } from '../lib/planCatalog.js';
+import { CLUB_PLAN_ENABLED, plansWith } from '../lib/planCatalog.js';
 import { saveUserMp, exchangeCode } from '../lib/mpAccount.js';
 
 const router = Router();
@@ -428,7 +430,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     // ve también las deshabilitadas temporalmente, para poder reactivarlas).
     // Filtrar por gestión exacta requiere saber owner_id, que recién se sabe
     // con `club` resuelto -- se filtra en JS un poco más abajo.
-    const [[club], [agg], brackets, courtsList, [pendingBookings]] = await Promise.all([
+    const [[club], [agg], brackets, courtsList, [pendingBookings], photos, [follows]] = await Promise.all([
       sql`
         SELECT c.id, c.name, c.photo_url, c.header_url, c.social_links,
         c.contact_phone, c.contact_whatsapp,
@@ -444,7 +446,11 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         (c.owner_id IS NOT NULL AND (NOT ${CLUB_PLAN_ENABLED} OR EXISTS (
           SELECT 1 FROM subscriptions s
           WHERE s.user_id = c.owner_id AND s.plan = 'club' AND s.status = 'active'
-        ))) AS can_collect_online
+        ))) AS can_collect_online,
+        (${CLUB_PLAN_ENABLED}::boolean AND EXISTS (
+          SELECT 1 FROM subscriptions s
+          WHERE s.user_id = c.owner_id AND s.plan = ANY(${CLUB_PLANS}) AND s.status = 'active'
+        )) AS owner_has_club_plan
         FROM clubs c
         LEFT JOIN users ou ON ou.id = c.owner_id
         WHERE c.id = ${req.params.id}
@@ -483,6 +489,11 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       `,
       // Cuenta grupos de reservas, no filas: un grupo de varios turnos son varias filas
       sql`SELECT COUNT(DISTINCT group_id)::int AS n FROM bookings WHERE club_id = ${req.params.id} AND status = 'pending'`,
+      sql`SELECT id, url FROM club_photos WHERE club_id = ${req.params.id} ORDER BY created_at`,
+      sql`
+        SELECT COUNT(*)::int AS n, COALESCE(bool_or(user_id = ${viewerId}), false) AS mine
+        FROM club_follows WHERE club_id = ${req.params.id}
+      `,
     ]);
 
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
@@ -493,8 +504,13 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     // Más estricto que isManager: el admin solo gestiona reservas de clubes sin dueño
     const canManageBookings = club.is_owner === true || (req.user?.role === 'admin' && !club.has_owner);
 
+    const { owner_has_club_plan, ...publicClub } = club;
     res.json({
-      ...club,
+      ...publicClub,
+      photos,
+      photo_limit: isManager ? clubPhotoLimit(owner_has_club_plan) : undefined,
+      followers_count: follows?.n ?? 0,
+      is_following: !!follows?.mine,
       courts_list,
       can_manage_bookings: canManageBookings,
       pending_bookings_count: canManageBookings ? (pendingBookings?.n ?? 0) : undefined,
@@ -925,6 +941,74 @@ router.delete('/:id/header', requireAuth, requireClubManage, async (req, res, ne
       location_name, lat, lon, courts, schedule, owner_visible, created_at
     `;
     res.json(updated);
+  } catch (err) { next(err); }
+});
+
+// Galería: el límite sale del plan del dueño; bajar de plan no borra las que ya están
+router.post('/:id/photos', requireAuth, requireClubManage, uploadClubPhoto, async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No se envió imagen' });
+    const sql = getDb();
+    const [[club], [{ n }]] = await Promise.all([
+      sql`
+        SELECT c.id, (${CLUB_PLAN_ENABLED}::boolean AND EXISTS (
+          SELECT 1 FROM subscriptions s
+          WHERE s.user_id = c.owner_id AND s.plan = ANY(${CLUB_PLANS}) AND s.status = 'active'
+        )) AS has_plan
+        FROM clubs c WHERE c.id = ${req.params.id}
+      `,
+      sql`SELECT COUNT(*)::int AS n FROM club_photos WHERE club_id = ${req.params.id}`,
+    ]);
+    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
+    const limit = clubPhotoLimit(club.has_plan);
+    if (n >= limit) return res.status(403).json({ error: `Llegaste al límite de ${limit} fotos`, code: 'plan_limit', limit });
+
+    const result = await uploadBuffer(req.file.buffer, { folder: `padeliando/clubs/${club.id}/gallery` });
+    const [photo] = await sql`
+      INSERT INTO club_photos (id, club_id, url, public_id)
+      VALUES (${uid()}, ${club.id}, ${result.secure_url}, ${result.public_id})
+      RETURNING id, url
+    `;
+    res.status(201).json(photo);
+  } catch (err) { next(err); }
+});
+
+router.delete('/:id/photos/:photoId', requireAuth, requireClubManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [gone] = await sql`
+      DELETE FROM club_photos WHERE id = ${req.params.photoId} AND club_id = ${req.params.id} RETURNING public_id
+    `;
+    if (!gone) return res.status(404).json({ error: 'Foto no encontrada' });
+    if (gone.public_id) await deleteByPublicId(gone.public_id);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// Seguir el club: avisa cuando un torneo del club abre la inscripción
+async function followState(sql, clubId, userId) {
+  const [row] = await sql`
+    SELECT COUNT(*)::int AS n, COALESCE(bool_or(user_id = ${userId}), false) AS mine
+    FROM club_follows WHERE club_id = ${clubId}
+  `;
+  return { followers_count: row.n, is_following: row.mine };
+}
+
+router.post('/:id/follow', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const [club] = await sql`SELECT id FROM clubs WHERE id = ${req.params.id}`;
+    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
+    await sql`INSERT INTO club_follows (user_id, club_id) VALUES (${req.user.id}, ${club.id}) ON CONFLICT DO NOTHING`;
+    res.json(await followState(sql, club.id, req.user.id));
+  } catch (err) { next(err); }
+});
+
+router.delete('/:id/follow', requireAuth, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    await sql`DELETE FROM club_follows WHERE user_id = ${req.user.id} AND club_id = ${req.params.id}`;
+    res.json(await followState(sql, req.params.id, req.user.id));
   } catch (err) { next(err); }
 });
 

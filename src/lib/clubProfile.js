@@ -42,3 +42,7 @@ export function parseCourtExtras(body = {}) {
   }
   return { fields: { floor_color: color ? color.toLowerCase() : null, description } };
 }
+
+export const CLUB_PHOTOS_FREE = 4;
+export const CLUB_PHOTOS_PLAN = 16;
+export const clubPhotoLimit = (hasClubPlan) => (hasClubPlan ? CLUB_PHOTOS_PLAN : CLUB_PHOTOS_FREE);
