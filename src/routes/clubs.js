@@ -9,6 +9,7 @@ import { uploadClubPhoto, uploadClubHeader, uploadClubClaimPhotos } from '../mid
 import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
 import { arNow } from '../lib/friendlies.js';
+import { expandBookingSlots, withinHorizon, addDaysStr } from '../lib/bookingSlots.js';
 import { CLUB_PLAN_ENABLED } from '../lib/planCatalog.js';
 import { saveUserMp, exchangeCode } from '../lib/mpAccount.js';
 
@@ -1161,12 +1162,7 @@ function isValidDateStr(s) {
   return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
 }
 function todayStr() {
-  return new Date().toISOString().slice(0, 10);
-}
-function addDaysStr(dateStr, days) {
-  const d = new Date(`${dateStr}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().slice(0, 10);
+  return arNow().date;
 }
 
 // GET /api/clubs/:id/bookings: público, nunca devuelve quién reservó
@@ -1237,11 +1233,11 @@ function minutesToTime(mins) {
 }
 
 // Inserta N filas con el mismo group_id de forma atómica; el status depende de quien llama
-async function insertBookingGroup({ clubId, slotMinutes, date, sorted, court_id, price, userId, guestName, guestContact, status }) {
+async function insertBookingGroup({ clubId, slotMinutes, items, court_id, price, userId, guestName, guestContact, status }) {
   const groupId = uid();
   return withTransaction(async (client) => {
     const rows = [];
-    for (const start_time of sorted) {
+    for (const { date, start_time } of items) {
       const { rows: [row] } = await client.query(
         `INSERT INTO bookings
            (id, group_id, club_id, court_id, user_id, guest_name, guest_contact, date, start_time, duration_minutes, price, status)
@@ -1308,27 +1304,14 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
     if (!guest_contact) return res.status(400).json({ error: 'Un teléfono o WhatsApp de contacto es requerido' });
     if (!isValidDateStr(req.body?.date)) return res.status(400).json({ error: 'Fecha inválida' });
 
-    const slots = Array.isArray(req.body?.slots) ? [...req.body.slots] : [];
-    if (!slots.length || slots.length > MAX_SLOTS_PER_BOOKING || !slots.every((s) => /^\d{2}:\d{2}$/.test(s))) {
-      return res.status(400).json({ error: 'Horario inválido' });
-    }
-
-    const min = todayStr();
-    const max = addDaysStr(min, BOOKING_HORIZON_DAYS - 1);
-    if (req.body.date < min || req.body.date > max) {
-      return res.status(400).json({ error: `Sólo se puede reservar dentro de los próximos ${BOOKING_HORIZON_DAYS} días` });
-    }
-
     const sql = getDb();
     const [club] = await sql`SELECT id, name, owner_id, slot_minutes, mp_access_token FROM clubs WHERE id = ${req.params.id}`;
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
-    // Los turnos deben ser consecutivos y sin repetir
-    const sorted = [...slots].sort();
-    for (let i = 1; i < sorted.length; i++) {
-      if (timeToMinutes(sorted[i]) - timeToMinutes(sorted[i - 1]) !== club.slot_minutes) {
-        return res.status(400).json({ error: 'Los turnos elegidos tienen que ser consecutivos' });
-      }
+    const { items, error: slotsError } = expandBookingSlots(req.body.date, req.body?.slots, club.slot_minutes, MAX_SLOTS_PER_BOOKING);
+    if (slotsError) return res.status(400).json({ error: slotsError });
+    if (!withinHorizon(req.body.date, items[0].start_time, todayStr(), BOOKING_HORIZON_DAYS)) {
+      return res.status(400).json({ error: `Sólo se puede reservar dentro de los próximos ${BOOKING_HORIZON_DAYS} días` });
     }
 
     let court_id = null;
@@ -1343,16 +1326,15 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
       court_id = court.id;
       court_name = court.name;
       // Precio total repartido en partes iguales entre las filas; es solo informativo
-      totalPrice = computeTotalPrice(court.price_30, court.price_60, sorted.length);
-      price = totalPrice != null ? Math.round((totalPrice / sorted.length) * 100) / 100 : null;
+      totalPrice = computeTotalPrice(court.price_30, court.price_60, items.length);
+      price = totalPrice != null ? Math.round((totalPrice / items.length) * 100) / 100 : null;
     }
 
     try {
       const bookings = await insertBookingGroup({
         clubId: req.params.id,
         slotMinutes: club.slot_minutes,
-        date: req.body.date,
-        sorted,
+        items,
         court_id,
         price,
         userId: req.user?.id ?? null,
@@ -1395,11 +1377,11 @@ router.post('/:id/bookings', optionalAuth, async (req, res, next) => {
       // Avisar al dueño, o a los admins si no hay dueño; best-effort. Si va a
       // pago online no hace falta que apruebe nada, pero igual se entera.
       try {
-        const endTime = minutesToTime(timeToMinutes(sorted[sorted.length - 1]) + club.slot_minutes);
+        const endTime = minutesToTime(timeToMinutes(items[items.length - 1].start_time) + club.slot_minutes);
         const courtLabel = court_name ? ` en ${court_name}` : '';
         const body = checkout_url
-          ? `${guest_name} está pagando un turno${courtLabel} para el ${req.body.date} de ${sorted[0]} a ${endTime} hs.`
-          : `${guest_name} pidió un turno${courtLabel} para el ${req.body.date} de ${sorted[0]} a ${endTime} hs.`;
+          ? `${guest_name} está pagando un turno${courtLabel} para el ${req.body.date} de ${items[0].start_time} a ${endTime} hs.`
+          : `${guest_name} pidió un turno${courtLabel} para el ${req.body.date} de ${items[0].start_time} a ${endTime} hs.`;
         const actorId = req.user?.id ?? null;
         // entity_id es el club: el front lleva a su ficha
         if (club.owner_id) {
@@ -1437,21 +1419,12 @@ router.post('/:id/bookings/manual', requireAuth, requireClubBookingManage, async
     if (!isValidDateStr(req.body?.date)) return res.status(400).json({ error: 'Fecha inválida' });
     if (req.body.date < todayStr()) return res.status(400).json({ error: 'No se puede bloquear una fecha pasada' });
 
-    const slots = Array.isArray(req.body?.slots) ? [...req.body.slots] : [];
-    if (!slots.length || slots.length > MAX_SLOTS_PER_BOOKING || !slots.every((s) => /^\d{2}:\d{2}$/.test(s))) {
-      return res.status(400).json({ error: 'Horario inválido' });
-    }
-
     const sql = getDb();
     const [club] = await sql`SELECT id, name, slot_minutes FROM clubs WHERE id = ${req.params.id}`;
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
-    const sorted = [...slots].sort();
-    for (let i = 1; i < sorted.length; i++) {
-      if (timeToMinutes(sorted[i]) - timeToMinutes(sorted[i - 1]) !== club.slot_minutes) {
-        return res.status(400).json({ error: 'Los turnos elegidos tienen que ser consecutivos' });
-      }
-    }
+    const { items, error: slotsError } = expandBookingSlots(req.body.date, req.body?.slots, club.slot_minutes, MAX_SLOTS_PER_BOOKING);
+    if (slotsError) return res.status(400).json({ error: slotsError });
 
     let court_id = null;
     let price = null;
@@ -1461,16 +1434,15 @@ router.post('/:id/bookings/manual', requireAuth, requireClubBookingManage, async
       `;
       if (!court) return res.status(400).json({ error: 'Cancha no válida' });
       court_id = court.id;
-      const totalPrice = computeTotalPrice(court.price_30, court.price_60, sorted.length);
-      price = totalPrice != null ? Math.round((totalPrice / sorted.length) * 100) / 100 : null;
+      const totalPrice = computeTotalPrice(court.price_30, court.price_60, items.length);
+      price = totalPrice != null ? Math.round((totalPrice / items.length) * 100) / 100 : null;
     }
 
     try {
       const bookings = await insertBookingGroup({
         clubId: req.params.id,
         slotMinutes: club.slot_minutes,
-        date: req.body.date,
-        sorted,
+        items,
         court_id,
         price,
         userId: null,
