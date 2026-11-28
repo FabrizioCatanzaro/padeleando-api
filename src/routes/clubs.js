@@ -10,6 +10,7 @@ import { uploadBuffer, deleteByPublicId } from '../lib/cloudinary.js';
 import { countBracketPlayed } from '../lib/profileStats.js';
 import { arNow } from '../lib/friendlies.js';
 import { expandBookingSlots, withinHorizon, addDaysStr } from '../lib/bookingSlots.js';
+import { parseClubExtras, parseCourtExtras, COURT_WALL_TYPES } from '../lib/clubProfile.js';
 import { CLUB_PLAN_ENABLED } from '../lib/planCatalog.js';
 import { saveUserMp, exchangeCode } from '../lib/mpAccount.js';
 
@@ -429,6 +430,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
         SELECT c.id, c.name, c.photo_url, c.header_url, c.social_links,
         c.contact_phone, c.contact_whatsapp,
         c.location_name, c.lat, c.lon, c.courts, c.slot_minutes, c.schedule, c.created_at,
+        c.amenities, c.amenities_other, c.contact_email,
         (c.owner_id IS NOT NULL)          AS has_owner,
         COALESCE(c.owner_id = ${viewerId}, false) AS is_owner,
         c.owner_visible,
@@ -472,7 +474,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       `,
       // Trae TODAS las canchas acá (activas e inactivas): se filtran abajo.
       sql`
-        SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+        SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
         FROM club_courts WHERE club_id = ${req.params.id}
         ORDER BY sort_order ASC, created_at ASC
       `,
@@ -662,6 +664,9 @@ router.put('/:id', requireAuth, requireClubManage, async (req, res, next) => {
 
     const f = clubFields(req.body);
     const ownerVisible = typeof req.body?.owner_visible === 'boolean' ? req.body.owner_visible : null;
+    const extras = parseClubExtras(req.body);
+    if (extras.error) return res.status(400).json({ error: extras.error });
+    const x = extras.fields;
 
     const [current] = await sql`
       SELECT name, location_name, lat, lon FROM clubs WHERE id = ${req.params.id}
@@ -687,10 +692,14 @@ router.put('/:id', requireAuth, requireClubManage, async (req, res, next) => {
         lon              = CASE WHEN ${isAdmin}::boolean THEN ${f.lon} ELSE lon END,
         courts           = ${f.courts},
         slot_minutes     = ${f.slot_minutes},
-        owner_visible    = COALESCE(${ownerVisible}::boolean, owner_visible)
+        owner_visible    = COALESCE(${ownerVisible}::boolean, owner_visible),
+        amenities        = CASE WHEN ${'amenities' in x}::boolean THEN ${x.amenities ?? []}::text[] ELSE amenities END,
+        amenities_other  = CASE WHEN ${'amenities_other' in x}::boolean THEN ${x.amenities_other ?? null} ELSE amenities_other END,
+        contact_email    = CASE WHEN ${'contact_email' in x}::boolean THEN ${x.contact_email ?? null} ELSE contact_email END
       WHERE id = ${req.params.id}
       RETURNING id, name, photo_url, header_url, social_links, contact_phone, contact_whatsapp,
-      location_name, lat, lon, courts, slot_minutes, schedule, owner_visible, created_at
+      location_name, lat, lon, courts, slot_minutes, schedule, owner_visible, created_at,
+      amenities, amenities_other, contact_email
     `;
 
     let pendingIdentityRequestId = null;
@@ -862,7 +871,6 @@ router.delete('/:id/header', requireAuth, requireClubManage, async (req, res, ne
 
 // Canchas del club: una fila por cancha física; horario y duración son del club entero
 const COURT_FLOOR_TYPES = ['cesped_sintetico', 'cesped_natural', 'cemento'];
-const COURT_WALL_TYPES  = ['cemento', 'cristal'];
 
 // Dos precios por cancha (30 y 60 min); cada uno puede ser null
 function parsePrice(v) {
@@ -877,7 +885,9 @@ function courtFields(body = {}) {
   const external_play = typeof body.external_play === 'boolean' ? body.external_play : null;
   const price_30 = parsePrice(body.price_30);
   const price_60 = parsePrice(body.price_60);
-  return { floor_type, wall_type, covered, lit, external_play, price_30, price_60 };
+  const extras = parseCourtExtras(body);
+  if (extras.error) return { error: extras.error };
+  return { floor_type, wall_type, covered, lit, external_play, price_30, price_60, ...extras.fields };
 }
 
 // Total de turnos seguidos: bloques de 60 más un 30 suelto; si falta un precio se estima del otro
@@ -910,7 +920,7 @@ router.get('/:id/courts', optionalAuth, async (req, res, next) => {
     if (!club) return res.status(404).json({ error: 'Club no encontrado' });
     const isManager = req.user?.role === 'admin' || (!!req.user && req.user.id === club.owner_id);
     const courts = await sql`
-      SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+      SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
       FROM club_courts
       WHERE club_id = ${req.params.id} AND (${isManager}::boolean OR active = true)
       ORDER BY sort_order ASC, created_at ASC
@@ -926,15 +936,16 @@ router.post('/:id/courts', requireAuth, requireClubManage, async (req, res, next
     if (!name)            return res.status(400).json({ error: 'El nombre de la cancha es requerido' });
     if (name.length > 40) return res.status(400).json({ error: 'El nombre de la cancha no puede superar los 40 caracteres' });
 
-    const sql = getDb();
     const c = courtFields(req.body);
+    if (c.error) return res.status(400).json({ error: c.error });
+    const sql = getDb();
     const [{ next_order }] = await sql`
       SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM club_courts WHERE club_id = ${req.params.id}
     `;
     const [court] = await sql`
-      INSERT INTO club_courts (id, club_id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, sort_order)
-      VALUES (${uid()}, ${req.params.id}, ${name}, ${c.floor_type}, ${c.wall_type}, ${c.covered}, ${c.lit}, ${c.external_play}, ${c.price_30}, ${c.price_60}, ${next_order})
-      RETURNING id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+      INSERT INTO club_courts (id, club_id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, sort_order)
+      VALUES (${uid()}, ${req.params.id}, ${name}, ${c.floor_type}, ${c.wall_type}, ${c.covered}, ${c.lit}, ${c.external_play}, ${c.price_30}, ${c.price_60}, ${c.floor_color}, ${c.description}, ${next_order})
+      RETURNING id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
     `;
     await syncLegacyCourtsCount(sql, req.params.id);
     res.status(201).json(court);
@@ -948,16 +959,18 @@ router.put('/:id/courts/:courtId', requireAuth, requireClubManage, async (req, r
     if (!name)            return res.status(400).json({ error: 'El nombre de la cancha es requerido' });
     if (name.length > 40) return res.status(400).json({ error: 'El nombre de la cancha no puede superar los 40 caracteres' });
 
-    const sql = getDb();
     const c = courtFields(req.body);
+    if (c.error) return res.status(400).json({ error: c.error });
+    const sql = getDb();
     const active = typeof req.body?.active === 'boolean' ? req.body.active : true;
     const [court] = await sql`
       UPDATE club_courts SET
         name = ${name}, floor_type = ${c.floor_type}, wall_type = ${c.wall_type},
         covered = ${c.covered}, lit = ${c.lit}, external_play = ${c.external_play},
-        price_30 = ${c.price_30}, price_60 = ${c.price_60}, active = ${active}
+        price_30 = ${c.price_30}, price_60 = ${c.price_60},
+        floor_color = ${c.floor_color}, description = ${c.description}, active = ${active}
       WHERE id = ${req.params.courtId} AND club_id = ${req.params.id}
-      RETURNING id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+      RETURNING id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
     `;
     if (!court) return res.status(404).json({ error: 'Cancha no encontrada' });
     await syncLegacyCourtsCount(sql, req.params.id);
@@ -1000,7 +1013,7 @@ router.patch('/:id/courts/:courtId/move', requireAuth, requireClubManage, async 
     } // si ya está en la punta, no-op -- se devuelve la lista tal cual está.
 
     const updated = await sql`
-      SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, active, sort_order
+      SELECT id, name, floor_type, wall_type, covered, lit, external_play, price_30, price_60, floor_color, description, active, sort_order
       FROM club_courts WHERE club_id = ${req.params.id} ORDER BY sort_order ASC, created_at ASC
     `;
     res.json(updated);

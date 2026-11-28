@@ -1009,3 +1009,13 @@ CREATE TABLE IF NOT EXISTS commission_settlements (
   CHECK (credit_applied >= 0 AND credit_applied <= amount)
 );
 CREATE INDEX IF NOT EXISTS idx_settlements_owner ON commission_settlements(owner_id, status);
+
+-- Perfil de club: servicios, email, color y descripción de cada cancha
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS amenities       TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS amenities_other TEXT;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS contact_email   TEXT;
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS floor_color TEXT;
+ALTER TABLE club_courts ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE club_courts DROP CONSTRAINT IF EXISTS club_courts_wall_type_check;
+ALTER TABLE club_courts ADD CONSTRAINT club_courts_wall_type_check
+  CHECK (wall_type IS NULL OR wall_type IN ('cemento', 'cristal', 'cristal_panoramico'));
