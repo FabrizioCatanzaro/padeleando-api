@@ -8,8 +8,9 @@ The **React frontend lives in a separate repo** (`c:\Users\Fabry\Programacion\pa
 
 ---
 
-## Current Status (updated 2026-11-27)
+## Current Status (updated 2026-11-28)
 
+- **In progress: Perfil de club** — branch `feat/club-perfil` (both repos), pending the real test. Services, email, floor color, gallery, follows, the Resumen data in `GET /clubs/:id/events` and bookings after midnight (see [Perfil de club](#perfil-de-club)). Schema tested on the Neon branch `club-perfil-dev`.
 - **In progress: Cards de torneo** — branch `feat/cards-torneo` (both repos). Photo, level and organizer on every tournament card, plus `GET /api/home/calendar` (see [Portada del visitante](#portada-del-visitante)).
 - **In progress: Home público** — branch `feat/home-publico` (both repos). `GET /api/home` adds champions and open friendlies for the new visitor landing (see [Portada del visitante](#portada-del-visitante)).
 - **In progress: Planes por rol** — branch `feat/planes` (both repos). Stages 1 and 2 of 5 done: plans by role (Jugador+, Organizador, Combo, Club disabled) and online signup payment with commission (see [Cobro online de inscripciones](#cobro-online-de-inscripciones)). Next: launch period, boost, referrals. Business model: Project doc `claude/modelo-de-negocio.md`. Pending before release: the six Mercado Pago preapproval plans (`MP_PLAN_ID_<PLAN>_<PERIOD>`).
@@ -231,6 +232,16 @@ Route sizes are uneven on purpose: `groups.js` (~1.2k lines) and `tournaments.js
 - The quota in `/organize` is the category **owner's**, like every plan gate; a co-organizer sees the owner's limits.
 - `routes/padeleros.js`: `GET /players` (`requireAuth`) returns the network counts, "Jugaste con" (top 4 by matches as partner or rival: `matches`, brackets and confirmed friendlies; a player without an account is keyed by normalized name), up to 6 suggested users (shared public tournaments, not followed yet; stats counted like the profile; "Juega en" = most frequent club of the last 6 months) and the 3 most active organizers. The suggested set is a CTE repeated in the three queries that need it, so the whole endpoint is one round of 8 queries. `GET /organizers` (`optionalAuth`): owners of public categories with a tournament in the last 90 days; with `lat`/`lon` it sorts by the closest club.
 - `GET /clubs` and `GET /clubs/nearby` accept `?stats=1`: open friendlies, `bookable` (owner + active courts), active courts, header and WhatsApp, from one extra query run in parallel. Without the flag the response is unchanged.
+
+### Perfil de club
+
+- `clubs.amenities` (keys of `CLUB_AMENITIES` in `lib/clubProfile.js`, with tests), `amenities_other` and `contact_email`. `PUT /clubs/:id` touches them only when present in the body; they never go through `club_requests`.
+- `club_courts.floor_color` (`#rrggbb`) and `description` (200 max); `wall_type` also takes `cristal_panoramico`.
+- `GET /clubs/:id/events` adds, in the same `Promise.all`: `friendlies` (`listOpenFriendlies` with a club id), `champions` (last 3 bracket finals, `championCard`) and `activity` (`lib/clubActivity.js`: tournaments and distinct players per month and year; a player is `user_id` or the normalized name, in tournaments and confirmed friendlies). Each tournament carries flyer, cover, level and `signup_open`.
+- `GET /clubs/:id/bookings/occupancy` (booking managers, `NEVER_STORE_PATTERNS`): confirmed slots of the last 8 weeks by ISO weekday and 2 h band.
+- Gallery: `club_photos`, `POST /clubs/:id/photos` and `DELETE /clubs/:id/photos/:photoId`. `clubPhotoLimit`: 4, or 16 with the Club plan of the club owner (only while `CLUB_PLAN_ENABLED`). 403 `plan_limit` at the limit; a downgrade deletes nothing.
+- Follows: `club_follows`, `POST` / `DELETE /clubs/:id/follow`. `GET /clubs/:id` returns `followers_count`, `is_following`, `photos` and, for managers, `photo_limit`. `notifyClubFollowersSignup` (`lib/clubFollowers.js`) sends `club_tournament_signup` when a public tournament of the club opens signup (create, or a PATCH with `signup_open` or `club_id`), once per tournament and person; `body` is the club name.
+- **Bookings after midnight.** The client sends the real date of the first slot and the times in order; a time lower than the previous one falls on the next day (`expandBookingSlots` in `lib/bookingSlots.js`). The horizon admits the early morning after its last day (`withinHorizon`), a started slot is rejected (`hasStarted`) and "today" is Argentina time, not UTC.
 
 ### Portada del visitante
 
