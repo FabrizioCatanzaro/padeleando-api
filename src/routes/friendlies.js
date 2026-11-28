@@ -216,12 +216,12 @@ router.get('/', optionalAuth, async (req, res, next) => {
 });
 
 // Amistosos públicos con lugar libre para la portada del visitante.
-export async function listOpenFriendlies(sql, limit) {
+export async function listOpenFriendlies(sql, limit, clubId = null) {
   const now = arNow();
   const rows = await run(sql, q`
     ${SELECT_MATCH}, NULL::json AS pending
     ${FROM_MATCH}
-    WHERE ${OPEN_PUBLIC(now)}
+    WHERE ${OPEN_PUBLIC(now)} ${clubId ? q`AND fm.club_id = ${clubId}` : q``}
     ORDER BY fm.date, fm.start_time
     LIMIT ${limit}`);
   return rows.map((r) => present(r, null, now));

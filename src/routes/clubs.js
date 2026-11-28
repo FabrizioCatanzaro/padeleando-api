@@ -11,6 +11,9 @@ import { countBracketPlayed } from '../lib/profileStats.js';
 import { arNow } from '../lib/friendlies.js';
 import { expandBookingSlots, withinHorizon, addDaysStr } from '../lib/bookingSlots.js';
 import { parseClubExtras, parseCourtExtras, COURT_WALL_TYPES } from '../lib/clubProfile.js';
+import { activityFrom, buildActivity } from '../lib/clubActivity.js';
+import { championCard } from '../lib/homeChampions.js';
+import { listOpenFriendlies } from './friendlies.js';
 import { CLUB_PLAN_ENABLED } from '../lib/planCatalog.js';
 import { saveUserMp, exchangeCode } from '../lib/mpAccount.js';
 
@@ -510,12 +513,18 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
 router.get('/:id/events', async (req, res, next) => {
   try {
     const sql = getDb();
-    const [club] = await sql`SELECT id FROM clubs WHERE id = ${req.params.id}`;
-    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
-
-    const rows = await sql`
+    const clubId = req.params.id;
+    const today = arNow().date;
+    const from = activityFrom(today);
+    const [[club], rows, champions, friendlies, activityRows] = await Promise.all([
+      sql`SELECT id FROM clubs WHERE id = ${clubId}`,
+      sql`
       SELECT
-        t.id, t.name, t.format, t.mode, t.status, t.event_date, t.created_at,
+        t.id, t.name, t.format, t.mode, t.status, t.event_date, t.event_time, t.created_at,
+        t.flyer_url, COALESCE(t.level, g.level) AS level,
+        (SELECT ph.url FROM tournament_photos ph WHERE ph.tournament_id = t.id AND ph.is_cover ORDER BY ph.created_at DESC LIMIT 1) AS cover_url,
+        (t.status <> 'finished' AND COALESCE(t.signup_open, g.signup_open, false)
+         AND (t.event_date IS NULL OR t.event_date >= ${today}::date)) AS signup_open,
         -- No alcanza con IS NOT NULL: live_match queda en un array vacío cuando
         -- se cierra el último partido, y una jornada terminada conserva el
         -- payload viejo. Misma condición que la consulta live de GET /api/home.
@@ -529,9 +538,54 @@ router.get('/:id/events', async (req, res, next) => {
       FROM tournaments t
       JOIN groups g ON g.id = t.group_id
       LEFT JOIN users u ON u.id = g.user_id
-      WHERE t.club_id = ${req.params.id} AND g.is_public = true
+      WHERE t.club_id = ${clubId} AND g.is_public = true
       ORDER BY COALESCE(t.event_date, t.created_at::date) DESC
-    `;
+    `,
+      sql`
+        SELECT t.id, t.name, t.format, t.bracket->'final' AS final,
+               COALESCE(t.level, g.level) AS level,
+               COALESCE(t.event_date, (SELECT MIN(m.played_at)::date FROM matches m WHERE m.tournament_id = t.id), t.created_at::date) AS played_on,
+               g.id AS group_id, g.name AS group_name,
+               ou.name AS owner_name, ou.username AS owner_username,
+               COALESCE(u1.name, p1.name) AS p1_name, u1.avatar_url AS p1_avatar, u1.username AS p1_username,
+               COALESCE(u2.name, p2.name) AS p2_name, u2.avatar_url AS p2_avatar, u2.username AS p2_username
+        FROM   tournaments t
+        JOIN   groups g  ON g.id = t.group_id
+        JOIN   users  ou ON ou.id = g.user_id
+        JOIN   pairs  pr ON pr.tournament_id = t.id AND pr.id = t.bracket->'final'->>'winner_id'
+        LEFT   JOIN players p1 ON p1.id = pr.p1_id
+        LEFT   JOIN users   u1 ON u1.id = p1.user_id
+        LEFT   JOIN players p2 ON p2.id = pr.p2_id
+        LEFT   JOIN users   u2 ON u2.id = p2.user_id
+        WHERE  t.club_id = ${clubId} AND g.is_public = true
+          AND  t.status = 'finished'
+          AND  t.bracket->'final'->>'winner_id' IS NOT NULL
+        ORDER  BY played_on DESC, t.created_at DESC
+        LIMIT  3
+      `,
+      listOpenFriendlies(sql, 20, clubId),
+      sql`
+        WITH tt AS (
+          SELECT t.id, COALESCE(t.event_date, t.created_at::date) AS d
+          FROM tournaments t JOIN groups g ON g.id = t.group_id AND g.is_public = true
+          WHERE t.club_id = ${clubId}
+        ), people AS (
+          SELECT tt.d, COALESCE('u:' || p.user_id, 'n:' || lower(trim(p.name))) AS k
+          FROM tt JOIN tournament_players tp ON tp.tournament_id = tt.id JOIN players p ON p.id = tp.player_id
+          UNION ALL
+          SELECT fm.date, COALESCE('u:' || fp.user_id, 'n:' || lower(trim(fp.guest_name)))
+          FROM friendly_matches fm JOIN friendly_match_players fp ON fp.match_id = fm.id
+          WHERE fm.club_id = ${clubId} AND fm.status = 'confirmado'
+            AND (fp.user_id IS NOT NULL OR fp.guest_name IS NOT NULL)
+        )
+        SELECT 'torneos' AS serie, 'm' AS kind, to_char(d, 'YYYY-MM') AS key, COUNT(*)::int AS n FROM tt WHERE d >= ${from}::date GROUP BY 3
+        UNION ALL SELECT 'torneos', 'y', to_char(d, 'YYYY'), COUNT(*)::int FROM tt GROUP BY 3
+        UNION ALL SELECT 'jugadores', 'm', to_char(d, 'YYYY-MM'), COUNT(DISTINCT k)::int FROM people WHERE d >= ${from}::date GROUP BY 3
+        UNION ALL SELECT 'jugadores', 'y', to_char(d, 'YYYY'), COUNT(DISTINCT k)::int FROM people GROUP BY 3
+        UNION ALL SELECT 'jugadores', 'total', 'total', COUNT(DISTINCT k)::int FROM people
+      `,
+    ]);
+    if (!club) return res.status(404).json({ error: 'Club no encontrado' });
 
     const events = { upcoming: [], ongoing: [], past: [] };
     for (const t of rows) {
@@ -543,7 +597,12 @@ router.get('/:id/events', async (req, res, next) => {
     }
     // upcoming en orden cronológico ascendente (lo más próximo primero)
     events.upcoming.reverse();
-    res.json(events);
+    res.json({
+      ...events,
+      champions: champions.map(championCard),
+      friendlies,
+      activity: buildActivity(activityRows, today),
+    });
   } catch (err) { next(err); }
 });
 
@@ -1230,6 +1289,23 @@ router.get('/:id/bookings/manage', requireAuth, requireClubBookingManage, async 
     `;
     const overlapMap = new Map(overlaps.map((r) => [r.group_id, r.other_pending_count]));
     res.json(bookings.map((b) => ({ ...b, other_pending_count: overlapMap.get(b.group_id) ?? 0 })));
+  } catch (err) { next(err); }
+});
+
+// GET .../bookings/occupancy: turnos confirmados de las últimas 8 semanas por día y franja de 2 h
+const OCCUPANCY_WEEKS = 8;
+router.get('/:id/bookings/occupancy', requireAuth, requireClubBookingManage, async (req, res, next) => {
+  try {
+    const sql = getDb();
+    const today = todayStr();
+    const rows = await sql`
+      SELECT EXTRACT(ISODOW FROM date)::int AS dow, (EXTRACT(HOUR FROM start_time)::int / 2) AS band, COUNT(*)::int AS slots
+      FROM bookings
+      WHERE club_id = ${req.params.id} AND status = 'confirmed'
+        AND date >= ${addDaysStr(today, -7 * OCCUPANCY_WEEKS)}::date AND date < ${today}::date
+      GROUP BY 1, 2
+    `;
+    res.json({ weeks: OCCUPANCY_WEEKS, cells: rows });
   } catch (err) { next(err); }
 });
 
